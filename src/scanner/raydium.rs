@@ -74,9 +74,8 @@ pub struct AmmInfo {
     pub padding2: u64,
 }
 
-pub fn fetch_price(client: &RpcClient) -> Result<PriceUpdate> {
-    let pool_pubkey =
-        Pubkey::from_str(RAYDIUM_SOL_USDC_POOL).context("Invalid pool pubkey format")?;
+pub fn fetch_price(client: &RpcClient, pool_id: &str, pair: &str) -> Result<PriceUpdate> {
+    let pool_pubkey = Pubkey::from_str(pool_id).context("Invalid pool pubkey format")?;
 
     let account = client
         .get_account(&pool_pubkey)
@@ -101,7 +100,7 @@ pub fn fetch_price(client: &RpcClient) -> Result<PriceUpdate> {
 
     Ok(PriceUpdate {
         dex: "Raydium".to_string(),
-        pair: "SOL/USDC".to_string(),
+        pair: pair.to_string(),
         price,
         base_liquidity: coin_amount,
         quote_liquidity: pc_amount,

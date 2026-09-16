@@ -5,6 +5,9 @@ pub struct Config {
     pub helius_rpc_url: String,
     pub jito_block_engine_url: String,
     pub keypair: Keypair,
+    pub pair: String,
+    pub raydium_pool_id: String,
+    pub orca_pool_id: String,
 }
 
 impl Config {
@@ -24,16 +27,32 @@ impl Config {
             .into_vec()
             .context("WALLET_PRIVATE_KEY is not valid base58")?;
 
-        let keypair = Keypair::try_from(secret_bytes.as_slice()).map_err(|e| {
-            anyhow::anyhow!("Failed to construct Keypair from decoded private key bytes: {e}")
-        })?;
+        let keypair = Keypair::try_from(secret_bytes.as_slice())
+            .map_err(|e| anyhow::anyhow!("Failed to construct Keypair: {e}"))?;
+
+        let pair = std::env::var("PAIR").context("PAIR not set in environment")?;
+
+        let raydium_pool_id =
+            std::env::var("RAYDIUM_POOL_ID").context("RAYDIUM_POOL_ID not set in environment")?;
+
+        let orca_pool_id =
+            std::env::var("ORCA_POOL_ID").context("ORCA_POOL_ID not set in environment")?;
 
         tracing::info!("Config loaded. Wallet pubkey: {}", keypair.pubkey());
+        tracing::info!(
+            "Pair: {}, Raydium pool: {}, Orca pool: {}",
+            pair,
+            raydium_pool_id,
+            orca_pool_id
+        );
 
         Ok(Self {
             helius_rpc_url,
             jito_block_engine_url,
             keypair,
+            pair,
+            raydium_pool_id,
+            orca_pool_id,
         })
     }
 }

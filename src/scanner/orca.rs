@@ -42,25 +42,20 @@ pub struct Whirlpool {
     pub reward_infos: [WhirlpoolRewardInfo; 3],
 }
 
-pub fn fetch_price(client: &RpcClient) -> Result<PriceUpdate> {
-    let pool_pubkey =
-        Pubkey::from_str(ORCA_SOL_USDC_WHIRLPOOL).context("Invalid Whirlpool pubkey format")?;
+pub fn fetch_price(client: &RpcClient, pool_id: &str, pair: &str) -> Result<PriceUpdate> {
+    let pool_pubkey = Pubkey::from_str(pool_id).context("Invalid Whirlpool pubkey format")?;
 
     let account = client
         .get_account(&pool_pubkey)
         .context("Failed to fetch Whirlpool account")?;
 
-    // Anchor accounts have an 8-byte discriminator before the actual struct data
     let data = &account.data[8..];
 
-    let whirlpool = Whirlpool::try_from_slice(data)
-        .context("Failed to deserialize Whirlpool - layout may have changed")?;
+    let whirlpool = Whirlpool::try_from_slice(data).context("Failed to deserialize Whirlpool")?;
 
-    // price = (sqrt_price / 2^64)^2, adjusted for decimal difference between token A and B
     let sqrt_price_f64 = whirlpool.sqrt_price as f64 / (2f64.powi(64));
     let raw_price = sqrt_price_f64 * sqrt_price_f64;
 
-    // token_mint_a is SOL, token_mint_b is USDC for this pool - adjust for decimals
     let decimal_adjustment = 10f64.powi(SOL_DECIMALS - USDC_DECIMALS);
     let price = raw_price * decimal_adjustment;
 
@@ -80,7 +75,7 @@ pub fn fetch_price(client: &RpcClient) -> Result<PriceUpdate> {
 
     Ok(PriceUpdate {
         dex: "Orca".to_string(),
-        pair: "SOL/USDC".to_string(),
+        pair: pair.to_string(),
         price,
         base_liquidity,
         quote_liquidity,

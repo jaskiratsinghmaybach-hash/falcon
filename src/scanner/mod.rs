@@ -15,11 +15,16 @@ pub struct PriceUpdate {
     pub timestamp: std::time::SystemTime,
 }
 
-pub async fn run_polling_loop(rpc_url: &str) -> Result<()> {
+pub async fn run_polling_loop(
+    rpc_url: &str,
+    pair: &str,
+    raydium_pool_id: &str,
+    orca_pool_id: &str,
+) -> Result<()> {
     let client = RpcClient::new(rpc_url.to_string());
 
     loop {
-        match raydium::fetch_price(&client) {
+        match raydium::fetch_price(&client, raydium_pool_id, pair) {
             Ok(update) => {
                 tracing::info!(
                     "[{}] {} price: {:.4} (base liq: {:.2}, quote liq: {:.2})",
@@ -33,7 +38,7 @@ pub async fn run_polling_loop(rpc_url: &str) -> Result<()> {
             Err(e) => tracing::error!("Raydium fetch failed: {}", e),
         }
 
-        match orca::fetch_price(&client) {
+        match orca::fetch_price(&client, orca_pool_id, pair) {
             Ok(update) => {
                 tracing::info!(
                     "[{}] {} price: {:.4} (base liq: {:.2}, quote liq: {:.2})",
