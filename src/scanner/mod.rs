@@ -1,6 +1,7 @@
 pub mod orca;
 pub mod raydium;
 
+use crate::analyzer;
 use anyhow::Result;
 use solana_client::rpc_client::RpcClient;
 use std::time::Duration;
@@ -24,32 +25,42 @@ pub async fn run_polling_loop(
     let client = RpcClient::new(rpc_url.to_string());
 
     loop {
-        match raydium::fetch_price(&client, raydium_pool_id, pair) {
-            Ok(update) => {
-                tracing::info!(
-                    "[{}] {} price: {:.4} (base liq: {:.2}, quote liq: {:.2})",
-                    update.dex,
-                    update.pair,
-                    update.price,
-                    update.base_liquidity,
-                    update.quote_liquidity
-                );
-            }
-            Err(e) => tracing::error!("Raydium fetch failed: {}", e),
-        }
+        let raydium_result = raydium::fetch_price(&client, raydium_pool_id, pair);
+        let orca_result = orca::fetch_price(&client, orca_pool_id, pair);
 
-        match orca::fetch_price(&client, orca_pool_id, pair) {
-            Ok(update) => {
+        match (&raydium_result, &orca_result) {
+            (Ok(r), Ok(o)) => {
                 tracing::info!(
                     "[{}] {} price: {:.4} (base liq: {:.2}, quote liq: {:.2})",
-                    update.dex,
-                    update.pair,
-                    update.price,
-                    update.base_liquidity,
-                    update.quote_liquidity
+                    r.dex,
+                    r.pair,
+                    r.price,
+                    r.base_liquidity,
+                    r.quote_liquidity
                 );
+                tracing::info!(
+                    "[{}] {} price: {:.4} (base liq: {:.2}, quote liq: {:.2})",
+                    o.dex,
+                    o.pair,
+                    o.price,
+                    o.base_liquidity,
+                    o.quote_liquidity
+                );
+
+                match analyzer::find_opportunity(r, o) {
+                    Ok(opp) => {
+                        tracing::info!(
+                            "OPPORTUNITY: buy on {} @ {:.4}, sell on {} @ {:.4}, raw spread: {:.4}%",
+                            opp.buy_dex, opp.buy_price, opp.sell_dex, opp.sell_price, opp.raw_spread_pct
+                        );
+                    }
+                    Err(reason) => {
+                        tracing::info!("No opportunity: {:?}", reason);
+                    }
+                }
             }
-            Err(e) => tracing::error!("Orca fetch failed: {}", e),
+            (Err(e), _) => tracing::error!("Raydium fetch failed: {}", e),
+            (_, Err(e)) => tracing::error!("Orca fetch failed: {}", e),
         }
 
         tokio::time::sleep(Duration::from_secs(5)).await;
