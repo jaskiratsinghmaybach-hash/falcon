@@ -19,3 +19,5 @@ dotenvy = "0.15"
 futures-util = "0.3"
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 solana-account-decoder = "2"
+borsh = "1"
+spl-token = "7"
