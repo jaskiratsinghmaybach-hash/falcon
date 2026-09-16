@@ -73,12 +73,16 @@ pub fn fetch_price(client: &RpcClient, pool_id: &str, pair: &str) -> Result<Pric
         .ui_amount
         .context("No ui_amount for vault B")?;
 
+    // fee_rate is in hundredths of a basis point: fee_rate / 1_000_000 = fee as a fraction
+    let fee_pct = whirlpool.fee_rate as f64 / 10_000.0;
+
     Ok(PriceUpdate {
         dex: "Orca".to_string(),
         pair: pair.to_string(),
         price,
         base_liquidity,
         quote_liquidity,
+        fee_pct,
         timestamp: std::time::SystemTime::now(),
     })
 }

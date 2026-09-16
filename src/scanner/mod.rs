@@ -13,6 +13,7 @@ pub struct PriceUpdate {
     pub price: f64,
     pub base_liquidity: f64,
     pub quote_liquidity: f64,
+    pub fee_pct: f64,
     pub timestamp: std::time::SystemTime,
 }
 
@@ -50,8 +51,8 @@ pub async fn run_polling_loop(
                 match analyzer::find_opportunity(r, o) {
                     Ok(opp) => {
                         tracing::info!(
-                            "OPPORTUNITY: buy on {} @ {:.4}, sell on {} @ {:.4}, raw spread: {:.4}%",
-                            opp.buy_dex, opp.buy_price, opp.sell_dex, opp.sell_price, opp.raw_spread_pct
+                            "OPPORTUNITY: buy on {} @ {:.4}, sell on {} @ {:.4}, raw spread: {:.4}%, fee-adjusted: {:.4}%",
+                            opp.buy_dex, opp.buy_price, opp.sell_dex, opp.sell_price, opp.raw_spread_pct, opp.fee_adjusted_spread_pct
                         );
                     }
                     Err(reason) => {

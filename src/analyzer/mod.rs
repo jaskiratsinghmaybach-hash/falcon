@@ -7,6 +7,7 @@ pub struct Opportunity {
     pub buy_price: f64,
     pub sell_price: f64,
     pub raw_spread_pct: f64,
+    pub fee_adjusted_spread_pct: f64,
     pub pair: String,
 }
 
@@ -16,6 +17,9 @@ pub enum RejectReason {
     SpreadTooSmall {
         spread_pct: f64,
         min_required_pct: f64,
+    },
+    FeesExceedSpread {
+        fee_adjusted_pct: f64,
     },
 }
 
@@ -35,8 +39,6 @@ pub fn find_opportunity(
 
     let raw_spread_pct = ((sell.price - buy.price) / buy.price) * 100.0;
 
-    // Minimum raw spread before we even consider this worth analyzing further.
-    // This is NOT the final profit check - just a cheap first filter.
     const MIN_RAW_SPREAD_PCT: f64 = 0.01;
 
     if raw_spread_pct < MIN_RAW_SPREAD_PCT {
@@ -46,12 +48,23 @@ pub fn find_opportunity(
         });
     }
 
+    // Subtract both DEXs' swap fees from the raw spread - you pay a fee to buy AND to sell.
+    let total_fee_pct = buy.fee_pct + sell.fee_pct;
+    let fee_adjusted_spread_pct = raw_spread_pct - total_fee_pct;
+
+    if fee_adjusted_spread_pct <= 0.0 {
+        return Err(RejectReason::FeesExceedSpread {
+            fee_adjusted_pct: fee_adjusted_spread_pct,
+        });
+    }
+
     Ok(Opportunity {
         buy_dex: buy.dex.clone(),
         sell_dex: sell.dex.clone(),
         buy_price: buy.price,
         sell_price: sell.price,
         raw_spread_pct,
+        fee_adjusted_spread_pct,
         pair: price_a.pair.clone(),
     })
 }

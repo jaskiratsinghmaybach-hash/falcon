@@ -98,12 +98,17 @@ pub fn fetch_price(client: &RpcClient, pool_id: &str, pair: &str) -> Result<Pric
 
     let price = pc_amount / coin_amount;
 
+    let fee_pct = (amm_info.fees.swap_fee_numerator as f64
+        / amm_info.fees.swap_fee_denominator as f64)
+        * 100.0;
+
     Ok(PriceUpdate {
         dex: "Raydium".to_string(),
         pair: pair.to_string(),
         price,
         base_liquidity: coin_amount,
         quote_liquidity: pc_amount,
+        fee_pct,
         timestamp: std::time::SystemTime::now(),
     })
 }
