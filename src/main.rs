@@ -13,7 +13,9 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("Falcon starting up");
 
-    let _config = config::Config::load()?;
+    let config = config::Config::load()?;
+
+    scanner::check_pool_exists(&config.helius_rpc_url)?;
 
     tracing::info!("Falcon initialized and ready");
 
