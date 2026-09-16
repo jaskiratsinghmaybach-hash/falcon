@@ -4,6 +4,8 @@ use solana_client::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
 use std::str::FromStr;
 
+use super::PriceUpdate;
+
 const RAYDIUM_SOL_USDC_POOL: &str = "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2";
 
 #[derive(BorshDeserialize, Debug)]
@@ -72,9 +74,7 @@ pub struct AmmInfo {
     pub padding2: u64,
 }
 
-pub fn fetch_pool_price(rpc_url: &str) -> Result<f64> {
-    let client = RpcClient::new(rpc_url.to_string());
-
+pub fn fetch_price(client: &RpcClient) -> Result<PriceUpdate> {
     let pool_pubkey =
         Pubkey::from_str(RAYDIUM_SOL_USDC_POOL).context("Invalid pool pubkey format")?;
 
@@ -82,17 +82,8 @@ pub fn fetch_pool_price(rpc_url: &str) -> Result<f64> {
         .get_account(&pool_pubkey)
         .context("Failed to fetch pool account")?;
 
-    let amm_info = AmmInfo::try_from_slice(&account.data)
-        .context("Failed to deserialize AmmInfo - layout may have changed")?;
-
-    tracing::info!(
-        "Pool status: {}, coin_decimals: {}, pc_decimals: {}",
-        amm_info.status,
-        amm_info.coin_decimals,
-        amm_info.pc_decimals
-    );
-    tracing::info!("Coin vault: {}", amm_info.coin_vault);
-    tracing::info!("PC vault: {}", amm_info.pc_vault);
+    let amm_info =
+        AmmInfo::try_from_slice(&account.data).context("Failed to deserialize AmmInfo")?;
 
     let coin_balance = client
         .get_token_account_balance(&amm_info.coin_vault)
@@ -106,12 +97,14 @@ pub fn fetch_pool_price(rpc_url: &str) -> Result<f64> {
         .context("No ui_amount for coin vault")?;
     let pc_amount: f64 = pc_balance.ui_amount.context("No ui_amount for pc vault")?;
 
-    tracing::info!("Coin vault balance: {} SOL", coin_amount);
-    tracing::info!("PC vault balance: {} USDC", pc_amount);
-
     let price = pc_amount / coin_amount;
 
-    tracing::info!("Computed price: {} USDC per SOL", price);
-
-    Ok(price)
+    Ok(PriceUpdate {
+        dex: "Raydium".to_string(),
+        pair: "SOL/USDC".to_string(),
+        price,
+        base_liquidity: coin_amount,
+        quote_liquidity: pc_amount,
+        timestamp: std::time::SystemTime::now(),
+    })
 }
