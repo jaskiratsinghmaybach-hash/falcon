@@ -6,7 +6,7 @@ use std::str::FromStr;
 
 use super::PriceUpdate;
 
-const RAYDIUM_SOL_USDC_POOL: &str = "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2";
+const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
 
 #[derive(BorshDeserialize, Debug)]
 pub struct Fees {
@@ -96,7 +96,22 @@ pub fn fetch_price(client: &RpcClient, pool_id: &str, pair: &str) -> Result<Pric
         .context("No ui_amount for coin vault")?;
     let pc_amount: f64 = pc_balance.ui_amount.context("No ui_amount for pc vault")?;
 
-    let price = pc_amount / coin_amount;
+    tracing::debug!(
+        "Raydium coin_vault_mint: {}, pc_vault_mint: {}",
+        amm_info.coin_vault_mint,
+        amm_info.pc_vault_mint
+    );
+
+    // Normalize: base_liquidity = non-SOL token reserve, quote_liquidity = SOL reserve,
+    // price = SOL per unit of the other token. Consistent across every DEX module.
+    let (base_liquidity, quote_liquidity, price) =
+        if amm_info.pc_vault_mint.to_string() == WSOL_MINT {
+            (coin_amount, pc_amount, pc_amount / coin_amount)
+        } else if amm_info.coin_vault_mint.to_string() == WSOL_MINT {
+            (pc_amount, coin_amount, coin_amount / pc_amount)
+        } else {
+            (coin_amount, pc_amount, pc_amount / coin_amount)
+        };
 
     let fee_pct = (amm_info.fees.swap_fee_numerator as f64
         / amm_info.fees.swap_fee_denominator as f64)
@@ -106,8 +121,8 @@ pub fn fetch_price(client: &RpcClient, pool_id: &str, pair: &str) -> Result<Pric
         dex: "Raydium".to_string(),
         pair: pair.to_string(),
         price,
-        base_liquidity: coin_amount,
-        quote_liquidity: pc_amount,
+        base_liquidity,
+        quote_liquidity,
         fee_pct,
         timestamp: std::time::SystemTime::now(),
     })

@@ -6,9 +6,7 @@ use std::str::FromStr;
 
 use super::PriceUpdate;
 
-const ORCA_SOL_USDC_WHIRLPOOL: &str = "7qbRF6YsyGuLUVs6Y1q64bdVrfe4ZcUUz1JRdoVNUJnm";
-const SOL_DECIMALS: i32 = 9;
-const USDC_DECIMALS: i32 = 6;
+const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
 
 #[derive(BorshDeserialize, Debug)]
 pub struct WhirlpoolRewardInfo {
@@ -53,11 +51,11 @@ pub fn fetch_price(client: &RpcClient, pool_id: &str, pair: &str) -> Result<Pric
 
     let whirlpool = Whirlpool::try_from_slice(data).context("Failed to deserialize Whirlpool")?;
 
-    let sqrt_price_f64 = whirlpool.sqrt_price as f64 / (2f64.powi(64));
-    let raw_price = sqrt_price_f64 * sqrt_price_f64;
-
-    let decimal_adjustment = 10f64.powi(SOL_DECIMALS - USDC_DECIMALS);
-    let price = raw_price * decimal_adjustment;
+    tracing::debug!(
+        "Orca token_mint_a: {}, token_mint_b: {}",
+        whirlpool.token_mint_a,
+        whirlpool.token_mint_b
+    );
 
     let vault_a_balance = client
         .get_token_account_balance(&whirlpool.token_vault_a)
@@ -66,14 +64,36 @@ pub fn fetch_price(client: &RpcClient, pool_id: &str, pair: &str) -> Result<Pric
         .get_token_account_balance(&whirlpool.token_vault_b)
         .context("Failed to fetch token vault B balance")?;
 
-    let base_liquidity = vault_a_balance
+    let vault_a_amount = vault_a_balance
         .ui_amount
         .context("No ui_amount for vault A")?;
-    let quote_liquidity = vault_b_balance
+    let vault_b_amount = vault_b_balance
         .ui_amount
         .context("No ui_amount for vault B")?;
 
-    // fee_rate is in hundredths of a basis point: fee_rate / 1_000_000 = fee as a fraction
+    // Normalize: base_liquidity = non-SOL token reserve, quote_liquidity = SOL reserve,
+    // price = SOL per unit of the other token. Consistent across every DEX module.
+    let (base_liquidity, quote_liquidity, price) =
+        if whirlpool.token_mint_a.to_string() == WSOL_MINT {
+            (
+                vault_b_amount,
+                vault_a_amount,
+                vault_a_amount / vault_b_amount,
+            )
+        } else if whirlpool.token_mint_b.to_string() == WSOL_MINT {
+            (
+                vault_a_amount,
+                vault_b_amount,
+                vault_b_amount / vault_a_amount,
+            )
+        } else {
+            (
+                vault_a_amount,
+                vault_b_amount,
+                vault_b_amount / vault_a_amount,
+            )
+        };
+
     let fee_pct = whirlpool.fee_rate as f64 / 10_000.0;
 
     Ok(PriceUpdate {

@@ -48,11 +48,12 @@ pub async fn run_polling_loop(
                     o.quote_liquidity
                 );
 
-                match analyzer::find_opportunity(r, o) {
+                match analyzer::find_opportunity(r, o, 50.0) {
                     Ok(opp) => {
                         tracing::info!(
-                            "OPPORTUNITY: buy on {} @ {:.4}, sell on {} @ {:.4}, raw spread: {:.4}%, fee-adjusted: {:.4}%",
-                            opp.buy_dex, opp.buy_price, opp.sell_dex, opp.sell_price, opp.raw_spread_pct, opp.fee_adjusted_spread_pct
+                            "OPPORTUNITY: buy on {} @ {:.4}, sell on {} @ {:.4}, raw: {:.4}%, fee-adj: {:.4}%, after slippage: {:.4}%, NET PROFIT: {:.4}%",
+                            opp.buy_dex, opp.buy_price, opp.sell_dex, opp.sell_price,
+                            opp.raw_spread_pct, opp.fee_adjusted_spread_pct, opp.net_spread_after_slippage_pct, opp.net_profit_pct
                         );
                     }
                     Err(reason) => {
