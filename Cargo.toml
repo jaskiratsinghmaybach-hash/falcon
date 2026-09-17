@@ -21,3 +21,4 @@ tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 solana-account-decoder = "2"
 borsh = "1"
 spl-token = "7"
+spl-associated-token-account = "6"
