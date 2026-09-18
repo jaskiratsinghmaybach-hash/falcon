@@ -57,6 +57,26 @@ pub fn fetch_price(client: &RpcClient, pool_id: &str, pair: &str) -> Result<Pric
         whirlpool.token_mint_b
     );
 
+    // Read actual decimals from each token's mint - needed to correctly scale sqrt_price.
+    let mint_a_info = client
+        .get_token_supply(&whirlpool.token_mint_a)
+        .context("Failed to fetch token A mint info")?;
+    let mint_b_info = client
+        .get_token_supply(&whirlpool.token_mint_b)
+        .context("Failed to fetch token B mint info")?;
+
+    let decimals_a = mint_a_info.decimals as i32;
+    let decimals_b = mint_b_info.decimals as i32;
+
+    // Price MUST come from sqrt_price, not vault ratio. Whirlpools are concentrated-liquidity:
+    // vault balances can include out-of-range liquidity that doesn't reflect the tradeable
+    // price at the current tick. sqrt_price is the pool's authoritative current price.
+    let sqrt_price_f64 = whirlpool.sqrt_price as f64 / (2f64.powi(64));
+    let raw_price = sqrt_price_f64 * sqrt_price_f64; // price of A in terms of B, raw units
+
+    let decimal_adjustment = 10f64.powi(decimals_a - decimals_b);
+    let price_b_per_a = raw_price * decimal_adjustment; // A-per-B in real UI-decimal terms
+
     let vault_a_balance = client
         .get_token_account_balance(&whirlpool.token_vault_a)
         .context("Failed to fetch token vault A balance")?;
@@ -73,25 +93,15 @@ pub fn fetch_price(client: &RpcClient, pool_id: &str, pair: &str) -> Result<Pric
 
     // Normalize: base_liquidity = non-SOL token reserve, quote_liquidity = SOL reserve,
     // price = SOL per unit of the other token. Consistent across every DEX module.
+    // NOTE: base_liquidity/quote_liquidity here reflect total vault balances (TVL),
+    // not necessarily the liquidity active at the current price tick.
     let (base_liquidity, quote_liquidity, price) =
         if whirlpool.token_mint_a.to_string() == WSOL_MINT {
-            (
-                vault_b_amount,
-                vault_a_amount,
-                vault_a_amount / vault_b_amount,
-            )
+            (vault_b_amount, vault_a_amount, 1.0 / price_b_per_a)
         } else if whirlpool.token_mint_b.to_string() == WSOL_MINT {
-            (
-                vault_a_amount,
-                vault_b_amount,
-                vault_b_amount / vault_a_amount,
-            )
+            (vault_a_amount, vault_b_amount, price_b_per_a)
         } else {
-            (
-                vault_a_amount,
-                vault_b_amount,
-                vault_b_amount / vault_a_amount,
-            )
+            (vault_a_amount, vault_b_amount, price_b_per_a)
         };
 
     let fee_pct = whirlpool.fee_rate as f64 / 10_000.0;
