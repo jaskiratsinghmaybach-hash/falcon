@@ -17,43 +17,35 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Falcon starting up");
 
     let config = config::Config::load()?;
-
-    tracing::info!("Falcon initialized and ready");
-
     let client = RpcClient::new(config.helius_rpc_url.clone());
 
-    // Fetch the pool's real vault addresses first.
-    let vaults = scanner::raydium::fetch_pool_vaults(&client, &config.raydium_pool_id)?;
+    let wsol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112")?;
+
+    let amount_in = 1_000_000; // 0.001 SOL in lamports
+    let minimum_amount_out = 1; // no slippage protection for this dry run
+
+    // --- Orca side test ---
+    let orca_pool = Pubkey::from_str(&config.orca_pool_id)?;
+    let orca_info = scanner::orca::fetch_pool_info(&client, &config.orca_pool_id)?;
     tracing::info!(
-        "Pool coin_vault: {}, pc_vault: {}",
-        vaults.coin_vault,
-        vaults.pc_vault
+        "Orca pool: tick_current={}, tick_spacing={}, mint_a={}, mint_b={}",
+        orca_info.tick_current_index,
+        orca_info.tick_spacing,
+        orca_info.token_mint_a,
+        orca_info.token_mint_b
     );
 
-    // Stage 3 test: simulate a tiny Raydium swap (buying RAY with a small amount of SOL)
-    // using our known, verified pool accounts. This does NOT send a real transaction.
-    let ray_mint = Pubkey::from_str("4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R")?;
-    let wsol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112")?;
-    let amm_pool = Pubkey::from_str(&config.raydium_pool_id)?;
-    let amm_authority = Pubkey::from_str("5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1")?;
-
-    let amount_in = 1_000_000; // 0.001 SOL in lamports, a tiny test amount
-    let minimum_amount_out = 1; // essentially no slippage protection for this dry-run test
-
-    match executor::simulate_raydium_swap(
+    match executor::simulate_orca_swap(
         &client,
         &config.keypair,
-        &amm_pool,
-        &amm_authority,
-        &vaults.coin_vault,
-        &vaults.pc_vault,
+        &orca_pool,
+        &orca_info,
         &wsol_mint,
-        &ray_mint,
         amount_in,
         minimum_amount_out,
     ) {
-        Ok(_) => tracing::info!("Simulation call completed"),
-        Err(e) => tracing::error!("Simulation setup failed: {}", e),
+        Ok(_) => tracing::info!("Orca simulation call completed"),
+        Err(e) => tracing::error!("Orca simulation setup failed: {}", e),
     }
 
     Ok(())
