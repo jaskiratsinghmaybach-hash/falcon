@@ -74,6 +74,27 @@ pub struct AmmInfo {
     pub padding2: u64,
 }
 
+pub struct PoolVaults {
+    pub coin_vault: Pubkey,
+    pub pc_vault: Pubkey,
+}
+
+pub fn fetch_pool_vaults(client: &RpcClient, pool_id: &str) -> Result<PoolVaults> {
+    let pool_pubkey = Pubkey::from_str(pool_id).context("Invalid pool pubkey format")?;
+
+    let account = client
+        .get_account(&pool_pubkey)
+        .context("Failed to fetch pool account")?;
+
+    let amm_info =
+        AmmInfo::try_from_slice(&account.data).context("Failed to deserialize AmmInfo")?;
+
+    Ok(PoolVaults {
+        coin_vault: amm_info.coin_vault,
+        pc_vault: amm_info.pc_vault,
+    })
+}
+
 pub fn fetch_price(client: &RpcClient, pool_id: &str, pair: &str) -> Result<PriceUpdate> {
     let pool_pubkey = Pubkey::from_str(pool_id).context("Invalid pool pubkey format")?;
 
