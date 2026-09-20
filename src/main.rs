@@ -19,7 +19,7 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("Falcon initialized and ready");
 
-    let ray_mint = Pubkey::from_str("4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R")?;
+    let jup_mint = Pubkey::from_str("JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN")?;
     let amm_authority = Pubkey::from_str("5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1")?;
 
     scanner::run_polling_loop(
@@ -28,10 +28,10 @@ async fn main() -> anyhow::Result<()> {
         &config.raydium_pool_id,
         &config.orca_pool_id,
         &config.keypair,
-        &ray_mint,
-        6, // RAY decimals
-        &amm_authority,
-        50.0, // trade size in base token units
+        &jup_mint,      // now points to JUP mint
+        6,              // JUP decimals
+        &amm_authority, // NOTE: this will be wrong for the new pool - see below
+        50.0,
     )
     .await?;
 

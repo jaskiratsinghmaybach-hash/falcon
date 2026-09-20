@@ -89,6 +89,11 @@ pub fn fetch_pool_vaults(client: &RpcClient, pool_id: &str) -> Result<PoolVaults
     let amm_info =
         AmmInfo::try_from_slice(&account.data).context("Failed to deserialize AmmInfo")?;
 
+    let coin_account_info = client.get_account(&amm_info.coin_vault)?;
+    let owner_bytes = &coin_account_info.data[32..64];
+    let vault_owner = Pubkey::try_from(owner_bytes).context("Failed to parse vault owner")?;
+    tracing::info!("New pool's amm_authority: {}", vault_owner);
+
     Ok(PoolVaults {
         coin_vault: amm_info.coin_vault,
         pc_vault: amm_info.pc_vault,
