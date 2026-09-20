@@ -1,5 +1,6 @@
 pub mod orca;
 pub mod raydium;
+pub mod raydium_cpmm;
 
 use anyhow::{bail, Context, Result};
 use solana_client::rpc_client::RpcClient;
