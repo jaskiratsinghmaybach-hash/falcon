@@ -32,25 +32,26 @@ pub enum RejectReason {
     },
 }
 
-fn estimate_slippage_pct(base_reserve: f64, quote_reserve: f64, trade_size_quote: f64) -> f64 {
+/// How many base tokens you actually receive for spending `input_quote` into a
+/// constant-product pool with the given reserves.
+pub fn estimate_output_amount(base_reserve: f64, quote_reserve: f64, input_quote: f64) -> f64 {
     let k = base_reserve * quote_reserve;
-    let new_quote_reserve = quote_reserve + trade_size_quote;
+    let new_quote_reserve = quote_reserve + input_quote;
     let new_base_reserve = k / new_quote_reserve;
-    let base_received = base_reserve - new_base_reserve;
+    base_reserve - new_base_reserve
+}
 
+fn estimate_slippage_pct(base_reserve: f64, quote_reserve: f64, trade_size_quote: f64) -> f64 {
+    let base_received = estimate_output_amount(base_reserve, quote_reserve, trade_size_quote);
     let spot_price = quote_reserve / base_reserve;
     let effective_price = trade_size_quote / base_received;
-
     ((effective_price - spot_price) / spot_price) * 100.0
 }
 
-// Placeholder gas/tip cost model until the Executor gives us real numbers.
-// Two transactions (buy + sell), each with a base fee + Jito tip, converted to
-// a percentage of the trade's SOL value so it can be subtracted from the spread.
 fn estimate_cost_pct(trade_size_base: f64, buy_price_sol: f64) -> f64 {
-    const BASE_TX_FEE_SOL: f64 = 0.000005; // Solana base fee per signature, ~5000 lamports
-    const JITO_TIP_SOL: f64 = 0.0001; // conservative placeholder tip per bundle, refine later
-    const NUM_TRANSACTIONS: f64 = 2.0; // buy + sell
+    const BASE_TX_FEE_SOL: f64 = 0.000005;
+    const JITO_TIP_SOL: f64 = 0.0001;
+    const NUM_TRANSACTIONS: f64 = 2.0;
 
     let total_fixed_cost_sol = (BASE_TX_FEE_SOL + JITO_TIP_SOL) * NUM_TRANSACTIONS;
     let trade_value_sol = trade_size_base * buy_price_sol;
@@ -119,7 +120,6 @@ pub fn find_opportunity(
     let cost_pct = estimate_cost_pct(trade_size_base, buy.price);
     let net_profit_pct = net_spread_after_slippage_pct - cost_pct;
 
-    // Hard rule: if net profit is zero or negative, never proceed.
     if net_profit_pct <= 0.0 {
         return Err(RejectReason::NetProfitNotPositive { net_profit_pct });
     }

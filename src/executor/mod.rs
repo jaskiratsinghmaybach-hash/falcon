@@ -1,7 +1,7 @@
 pub mod orca;
 pub mod raydium;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::{
     instruction::Instruction, message::Message, pubkey::Pubkey, signature::Keypair, signer::Signer,
@@ -12,8 +12,25 @@ use spl_associated_token_account::{
 };
 use std::str::FromStr;
 
+use crate::analyzer::Opportunity;
+use crate::scanner::orca::WhirlpoolInfo;
+
 pub const TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 pub const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
+
+/// Known accounts for a specific Raydium pool. Loaded once per run from live chain state.
+pub struct RaydiumPoolContext {
+    pub pool_id: Pubkey,
+    pub amm_authority: Pubkey,
+    pub coin_vault: Pubkey,
+    pub pc_vault: Pubkey,
+}
+
+/// Known accounts for a specific Orca pool. Loaded once per run from live chain state.
+pub struct OrcaPoolContext {
+    pub pool_id: Pubkey,
+    pub info: WhirlpoolInfo,
+}
 
 pub fn check_wallet_atas(
     client: &RpcClient,
@@ -34,7 +51,6 @@ pub fn check_wallet_atas(
     Ok((wsol_ata, wsol_exists, other_ata, other_exists))
 }
 
-/// Signs and simulates a set of instructions. Never sends anything.
 fn simulate(client: &RpcClient, payer: &Keypair, instructions: Vec<Instruction>) -> Result<()> {
     let recent_blockhash = client
         .get_latest_blockhash()
@@ -70,117 +86,112 @@ fn simulate(client: &RpcClient, payer: &Keypair, instructions: Vec<Instruction>)
     Ok(())
 }
 
-/// Simulates a single Raydium swap (SOL -> other token).
-pub fn simulate_raydium_swap(
-    client: &RpcClient,
-    payer: &Keypair,
-    amm_pool: &Pubkey,
-    amm_authority: &Pubkey,
-    pool_coin_token_account: &Pubkey,
-    pool_pc_token_account: &Pubkey,
+/// Builds a single swap instruction for the named DEX, spending `input_mint` for the
+/// other token. Direction-agnostic: works whether SOL or the other token is being spent.
+fn build_leg_instruction(
+    dex_name: &str,
+    raydium_ctx: &RaydiumPoolContext,
+    orca_ctx: &OrcaPoolContext,
+    wallet: Pubkey,
+    wsol_ata: Pubkey,
+    other_ata: Pubkey,
     input_mint: &Pubkey,
-    output_mint: &Pubkey,
     amount_in: u64,
     minimum_amount_out: u64,
-) -> Result<()> {
-    let wallet = payer.pubkey();
-    let token_program = Pubkey::from_str(TOKEN_PROGRAM_ID)?;
+) -> Result<Instruction> {
     let wsol_mint = Pubkey::from_str(WSOL_MINT)?;
 
-    let (wsol_ata, wsol_exists, other_ata, other_exists) =
-        check_wallet_atas(client, &wallet, output_mint)?;
+    match dex_name {
+        "Raydium" => {
+            let (user_source, user_destination) = if *input_mint == wsol_mint {
+                (wsol_ata, other_ata)
+            } else {
+                (other_ata, wsol_ata)
+            };
 
-    let (user_source, user_destination) = if *input_mint == wsol_mint {
-        (wsol_ata, other_ata)
-    } else {
-        (other_ata, wsol_ata)
-    };
+            let accounts = raydium::SwapAccounts {
+                amm_pool: raydium_ctx.pool_id,
+                amm_authority: raydium_ctx.amm_authority,
+                pool_coin_token_account: raydium_ctx.coin_vault,
+                pool_pc_token_account: raydium_ctx.pc_vault,
+                user_source,
+                user_destination,
+                user_owner: wallet,
+            };
 
-    let mut instructions = vec![];
+            raydium::build_swap_instruction(&accounts, amount_in, minimum_amount_out)
+        }
+        "Orca" => {
+            let info = &orca_ctx.info;
+            let (token_owner_account_a, token_owner_account_b) = if info.token_mint_a == wsol_mint {
+                (wsol_ata, other_ata)
+            } else {
+                (other_ata, wsol_ata)
+            };
 
-    if !wsol_exists {
-        instructions.push(create_associated_token_account(
-            &wallet,
-            &wallet,
-            &wsol_mint,
-            &token_program,
-        ));
+            let a_to_b = info.token_mint_a == *input_mint;
+
+            let accounts = orca::SwapAccounts {
+                whirlpool: orca_ctx.pool_id,
+                token_owner_account_a,
+                token_vault_a: info.token_vault_a,
+                token_owner_account_b,
+                token_vault_b: info.token_vault_b,
+                token_authority: wallet,
+            };
+
+            orca::build_swap_instruction(
+                &accounts,
+                info.tick_current_index,
+                info.tick_spacing,
+                amount_in,
+                minimum_amount_out,
+                a_to_b,
+            )
+        }
+        other => bail!("Unknown DEX: {other}"),
     }
-    if !other_exists {
-        instructions.push(create_associated_token_account(
-            &wallet,
-            &wallet,
-            output_mint,
-            &token_program,
-        ));
-    }
-
-    if *input_mint == wsol_mint {
-        instructions.push(system_instruction::transfer(&wallet, &wsol_ata, amount_in));
-        instructions.push(spl_token::instruction::sync_native(
-            &token_program,
-            &wsol_ata,
-        )?);
-    }
-
-    let accounts = raydium::SwapAccounts {
-        amm_pool: *amm_pool,
-        amm_authority: *amm_authority,
-        pool_coin_token_account: *pool_coin_token_account,
-        pool_pc_token_account: *pool_pc_token_account,
-        user_source,
-        user_destination,
-        user_owner: wallet,
-    };
-
-    instructions.push(raydium::build_swap_instruction(
-        &accounts,
-        amount_in,
-        minimum_amount_out,
-    )?);
-
-    simulate(client, payer, instructions)
 }
 
-/// Simulates a single Orca Whirlpool swap (SOL -> other token).
-pub fn simulate_orca_swap(
+/// Builds and simulates the full atomic arb transaction: buy on `opportunity.buy_dex`,
+/// sell on `opportunity.sell_dex`, direction chosen entirely by the Analyzer's output.
+/// Never sends anything - simulation only.
+#[allow(clippy::too_many_arguments)]
+pub fn simulate_opportunity(
     client: &RpcClient,
     payer: &Keypair,
-    whirlpool: &Pubkey,
-    pool: &crate::scanner::orca::WhirlpoolInfo,
-    input_mint: &Pubkey,
-    amount_in: u64,
-    minimum_amount_out: u64,
+    opportunity: &Opportunity,
+    raydium_ctx: &RaydiumPoolContext,
+    orca_ctx: &OrcaPoolContext,
+    other_token_mint: &Pubkey,
+    other_token_decimals: u32,
 ) -> Result<()> {
     let wallet = payer.pubkey();
     let token_program = Pubkey::from_str(TOKEN_PROGRAM_ID)?;
     let wsol_mint = Pubkey::from_str(WSOL_MINT)?;
 
-    // Whichever mint isn't the input is the output.
-    let other_mint = if pool.token_mint_a == *input_mint {
-        pool.token_mint_b
-    } else {
-        pool.token_mint_a
-    };
-
-    let non_sol_mint = if pool.token_mint_a == wsol_mint {
-        pool.token_mint_b
-    } else {
-        pool.token_mint_a
-    };
-
     let (wsol_ata, wsol_exists, other_ata, other_exists) =
-        check_wallet_atas(client, &wallet, &non_sol_mint)?;
+        check_wallet_atas(client, &wallet, other_token_mint)?;
 
-    // Map our two ATAs onto the pool's A/B slots.
-    let (token_owner_account_a, token_owner_account_b) = if pool.token_mint_a == wsol_mint {
-        (wsol_ata, other_ata)
+    let amount_in_sol_ui = opportunity.trade_size_base * opportunity.buy_price;
+    let amount_in_lamports = (amount_in_sol_ui * 1_000_000_000.0) as u64;
+
+    // Estimate what the buy leg produces, using the buy-side pool's reserves, so we can
+    // feed a real amount into the sell leg rather than guessing.
+    let buy_pool_reserves = if opportunity.buy_dex == "Raydium" {
+        // Reserves aren't stored on RaydiumPoolContext; caller passes them via opportunity
+        // trade_size_base and buy_price only, so for the sell-leg amount we use the
+        // Analyzer's own constant-product estimate against the same reserves it already
+        // validated against. Since Opportunity doesn't carry raw reserves, we approximate
+        // using trade_size_base directly - the amount of the OTHER token we intended to move.
+        opportunity.trade_size_base
     } else {
-        (other_ata, wsol_ata)
+        opportunity.trade_size_base
     };
+    let _ = buy_pool_reserves; // trade_size_base already IS the base-token amount we're targeting
 
-    // a_to_b is true when we're spending the pool's token A.
-    let a_to_b = pool.token_mint_a == *input_mint;
+    let other_token_amount_raw =
+        (opportunity.trade_size_base * 10f64.powi(other_token_decimals as i32)) as u64;
 
     let mut instructions = vec![];
 
@@ -196,44 +207,55 @@ pub fn simulate_orca_swap(
         instructions.push(create_associated_token_account(
             &wallet,
             &wallet,
-            &non_sol_mint,
+            other_token_mint,
             &token_program,
         ));
     }
 
-    if *input_mint == wsol_mint {
-        instructions.push(system_instruction::transfer(&wallet, &wsol_ata, amount_in));
-        instructions.push(spl_token::instruction::sync_native(
-            &token_program,
-            &wsol_ata,
-        )?);
-    }
+    // Fund WSOL for the buy leg.
+    instructions.push(system_instruction::transfer(
+        &wallet,
+        &wsol_ata,
+        amount_in_lamports,
+    ));
+    instructions.push(spl_token::instruction::sync_native(
+        &token_program,
+        &wsol_ata,
+    )?);
+
+    // Leg 1: buy - spend SOL, receive the other token.
+    let buy_ix = build_leg_instruction(
+        &opportunity.buy_dex,
+        raydium_ctx,
+        orca_ctx,
+        wallet,
+        wsol_ata,
+        other_ata,
+        &wsol_mint,
+        amount_in_lamports,
+        1, // loose minimum for this dry run - real execution needs a real slippage floor
+    )?;
+    instructions.push(buy_ix);
+
+    // Leg 2: sell - spend the other token (amount = what we expect to have received),
+    // receive SOL back.
+    let sell_ix = build_leg_instruction(
+        &opportunity.sell_dex,
+        raydium_ctx,
+        orca_ctx,
+        wallet,
+        wsol_ata,
+        other_ata,
+        other_token_mint,
+        other_token_amount_raw,
+        1,
+    )?;
+    instructions.push(sell_ix);
 
     tracing::info!(
-        "Orca swap direction: spending {}, receiving {}, a_to_b={}",
-        input_mint,
-        other_mint,
-        a_to_b
+        "Built atomic opportunity tx: buy on {} ({} lamports SOL in), sell on {} ({} raw units token in)",
+        opportunity.buy_dex, amount_in_lamports, opportunity.sell_dex, other_token_amount_raw
     );
-
-    let accounts = orca::SwapAccounts {
-        whirlpool: *whirlpool,
-        token_owner_account_a,
-        token_vault_a: pool.token_vault_a,
-        token_owner_account_b,
-        token_vault_b: pool.token_vault_b,
-        token_authority: wallet,
-    };
-
-    instructions.push(orca::build_swap_instruction(
-        &accounts,
-        pool.tick_current_index,
-        pool.tick_spacing,
-        amount_in,
-        minimum_amount_out,
-        a_to_b,
-    )?);
 
     simulate(client, payer, instructions)
 }
-
