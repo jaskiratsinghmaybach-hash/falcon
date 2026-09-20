@@ -33,6 +33,102 @@ pub struct OrcaPoolContext {
     pub info: WhirlpoolInfo,
 }
 
+pub fn simulate_cpmm_swap(
+    client: &RpcClient,
+    payer: &Keypair,
+    pool_info: &crate::scanner::raydium_cpmm::CpmmPoolInfo,
+    input_mint: &Pubkey,
+    amount_in: u64,
+    minimum_amount_out: u64,
+) -> Result<()> {
+    let wallet = payer.pubkey();
+    let wsol_mint = Pubkey::from_str(WSOL_MINT)?;
+
+    let output_mint = if pool_info.token_0_mint == *input_mint {
+        pool_info.token_1_mint
+    } else {
+        pool_info.token_0_mint
+    };
+
+    let non_sol_mint = if pool_info.token_0_mint == wsol_mint {
+        pool_info.token_1_mint
+    } else {
+        pool_info.token_0_mint
+    };
+
+    let (wsol_ata, wsol_exists, other_ata, other_exists) =
+        check_wallet_atas(client, &wallet, &non_sol_mint)?;
+
+    let (input_token_account, output_token_account) = if *input_mint == wsol_mint {
+        (wsol_ata, other_ata)
+    } else {
+        (other_ata, wsol_ata)
+    };
+
+    let (input_vault, output_vault) = if pool_info.token_0_mint == *input_mint {
+        (pool_info.token_0_vault, pool_info.token_1_vault)
+    } else {
+        (pool_info.token_1_vault, pool_info.token_0_vault)
+    };
+
+    let (input_token_program, output_token_program) = if pool_info.token_0_mint == *input_mint {
+        (pool_info.token_0_program, pool_info.token_1_program)
+    } else {
+        (pool_info.token_1_program, pool_info.token_0_program)
+    };
+
+    let mut instructions = vec![];
+    let token_program = Pubkey::from_str(TOKEN_PROGRAM_ID)?;
+
+    if !wsol_exists {
+        instructions.push(create_associated_token_account(
+            &wallet,
+            &wallet,
+            &wsol_mint,
+            &token_program,
+        ));
+    }
+    if !other_exists {
+        instructions.push(create_associated_token_account(
+            &wallet,
+            &wallet,
+            &non_sol_mint,
+            &token_program,
+        ));
+    }
+
+    if *input_mint == wsol_mint {
+        instructions.push(system_instruction::transfer(&wallet, &wsol_ata, amount_in));
+        instructions.push(spl_token::instruction::sync_native(
+            &token_program,
+            &wsol_ata,
+        )?);
+    }
+
+    let accounts = raydium_cpmm::SwapAccounts {
+        payer: wallet,
+        amm_config: pool_info.amm_config,
+        pool_state: pool_info.pool_state,
+        input_token_account,
+        output_token_account,
+        input_vault,
+        output_vault,
+        input_token_program,
+        output_token_program,
+        input_token_mint: *input_mint,
+        output_token_mint: output_mint,
+        observation_state: pool_info.observation_key,
+    };
+
+    instructions.push(raydium_cpmm::build_swap_instruction(
+        &accounts,
+        amount_in,
+        minimum_amount_out,
+    )?);
+
+    simulate(client, payer, instructions)
+}
+
 pub fn check_wallet_atas(
     client: &RpcClient,
     wallet: &Pubkey,

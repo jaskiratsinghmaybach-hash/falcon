@@ -103,6 +103,12 @@ pub fn fetch_price(client: &RpcClient, pool_id: &str, pair: &str) -> Result<Pric
     let pool_state = load_pool_state(client, pool_id)?;
 
     tracing::debug!(
+        "CPMM mint_0_decimals: {}, mint_1_decimals: {}",
+        pool_state.mint_0_decimals,
+        pool_state.mint_1_decimals
+    );
+
+    tracing::debug!(
         "CPMM token_0_mint: {}, token_1_mint: {}",
         pool_state.token_0_mint,
         pool_state.token_1_mint
