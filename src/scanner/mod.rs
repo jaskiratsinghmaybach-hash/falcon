@@ -37,13 +37,7 @@ pub async fn run_polling_loop(
     let client = RpcClient::new(rpc_url.to_string());
 
     // Pool contexts are static (accounts don't change), fetch once up front.
-    let raydium_vaults = raydium::fetch_pool_vaults(&client, raydium_pool_id)?;
-    let raydium_ctx = executor::RaydiumPoolContext {
-        pool_id: Pubkey::from_str(raydium_pool_id)?,
-        amm_authority: *amm_authority,
-        coin_vault: raydium_vaults.coin_vault,
-        pc_vault: raydium_vaults.pc_vault,
-    };
+    let cpmm_pool_info = raydium_cpmm::fetch_pool_info(&client, raydium_pool_id)?;
 
     let orca_info = orca::fetch_pool_info(&client, orca_pool_id)?;
     let orca_ctx = executor::OrcaPoolContext {
@@ -52,7 +46,7 @@ pub async fn run_polling_loop(
     };
 
     loop {
-        let raydium_result = raydium::fetch_price(&client, raydium_pool_id, pair);
+        let raydium_result = raydium_cpmm::fetch_price(&client, raydium_pool_id, pair);
         let orca_result = orca::fetch_price(&client, orca_pool_id, pair);
 
         match (&raydium_result, &orca_result) {
@@ -76,8 +70,8 @@ pub async fn run_polling_loop(
 
                 match analyzer::find_opportunity(r, o, trade_size_base) {
                     Ok(opp) => {
-                        tracing::info!(
-                            "OPPORTUNITY: buy on {} @ {:.4}, sell on {} @ {:.4}, NET PROFIT: {:.4}%",
+                        tracing::warn!(
+                            "🔥 REAL OPPORTUNITY: buy on {} @ {:.8}, sell on {} @ {:.8}, NET PROFIT: {:.4}%",
                             opp.buy_dex, opp.buy_price, opp.sell_dex, opp.sell_price, opp.net_profit_pct
                         );
 
@@ -97,25 +91,6 @@ pub async fn run_polling_loop(
                             opp.net_profit_pct,
                             "APPROVED",
                         );
-
-                        let fresh_orca_info = orca::fetch_pool_info(&client, orca_pool_id)?;
-                        let fresh_orca_ctx = executor::OrcaPoolContext {
-                            pool_id: orca_ctx.pool_id,
-                            info: fresh_orca_info,
-                        };
-
-                        match executor::simulate_opportunity(
-                            &client,
-                            payer,
-                            &opp,
-                            &raydium_ctx,
-                            &fresh_orca_ctx,
-                            other_token_mint,
-                            other_token_decimals,
-                        ) {
-                            Ok(_) => tracing::info!("Opportunity simulation completed"),
-                            Err(e) => tracing::error!("Opportunity simulation failed: {}", e),
-                        }
                     }
                     Err(reason) => {
                         tracing::info!("No opportunity: {:?}", reason);
