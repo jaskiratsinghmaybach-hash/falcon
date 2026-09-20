@@ -5,11 +5,9 @@ pub mod raydium_cpmm;
 use anyhow::Result;
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::{pubkey::Pubkey, signature::Keypair};
-use std::str::FromStr;
 use std::time::Duration;
 
 use crate::analyzer;
-use crate::executor;
 
 #[derive(Debug, Clone)]
 pub struct PriceUpdate {
@@ -28,22 +26,12 @@ pub async fn run_polling_loop(
     pair: &str,
     raydium_pool_id: &str,
     orca_pool_id: &str,
-    payer: &Keypair,
-    other_token_mint: &Pubkey,
-    other_token_decimals: u32,
-    amm_authority: &Pubkey,
-    trade_size_base: f64,
+    _payer: &Keypair,
+    _other_token_mint: &Pubkey,
+    _other_token_decimals: u32,
+    _trade_size_base: f64,
 ) -> Result<()> {
     let client = RpcClient::new(rpc_url.to_string());
-
-    // Pool contexts are static (accounts don't change), fetch once up front.
-    let cpmm_pool_info = raydium_cpmm::fetch_pool_info(&client, raydium_pool_id)?;
-
-    let orca_info = orca::fetch_pool_info(&client, orca_pool_id)?;
-    let orca_ctx = executor::OrcaPoolContext {
-        pool_id: Pubkey::from_str(orca_pool_id)?,
-        info: orca_info,
-    };
 
     loop {
         let raydium_result = raydium_cpmm::fetch_price(&client, raydium_pool_id, pair);
@@ -52,7 +40,7 @@ pub async fn run_polling_loop(
         match (&raydium_result, &orca_result) {
             (Ok(r), Ok(o)) => {
                 tracing::info!(
-                    "[{}] {} price: {:.4} (base liq: {:.2}, quote liq: {:.2})",
+                    "[{}] {} price: {:.10} (base liq: {:.2}, quote liq: {:.2})",
                     r.dex,
                     r.pair,
                     r.price,
@@ -60,7 +48,7 @@ pub async fn run_polling_loop(
                     r.quote_liquidity
                 );
                 tracing::info!(
-                    "[{}] {} price: {:.4} (base liq: {:.2}, quote liq: {:.2})",
+                    "[{}] {} price: {:.10} (base liq: {:.2}, quote liq: {:.2})",
                     o.dex,
                     o.pair,
                     o.price,
@@ -68,10 +56,10 @@ pub async fn run_polling_loop(
                     o.quote_liquidity
                 );
 
-                match analyzer::find_opportunity(r, o, trade_size_base) {
+                match analyzer::find_opportunity(r, o, _trade_size_base) {
                     Ok(opp) => {
                         tracing::warn!(
-                            "🔥 REAL OPPORTUNITY: buy on {} @ {:.8}, sell on {} @ {:.8}, NET PROFIT: {:.4}%",
+                            "REAL OPPORTUNITY: buy on {} @ {:.10}, sell on {} @ {:.10}, NET PROFIT: {:.4}%",
                             opp.buy_dex, opp.buy_price, opp.sell_dex, opp.sell_price, opp.net_profit_pct
                         );
 
@@ -130,3 +118,4 @@ pub async fn run_polling_loop(
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
+
