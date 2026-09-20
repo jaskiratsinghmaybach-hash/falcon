@@ -56,7 +56,7 @@ pub async fn run_polling_loop(
                     o.quote_liquidity
                 );
 
-                match analyzer::find_opportunity(r, o, _trade_size_base) {
+                match analyzer::find_best_opportunity(r, o) {
                     Ok(opp) => {
                         tracing::warn!(
                             "REAL OPPORTUNITY: buy on {} @ {:.10}, sell on {} @ {:.10}, NET PROFIT: {:.4}%",
@@ -118,4 +118,3 @@ pub async fn run_polling_loop(
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
-

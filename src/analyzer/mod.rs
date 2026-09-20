@@ -59,6 +59,69 @@ fn estimate_cost_pct(trade_size_base: f64, buy_price_sol: f64) -> f64 {
     (total_fixed_cost_sol / trade_value_sol) * 100.0
 }
 
+/// Tries several trade sizes (as fractions of the thinner pool's reserves) and
+/// returns whichever produces the best outcome - either the highest-profit
+/// approved Opportunity, or if none are profitable, the least-bad rejection
+/// (so we can still see how close we got).
+pub fn find_best_opportunity(
+    price_a: &PriceUpdate,
+    price_b: &PriceUpdate,
+) -> Result<Opportunity, RejectReason> {
+    const SIZE_FRACTIONS: [f64; 6] = [0.001, 0.005, 0.01, 0.02, 0.05, 0.10];
+
+    let thinner_pool_liquidity = price_a.base_liquidity.min(price_b.base_liquidity);
+
+    let mut best_opportunity: Option<Opportunity> = None;
+    let mut least_bad_rejection: Option<RejectReason> = None;
+    let mut least_bad_net_pct = f64::NEG_INFINITY;
+
+    for fraction in SIZE_FRACTIONS {
+        let trade_size = thinner_pool_liquidity * fraction;
+
+        match find_opportunity(price_a, price_b, trade_size) {
+            Ok(opp) => {
+                let is_better = match &best_opportunity {
+                    Some(current_best) => opp.net_profit_pct > current_best.net_profit_pct,
+                    None => true,
+                };
+                if is_better {
+                    best_opportunity = Some(opp);
+                }
+            }
+            Err(reason) => {
+                // Track the rejection with the highest (least negative) net_pct we saw,
+                // so we know how close the best-scanned size came to being profitable.
+                let net_pct = match &reason {
+                    RejectReason::SlippageExceedsSpread { net_pct } => *net_pct,
+                    RejectReason::NetProfitNotPositive { net_profit_pct } => *net_profit_pct,
+                    RejectReason::FeesExceedSpread { fee_adjusted_pct } => *fee_adjusted_pct,
+                    _ => f64::NEG_INFINITY,
+                };
+                if best_opportunity.is_none() && net_pct > least_bad_net_pct {
+                    least_bad_net_pct = net_pct;
+                    least_bad_rejection = Some(reason);
+                }
+            }
+        }
+    }
+
+    match best_opportunity {
+        Some(opp) => Ok(opp),
+        None => Err(least_bad_rejection.unwrap_or(RejectReason::NoSpread)),
+    }
+}
+
+/// Picks a trade size that's reasonable relative to the thinner pool's depth,
+/// so we're testing a realistic trade rather than an impossible one.
+/// This is NOT the flashloan optimal-sizing logic (that's a separate, more
+/// rigorous calculation for later) - just a sane default for pre-flashloan testing.
+pub fn safe_trade_size(pool_a_base_liquidity: f64, pool_b_base_liquidity: f64) -> f64 {
+    const SAFETY_FRACTION: f64 = 0.01; // 1% of the thinner pool's reserves
+
+    let thinner_pool_liquidity = pool_a_base_liquidity.min(pool_b_base_liquidity);
+    thinner_pool_liquidity * SAFETY_FRACTION
+}
+
 pub fn find_opportunity(
     price_a: &PriceUpdate,
     price_b: &PriceUpdate,
