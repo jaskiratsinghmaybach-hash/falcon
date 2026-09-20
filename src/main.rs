@@ -1,6 +1,7 @@
 mod analyzer;
 mod config;
 mod executor;
+mod logger;
 mod scanner;
 
 use solana_sdk::pubkey::Pubkey;
@@ -12,6 +13,8 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .init();
+
+    logger::ensure_header()?;
 
     tracing::info!("Falcon starting up");
 

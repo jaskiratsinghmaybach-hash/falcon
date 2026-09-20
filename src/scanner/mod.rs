@@ -80,8 +80,23 @@ pub async fn run_polling_loop(
                             opp.buy_dex, opp.buy_price, opp.sell_dex, opp.sell_price, opp.net_profit_pct
                         );
 
-                        // Re-fetch fresh Orca pool info right before simulating - tick_current_index
-                        // can shift between polls and must be current for tick array derivation.
+                        let _ = crate::logger::log_row(
+                            pair,
+                            r.price,
+                            o.price,
+                            r.base_liquidity,
+                            r.quote_liquidity,
+                            o.base_liquidity,
+                            o.quote_liquidity,
+                            &opp.buy_dex,
+                            &opp.sell_dex,
+                            opp.raw_spread_pct,
+                            opp.fee_adjusted_spread_pct,
+                            opp.net_spread_after_slippage_pct,
+                            opp.net_profit_pct,
+                            "APPROVED",
+                        );
+
                         let fresh_orca_info = orca::fetch_pool_info(&client, orca_pool_id)?;
                         let fresh_orca_ctx = executor::OrcaPoolContext {
                             pool_id: orca_ctx.pool_id,
@@ -103,6 +118,32 @@ pub async fn run_polling_loop(
                     }
                     Err(reason) => {
                         tracing::info!("No opportunity: {:?}", reason);
+
+                        let (buy_dex, sell_dex) = if r.price < o.price {
+                            (r.dex.as_str(), o.dex.as_str())
+                        } else {
+                            (o.dex.as_str(), r.dex.as_str())
+                        };
+                        let raw_spread_pct = ((r.price.max(o.price) - r.price.min(o.price))
+                            / r.price.min(o.price))
+                            * 100.0;
+
+                        let _ = crate::logger::log_row(
+                            pair,
+                            r.price,
+                            o.price,
+                            r.base_liquidity,
+                            r.quote_liquidity,
+                            o.base_liquidity,
+                            o.quote_liquidity,
+                            buy_dex,
+                            sell_dex,
+                            raw_spread_pct,
+                            0.0,
+                            0.0,
+                            0.0,
+                            &format!("{:?}", reason),
+                        );
                     }
                 }
             }
@@ -110,6 +151,6 @@ pub async fn run_polling_loop(
             (_, Err(e)) => tracing::error!("Orca fetch failed: {}", e),
         }
 
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
