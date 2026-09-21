@@ -129,6 +129,84 @@ pub fn simulate_cpmm_swap(
     simulate(client, payer, instructions)
 }
 
+pub fn simulate_orca_swap(
+    client: &RpcClient,
+    payer: &Keypair,
+    whirlpool: &Pubkey,
+    pool: &crate::scanner::orca::WhirlpoolInfo,
+    input_mint: &Pubkey,
+    amount_in: u64,
+    minimum_amount_out: u64,
+) -> Result<()> {
+    let wallet = payer.pubkey();
+    let token_program = Pubkey::from_str(TOKEN_PROGRAM_ID)?;
+    let wsol_mint = Pubkey::from_str(WSOL_MINT)?;
+
+    let non_sol_mint = if pool.token_mint_a == wsol_mint {
+        pool.token_mint_b
+    } else {
+        pool.token_mint_a
+    };
+
+    let (wsol_ata, wsol_exists, other_ata, other_exists) =
+        check_wallet_atas(client, &wallet, &non_sol_mint)?;
+
+    let (token_owner_account_a, token_owner_account_b) = if pool.token_mint_a == wsol_mint {
+        (wsol_ata, other_ata)
+    } else {
+        (other_ata, wsol_ata)
+    };
+
+    let a_to_b = pool.token_mint_a == *input_mint;
+
+    let mut instructions = vec![];
+
+    if !wsol_exists {
+        instructions.push(create_associated_token_account(
+            &wallet,
+            &wallet,
+            &wsol_mint,
+            &token_program,
+        ));
+    }
+    if !other_exists {
+        instructions.push(create_associated_token_account(
+            &wallet,
+            &wallet,
+            &non_sol_mint,
+            &token_program,
+        ));
+    }
+
+    if *input_mint == wsol_mint {
+        instructions.push(system_instruction::transfer(&wallet, &wsol_ata, amount_in));
+        instructions.push(spl_token::instruction::sync_native(
+            &token_program,
+            &wsol_ata,
+        )?);
+    }
+
+    let accounts = orca::SwapAccounts {
+        whirlpool: *whirlpool,
+        token_owner_account_a,
+        token_vault_a: pool.token_vault_a,
+        token_owner_account_b,
+        token_vault_b: pool.token_vault_b,
+        token_authority: wallet,
+    };
+
+    instructions.push(orca::build_swap_instruction(
+        &accounts,
+        pool.tick_current_index,
+        pool.tick_spacing,
+        amount_in,
+        minimum_amount_out,
+        a_to_b,
+    )?);
+
+    simulate(client, payer, instructions)
+}
+
 pub fn check_wallet_atas(
     client: &RpcClient,
     wallet: &Pubkey,
