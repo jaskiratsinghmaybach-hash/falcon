@@ -365,8 +365,11 @@ pub fn simulate_opportunity(
     };
     let _ = buy_pool_reserves; // trade_size_base already IS the base-token amount we're targeting
 
+    // Use the Analyzer's own computed output from the buy leg, not a re-derived guess -
+    // this is the exact amount the buy leg is expected to produce, so the sell leg
+    // spends exactly that, keeping Analyzer and Executor in agreement.
     let other_token_amount_raw =
-        (opportunity.trade_size_base * 10f64.powi(other_token_decimals as i32)) as u64;
+        (opportunity.expected_output_after_buy * 10f64.powi(other_token_decimals as i32)) as u64;
 
     let mut instructions = vec![];
 
