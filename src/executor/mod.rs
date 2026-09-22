@@ -13,7 +13,7 @@ use spl_associated_token_account::{
 };
 use std::str::FromStr;
 
-use crate::analyzer::Opportunity;
+use crate::analyzer::{self, Opportunity};
 use crate::scanner::orca::WhirlpoolInfo;
 
 pub const TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
@@ -353,17 +353,6 @@ pub fn simulate_opportunity(
 
     // Estimate what the buy leg produces, using the buy-side pool's reserves, so we can
     // feed a real amount into the sell leg rather than guessing.
-    let buy_pool_reserves = if opportunity.buy_dex == "Raydium" {
-        // Reserves aren't stored on RaydiumPoolContext; caller passes them via opportunity
-        // trade_size_base and buy_price only, so for the sell-leg amount we use the
-        // Analyzer's own constant-product estimate against the same reserves it already
-        // validated against. Since Opportunity doesn't carry raw reserves, we approximate
-        // using trade_size_base directly - the amount of the OTHER token we intended to move.
-        opportunity.trade_size_base
-    } else {
-        opportunity.trade_size_base
-    };
-    let _ = buy_pool_reserves; // trade_size_base already IS the base-token amount we're targeting
 
     // Use the Analyzer's own computed output from the buy leg, not a re-derived guess -
     // this is the exact amount the buy leg is expected to produce, so the sell leg
@@ -402,6 +391,14 @@ pub fn simulate_opportunity(
     )?);
 
     // Leg 1: buy - spend SOL, receive the other token.
+    const SLIPPAGE_TOLERANCE_PCT: f64 = 1.0; // 1% tolerance below expected output
+
+    let buy_minimum_out_ui = analyzer::calculate_minimum_out(
+        opportunity.expected_output_after_buy,
+        SLIPPAGE_TOLERANCE_PCT,
+    );
+    let buy_minimum_out_raw = (buy_minimum_out_ui * 10f64.powi(other_token_decimals as i32)) as u64;
+
     let buy_ix = build_leg_instruction(
         &opportunity.buy_dex,
         raydium_ctx,
@@ -411,12 +408,18 @@ pub fn simulate_opportunity(
         other_ata,
         &wsol_mint,
         amount_in_lamports,
-        1, // loose minimum for this dry run - real execution needs a real slippage floor
+        buy_minimum_out_raw,
     )?;
     instructions.push(buy_ix);
 
     // Leg 2: sell - spend the other token (amount = what we expect to have received),
     // receive SOL back.
+    let sell_minimum_out_sol = analyzer::calculate_minimum_out(
+        opportunity.expected_output_after_sell,
+        SLIPPAGE_TOLERANCE_PCT,
+    );
+    let sell_minimum_out_lamports = (sell_minimum_out_sol * 1_000_000_000.0) as u64;
+
     let sell_ix = build_leg_instruction(
         &opportunity.sell_dex,
         raydium_ctx,
@@ -426,7 +429,7 @@ pub fn simulate_opportunity(
         other_ata,
         other_token_mint,
         other_token_amount_raw,
-        1,
+        sell_minimum_out_lamports,
     )?;
     instructions.push(sell_ix);
 
