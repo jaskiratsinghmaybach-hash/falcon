@@ -12,6 +12,7 @@ pub struct Opportunity {
     pub net_profit_pct: f64,
     pub trade_size_base: f64,
     pub expected_output_after_buy: f64,
+    pub expected_output_after_sell: f64,
     pub pair: String,
 }
 
@@ -71,6 +72,14 @@ pub fn safe_trade_size(pool_a_base_liquidity: f64, pool_b_base_liquidity: f64) -
     thinner_pool_liquidity * SAFETY_FRACTION
 }
 
+/// Calculates a safe minimum-output floor: the expected output minus a tolerance
+/// buffer, so the transaction reverts if actual execution is worse than expected
+/// by more than this margin - protecting against price movement between
+/// calculation and landing.
+pub fn calculate_minimum_out(expected_output: f64, slippage_tolerance_pct: f64) -> f64 {
+    expected_output * (1.0 - slippage_tolerance_pct / 100.0)
+}
+
 pub fn find_opportunity(
     price_a: &PriceUpdate,
     price_b: &PriceUpdate,
@@ -115,6 +124,16 @@ pub fn find_opportunity(
         buy_trade_size_quote,
     );
 
+    // The sell leg's real input is what the buy leg actually produces, not the
+    // original trade_size_base - chain the real amounts through both legs.
+    // Reserves are swapped here since we're now selling the base token for SOL,
+    // the reverse direction from the buy leg.
+    let expected_output_after_sell = estimate_output_amount(
+        sell.quote_liquidity,
+        sell.base_liquidity,
+        expected_output_after_buy,
+    );
+
     let buy_slippage_pct = estimate_slippage_pct(
         buy.base_liquidity,
         buy.quote_liquidity,
@@ -153,6 +172,7 @@ pub fn find_opportunity(
         net_profit_pct,
         trade_size_base,
         expected_output_after_buy,
+        expected_output_after_sell,
         pair: price_a.pair.clone(),
     })
 }
