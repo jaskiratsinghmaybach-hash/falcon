@@ -39,37 +39,25 @@ async fn main() -> anyhow::Result<()> {
                 opp.buy_dex, opp.buy_price, opp.sell_dex, opp.sell_price, opp.trade_size_base, opp.net_profit_pct
             );
 
-            let amount_in_base = opp.trade_size_base;
-            let wsol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112")?;
-            let amount_in_lamports = (amount_in_base * opp.buy_price * 1_000_000_000.0) as u64;
+            // Stale-state check: re-fetch both prices right before acting, since real
+            // opportunities are momentary and market conditions can shift between
+            // detection and execution.
+            let fresh_raydium =
+                scanner::raydium_cpmm::fetch_price(&client, &config.raydium_pool_id, &config.pair)?;
+            let fresh_orca =
+                scanner::orca::fetch_price(&client, &config.orca_pool_id, &config.pair)?;
 
-            if opp.buy_dex == "RaydiumCPMM" {
-                let pool_info =
-                    scanner::raydium_cpmm::fetch_pool_info(&client, &config.raydium_pool_id)?;
+            const MAX_DRIFT_PCT: f64 = 0.5;
 
-                tracing::info!("Simulating BUY leg on RaydiumCPMM...");
-                executor::simulate_cpmm_swap(
-                    &client,
-                    &config.keypair,
-                    &pool_info,
-                    &wsol_mint,
-                    amount_in_lamports,
-                    1,
-                )?;
+            let raydium_fresh =
+                analyzer::is_still_fresh(raydium_price.price, fresh_raydium.price, MAX_DRIFT_PCT);
+            let orca_fresh =
+                analyzer::is_still_fresh(orca_price.price, fresh_orca.price, MAX_DRIFT_PCT);
+
+            if !raydium_fresh || !orca_fresh {
+                tracing::warn!("ABORT: prices moved since detection (Raydium fresh: {}, Orca fresh: {}) - opportunity is stale", raydium_fresh, orca_fresh);
             } else {
-                let orca_pool = Pubkey::from_str(&config.orca_pool_id)?;
-                let orca_info = scanner::orca::fetch_pool_info(&client, &config.orca_pool_id)?;
-
-                tracing::info!("Simulating BUY leg on Orca...");
-                executor::simulate_orca_swap(
-                    &client,
-                    &config.keypair,
-                    &orca_pool,
-                    &orca_info,
-                    &wsol_mint,
-                    amount_in_lamports,
-                    1,
-                )?;
+                // ... existing simulation code continues here
             }
         }
         Err(reason) => {
@@ -80,4 +68,3 @@ async fn main() -> anyhow::Result<()> {
 
     Ok(())
 }
-

@@ -43,6 +43,15 @@ pub fn estimate_output_amount(base_reserve: f64, quote_reserve: f64, input_quote
     base_reserve - new_base_reserve
 }
 
+/// Checks whether a freshly-fetched price still roughly matches the price an
+/// Opportunity was computed from. If the market moved too much between
+/// detection and this check, the opportunity is considered stale and should
+/// be discarded rather than acted on.
+pub fn is_still_fresh(original_price: f64, current_price: f64, max_drift_pct: f64) -> bool {
+    let drift_pct = ((current_price - original_price).abs() / original_price) * 100.0;
+    drift_pct <= max_drift_pct
+}
+
 fn estimate_slippage_pct(base_reserve: f64, quote_reserve: f64, trade_size_quote: f64) -> f64 {
     let base_received = estimate_output_amount(base_reserve, quote_reserve, trade_size_quote);
     let spot_price = quote_reserve / base_reserve;
