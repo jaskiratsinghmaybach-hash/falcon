@@ -7,6 +7,7 @@ use std::str::FromStr;
 use super::PriceUpdate;
 
 const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
+const RAYDIUM_CPMM_PROGRAM: &str = "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C";
 
 #[derive(BorshDeserialize, Debug)]
 pub struct PoolState {
@@ -55,7 +56,6 @@ pub struct AmmConfig {
     pub padding: [u64; 15],
 }
 
-/// Everything the executor needs to build a CPMM swap instruction.
 #[derive(Debug, Clone)]
 pub struct CpmmPoolInfo {
     pub pool_state: Pubkey,
@@ -69,6 +69,17 @@ pub struct CpmmPoolInfo {
     pub observation_key: Pubkey,
 }
 
+fn validate_pool_account(account: &solana_sdk::account::Account, pool_id: &str) -> Result<()> {
+    let expected_owner = Pubkey::from_str(RAYDIUM_CPMM_PROGRAM)?;
+    if account.owner != expected_owner {
+        anyhow::bail!(
+            "Pool {} is not owned by Raydium CPMM program (expected {}, got {}) - wrong pool type or address",
+            pool_id, expected_owner, account.owner
+        );
+    }
+    Ok(())
+}
+
 fn load_pool_state(client: &RpcClient, pool_id: &str) -> Result<PoolState> {
     let pool_pubkey = Pubkey::from_str(pool_id).context("Invalid CPMM pool pubkey format")?;
 
@@ -76,10 +87,18 @@ fn load_pool_state(client: &RpcClient, pool_id: &str) -> Result<PoolState> {
         .get_account(&pool_pubkey)
         .context("Failed to fetch CPMM pool account")?;
 
-    // Anchor accounts carry an 8-byte discriminator before the struct data.
+    validate_pool_account(&account, pool_id)?;
+
     let data = &account.data[8..];
 
     PoolState::try_from_slice(data).context("Failed to deserialize CPMM PoolState")
+}
+
+/// Decodes PoolState from raw account bytes (no RPC call) - used by both the
+/// RPC-based fetch path and the WebSocket real-time path.
+pub fn decode_pool_state(data: &[u8]) -> Result<PoolState> {
+    let inner = &data[8..];
+    PoolState::try_from_slice(inner).context("Failed to deserialize CPMM PoolState")
 }
 
 pub fn fetch_pool_info(client: &RpcClient, pool_id: &str) -> Result<CpmmPoolInfo> {
@@ -103,12 +122,6 @@ pub fn fetch_price(client: &RpcClient, pool_id: &str, pair: &str) -> Result<Pric
     let pool_state = load_pool_state(client, pool_id)?;
 
     tracing::debug!(
-        "CPMM mint_0_decimals: {}, mint_1_decimals: {}",
-        pool_state.mint_0_decimals,
-        pool_state.mint_1_decimals
-    );
-
-    tracing::debug!(
         "CPMM token_0_mint: {}, token_1_mint: {}",
         pool_state.token_0_mint,
         pool_state.token_1_mint
@@ -128,19 +141,14 @@ pub fn fetch_price(client: &RpcClient, pool_id: &str, pair: &str) -> Result<Pric
         .ui_amount
         .context("No ui_amount for vault 1")?;
 
-    // CPMM's fee is stored on the shared AmmConfig account, not PoolState itself.
     let amm_config_account = client
         .get_account(&pool_state.amm_config)
         .context("Failed to fetch AmmConfig account")?;
     let amm_config = AmmConfig::try_from_slice(&amm_config_account.data[8..])
         .context("Failed to deserialize AmmConfig")?;
 
-    // trade_fee_rate is in units of 1/1_000_000 of volume.
     let fee_pct = (amm_config.trade_fee_rate as f64 / 1_000_000.0) * 100.0;
 
-    // Normalize: base_liquidity = non-SOL reserve, quote_liquidity = SOL reserve,
-    // price = SOL per unit of the other token. Vault ratio is valid here since CPMM
-    // is a true constant-product AMM (unlike Orca's concentrated liquidity).
     let (base_liquidity, quote_liquidity, price) =
         if pool_state.token_0_mint.to_string() == WSOL_MINT {
             (

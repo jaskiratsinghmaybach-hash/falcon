@@ -9,13 +9,10 @@ use super::TOKEN_PROGRAM_ID;
 
 pub const ORCA_WHIRLPOOL_PROGRAM: &str = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc";
 
-/// Ticks per tick array in a Whirlpool.
 const TICK_ARRAY_SIZE: i32 = 88;
 
-/// Anchor discriminator: first 8 bytes of sha256("global:swap").
 const SWAP_DISCRIMINATOR: [u8; 8] = [0xf8, 0xc6, 0x9e, 0x91, 0xe1, 0x75, 0x87, 0xc8];
 
-/// Price bounds - used as "no limit" values depending on swap direction.
 const MIN_SQRT_PRICE: u128 = 4_295_048_016;
 const MAX_SQRT_PRICE: u128 = 79_226_673_515_401_279_992_447_579_055;
 
@@ -32,7 +29,6 @@ fn program_id() -> Result<Pubkey> {
     Pubkey::from_str(ORCA_WHIRLPOOL_PROGRAM).context("Invalid Whirlpool program ID")
 }
 
-/// Round a tick index down to the start index of the tick array containing it.
 fn tick_array_start_index(tick_index: i32, tick_spacing: u16) -> i32 {
     let ticks_in_array = TICK_ARRAY_SIZE * tick_spacing as i32;
     tick_index.div_euclid(ticks_in_array) * ticks_in_array
@@ -52,8 +48,6 @@ fn derive_oracle_pda(whirlpool: &Pubkey) -> Result<Pubkey> {
     Ok(pda)
 }
 
-/// Three tick arrays, walking in the direction the price will move.
-/// a_to_b = price moves down, so we walk to lower start indices.
 fn derive_tick_arrays(
     whirlpool: &Pubkey,
     tick_current_index: i32,
@@ -71,8 +65,7 @@ fn derive_tick_arrays(
     ])
 }
 
-/// Orca Whirlpool `swap` instruction.
-/// `a_to_b` = true means spending token A to receive token B.
+/// Orca Whirlpool `swap` instruction. `a_to_b` = spending token A to receive token B.
 pub fn build_swap_instruction(
     accounts: &SwapAccounts,
     tick_current_index: i32,
@@ -92,7 +85,6 @@ pub fn build_swap_instruction(
     )?;
     let oracle = derive_oracle_pda(&accounts.whirlpool)?;
 
-    // No price limit: clamp to the extreme in whichever direction we're moving.
     let sqrt_price_limit: u128 = if a_to_b {
         MIN_SQRT_PRICE
     } else {
@@ -103,7 +95,7 @@ pub fn build_swap_instruction(
     data.extend_from_slice(&amount_in.to_le_bytes());
     data.extend_from_slice(&minimum_amount_out.to_le_bytes());
     data.extend_from_slice(&sqrt_price_limit.to_le_bytes());
-    data.push(1u8); // amount_specified_is_input = true
+    data.push(1u8);
     data.push(a_to_b as u8);
 
     let account_metas = vec![
@@ -119,14 +111,6 @@ pub fn build_swap_instruction(
         AccountMeta::new(tick_arrays[2], false),
         AccountMeta::new(oracle, false),
     ];
-
-    tracing::debug!(
-        "Orca swap: a_to_b={}, tick_current={}, tick_arrays={:?}, oracle={}",
-        a_to_b,
-        tick_current_index,
-        tick_arrays,
-        oracle
-    );
 
     Ok(Instruction {
         program_id: program,

@@ -351,9 +351,6 @@ pub fn simulate_opportunity(
     let amount_in_sol_ui = opportunity.trade_size_base * opportunity.buy_price;
     let amount_in_lamports = (amount_in_sol_ui * 1_000_000_000.0) as u64;
 
-    // Estimate what the buy leg produces, using the buy-side pool's reserves, so we can
-    // feed a real amount into the sell leg rather than guessing.
-
     // Use the Analyzer's own computed output from the buy leg, not a re-derived guess -
     // this is the exact amount the buy leg is expected to produce, so the sell leg
     // spends exactly that, keeping Analyzer and Executor in agreement.

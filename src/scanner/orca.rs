@@ -7,6 +7,7 @@ use std::str::FromStr;
 use super::PriceUpdate;
 
 const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
+const ORCA_WHIRLPOOL_PROGRAM: &str = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc";
 
 #[derive(BorshDeserialize, Debug)]
 pub struct WhirlpoolRewardInfo {
@@ -40,7 +41,6 @@ pub struct Whirlpool {
     pub reward_infos: [WhirlpoolRewardInfo; 3],
 }
 
-/// Everything the executor needs to build a Whirlpool swap instruction.
 #[derive(Debug, Clone)]
 pub struct WhirlpoolInfo {
     pub tick_current_index: i32,
@@ -51,6 +51,22 @@ pub struct WhirlpoolInfo {
     pub token_vault_b: Pubkey,
 }
 
+fn validate_pool_account(account: &solana_sdk::account::Account, pool_id: &str) -> Result<()> {
+    let expected_owner = Pubkey::from_str(ORCA_WHIRLPOOL_PROGRAM)?;
+    if account.owner != expected_owner {
+        anyhow::bail!(
+            "Pool {} is not owned by Orca Whirlpool program (expected {}, got {}) - wrong pool type or address",
+            pool_id, expected_owner, account.owner
+        );
+    }
+    Ok(())
+}
+
+pub fn decode_whirlpool(data: &[u8]) -> Result<Whirlpool> {
+    let inner = &data[8..];
+    Whirlpool::try_from_slice(inner).context("Failed to deserialize Whirlpool")
+}
+
 fn load_whirlpool(client: &RpcClient, pool_id: &str) -> Result<Whirlpool> {
     let pool_pubkey = Pubkey::from_str(pool_id).context("Invalid Whirlpool pubkey format")?;
 
@@ -58,7 +74,8 @@ fn load_whirlpool(client: &RpcClient, pool_id: &str) -> Result<Whirlpool> {
         .get_account(&pool_pubkey)
         .context("Failed to fetch Whirlpool account")?;
 
-    // Anchor accounts carry an 8-byte discriminator before the struct data.
+    validate_pool_account(&account, pool_id)?;
+
     let data = &account.data[8..];
 
     Whirlpool::try_from_slice(data).context("Failed to deserialize Whirlpool")
@@ -80,6 +97,12 @@ pub fn fetch_pool_info(client: &RpcClient, pool_id: &str) -> Result<WhirlpoolInf
 pub fn fetch_price(client: &RpcClient, pool_id: &str, pair: &str) -> Result<PriceUpdate> {
     let whirlpool = load_whirlpool(client, pool_id)?;
 
+    tracing::debug!(
+        "Orca token_mint_a: {}, token_mint_b: {}",
+        whirlpool.token_mint_a,
+        whirlpool.token_mint_b
+    );
+
     let mint_a_info = client
         .get_token_supply(&whirlpool.token_mint_a)
         .context("Failed to fetch token A mint info")?;
@@ -90,13 +113,11 @@ pub fn fetch_price(client: &RpcClient, pool_id: &str, pair: &str) -> Result<Pric
     let decimals_a = mint_a_info.decimals as i32;
     let decimals_b = mint_b_info.decimals as i32;
 
-    // Price MUST come from sqrt_price, not vault ratio. Whirlpools are concentrated-liquidity:
-    // vault balances include out-of-range liquidity that doesn't reflect the tradeable price.
     let sqrt_price_f64 = whirlpool.sqrt_price as f64 / (2f64.powi(64));
     let raw_price = sqrt_price_f64 * sqrt_price_f64;
 
     let decimal_adjustment = 10f64.powi(decimals_a - decimals_b);
-    let price_b_per_a = raw_price * decimal_adjustment; // token B per 1 token A, UI decimals
+    let price_b_per_a = raw_price * decimal_adjustment;
 
     let vault_a_balance = client
         .get_token_account_balance(&whirlpool.token_vault_a)
@@ -112,8 +133,6 @@ pub fn fetch_price(client: &RpcClient, pool_id: &str, pair: &str) -> Result<Pric
         .ui_amount
         .context("No ui_amount for vault B")?;
 
-    // Normalize: base_liquidity = non-SOL reserve, quote_liquidity = SOL reserve,
-    // price = SOL per unit of the other token.
     let (base_liquidity, quote_liquidity, price) =
         if whirlpool.token_mint_a.to_string() == WSOL_MINT {
             (vault_b_amount, vault_a_amount, 1.0 / price_b_per_a)

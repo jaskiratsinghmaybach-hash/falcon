@@ -7,7 +7,6 @@ use std::str::FromStr;
 
 pub const RAYDIUM_CPMM_PROGRAM: &str = "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C";
 
-/// Anchor sighash for "global:swap_base_input", confirmed from the published crate source.
 const SWAP_BASE_INPUT_DISCRIMINATOR: [u8; 8] = [143, 190, 90, 218, 196, 30, 51, 222];
 
 pub struct SwapAccounts {

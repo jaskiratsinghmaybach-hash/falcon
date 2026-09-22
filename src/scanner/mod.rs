@@ -1,10 +1,12 @@
 pub mod orca;
 pub mod raydium;
 pub mod raydium_cpmm;
+pub mod realtime;
 
 use anyhow::Result;
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::{pubkey::Pubkey, signature::Keypair};
+use std::sync::mpsc;
 use std::time::Duration;
 
 use crate::analyzer;
@@ -20,101 +22,155 @@ pub struct PriceUpdate {
     pub timestamp: std::time::SystemTime,
 }
 
-#[allow(clippy::too_many_arguments)]
-pub async fn run_polling_loop(
+enum Source {
+    Raydium,
+    Orca,
+}
+
+struct RealtimeEvent {
+    source: Source,
+    update: realtime::AccountUpdate,
+}
+
+/// Real-time event-driven loop: reacts the instant either pool's account changes,
+/// instead of polling on a timer. Decodes directly from the WebSocket payload.
+pub async fn run_realtime_loop(
+    ws_url: &str,
     rpc_url: &str,
     pair: &str,
     raydium_pool_id: &str,
     orca_pool_id: &str,
-    _payer: &Keypair,
-    _other_token_mint: &Pubkey,
-    _other_token_decimals: u32,
-    _trade_size_base: f64,
+    trade_size_hint: f64,
 ) -> Result<()> {
     let client = RpcClient::new(rpc_url.to_string());
+    let (tx, rx) = mpsc::channel::<RealtimeEvent>();
 
-    loop {
-        let raydium_result = raydium_cpmm::fetch_price(&client, raydium_pool_id, pair);
-        let orca_result = orca::fetch_price(&client, orca_pool_id, pair);
+    let ws_url_raydium = ws_url.to_string();
+    let raydium_pool_id_owned = raydium_pool_id.to_string();
+    let tx_raydium = tx.clone();
+    std::thread::spawn(move || {
+        let (inner_tx, inner_rx) = mpsc::channel();
+        let ws_url_clone = ws_url_raydium.clone();
+        let pool_clone = raydium_pool_id_owned.clone();
+        std::thread::spawn(move || {
+            if let Err(e) = realtime::subscribe_to_account(&ws_url_clone, &pool_clone, inner_tx) {
+                tracing::error!("Raydium subscription ended: {}", e);
+            }
+        });
+        for update in inner_rx {
+            if tx_raydium
+                .send(RealtimeEvent {
+                    source: Source::Raydium,
+                    update,
+                })
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
 
-        match (&raydium_result, &orca_result) {
-            (Ok(r), Ok(o)) => {
-                tracing::info!(
-                    "[{}] {} price: {:.10} (base liq: {:.2}, quote liq: {:.2})",
-                    r.dex,
-                    r.pair,
-                    r.price,
-                    r.base_liquidity,
-                    r.quote_liquidity
-                );
-                tracing::info!(
-                    "[{}] {} price: {:.10} (base liq: {:.2}, quote liq: {:.2})",
-                    o.dex,
-                    o.pair,
-                    o.price,
-                    o.base_liquidity,
-                    o.quote_liquidity
-                );
+    let ws_url_orca = ws_url.to_string();
+    let orca_pool_id_owned = orca_pool_id.to_string();
+    let tx_orca = tx;
+    std::thread::spawn(move || {
+        let (inner_tx, inner_rx) = mpsc::channel();
+        let ws_url_clone = ws_url_orca.clone();
+        let pool_clone = orca_pool_id_owned.clone();
+        std::thread::spawn(move || {
+            if let Err(e) = realtime::subscribe_to_account(&ws_url_clone, &pool_clone, inner_tx) {
+                tracing::error!("Orca subscription ended: {}", e);
+            }
+        });
+        for update in inner_rx {
+            if tx_orca
+                .send(RealtimeEvent {
+                    source: Source::Orca,
+                    update,
+                })
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
 
-                match analyzer::find_best_opportunity(r, o) {
-                    Ok(opp) => {
-                        tracing::warn!(
-                            "REAL OPPORTUNITY: buy on {} @ {:.10}, sell on {} @ {:.10}, NET PROFIT: {:.4}%",
-                            opp.buy_dex, opp.buy_price, opp.sell_dex, opp.sell_price, opp.net_profit_pct
-                        );
+    tracing::info!("Real-time WebSocket subscriptions started for {}", pair);
 
-                        let _ = crate::logger::log_row(
-                            pair,
-                            r.price,
-                            o.price,
-                            r.base_liquidity,
-                            r.quote_liquidity,
-                            o.base_liquidity,
-                            o.quote_liquidity,
-                            &opp.buy_dex,
-                            &opp.sell_dex,
-                            opp.raw_spread_pct,
-                            opp.fee_adjusted_spread_pct,
-                            opp.net_spread_after_slippage_pct,
-                            opp.net_profit_pct,
-                            "APPROVED",
-                        );
-                    }
-                    Err(reason) => {
-                        tracing::info!("No opportunity: {:?}", reason);
+    let mut last_raydium: Option<PriceUpdate> = None;
+    let mut last_orca: Option<PriceUpdate> = None;
 
-                        let (buy_dex, sell_dex) = if r.price < o.price {
-                            (r.dex.as_str(), o.dex.as_str())
-                        } else {
-                            (o.dex.as_str(), r.dex.as_str())
-                        };
-                        let raw_spread_pct = ((r.price.max(o.price) - r.price.min(o.price))
-                            / r.price.min(o.price))
-                            * 100.0;
+    // Seed both sides once via a normal RPC call so we have a baseline before
+    // the first WebSocket event arrives.
+    if let Ok(p) = raydium_cpmm::fetch_price(&client, raydium_pool_id, pair) {
+        last_raydium = Some(p);
+    }
+    if let Ok(p) = orca::fetch_price(&client, orca_pool_id, pair) {
+        last_orca = Some(p);
+    }
 
-                        let _ = crate::logger::log_row(
-                            pair,
-                            r.price,
-                            o.price,
-                            r.base_liquidity,
-                            r.quote_liquidity,
-                            o.base_liquidity,
-                            o.quote_liquidity,
-                            buy_dex,
-                            sell_dex,
-                            raw_spread_pct,
-                            0.0,
-                            0.0,
-                            0.0,
-                            &format!("{:?}", reason),
-                        );
-                    }
+    for event in rx {
+        let decoded_price = match event.source {
+            Source::Raydium => match raydium_cpmm::decode_pool_state(&event.update.data) {
+                Ok(_pool_state) => raydium_cpmm::fetch_price(&client, raydium_pool_id, pair).ok(),
+                Err(e) => {
+                    tracing::warn!("Failed to decode Raydium update: {}", e);
+                    None
+                }
+            },
+            Source::Orca => match orca::decode_whirlpool(&event.update.data) {
+                Ok(_whirlpool) => orca::fetch_price(&client, orca_pool_id, pair).ok(),
+                Err(e) => {
+                    tracing::warn!("Failed to decode Orca update: {}", e);
+                    None
+                }
+            },
+        };
+
+        match event.source {
+            Source::Raydium => {
+                if let Some(p) = decoded_price {
+                    last_raydium = Some(p);
                 }
             }
-            (Err(e), _) => tracing::error!("Raydium fetch failed: {}", e),
-            (_, Err(e)) => tracing::error!("Orca fetch failed: {}", e),
+            Source::Orca => {
+                if let Some(p) = decoded_price {
+                    last_orca = Some(p);
+                }
+            }
         }
 
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        if let (Some(r), Some(o)) = (&last_raydium, &last_orca) {
+            match analyzer::find_best_opportunity(r, o) {
+                Ok(opp) => {
+                    tracing::warn!(
+                        "REAL-TIME OPPORTUNITY: buy on {} @ {:.10}, sell on {} @ {:.10}, NET PROFIT: {:.4}%",
+                        opp.buy_dex, opp.buy_price, opp.sell_dex, opp.sell_price, opp.net_profit_pct
+                    );
+
+                    let _ = crate::logger::log_row(
+                        pair,
+                        r.price,
+                        o.price,
+                        r.base_liquidity,
+                        r.quote_liquidity,
+                        o.base_liquidity,
+                        o.quote_liquidity,
+                        &opp.buy_dex,
+                        &opp.sell_dex,
+                        opp.raw_spread_pct,
+                        opp.fee_adjusted_spread_pct,
+                        opp.net_spread_after_slippage_pct,
+                        opp.net_profit_pct,
+                        "APPROVED_REALTIME",
+                    );
+                }
+                Err(reason) => {
+                    tracing::debug!("No opportunity: {:?}", reason);
+                }
+            }
+        }
     }
+
+    Ok(())
 }

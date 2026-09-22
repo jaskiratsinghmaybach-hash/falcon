@@ -7,6 +7,7 @@ use std::str::FromStr;
 use super::PriceUpdate;
 
 const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
+const RAYDIUM_AMM_V4_PROGRAM: &str = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8";
 
 #[derive(BorshDeserialize, Debug)]
 pub struct Fees {
@@ -79,6 +80,23 @@ pub struct PoolVaults {
     pub pc_vault: Pubkey,
 }
 
+fn validate_pool_account(account: &solana_sdk::account::Account, pool_id: &str) -> Result<()> {
+    let expected_owner = Pubkey::from_str(RAYDIUM_AMM_V4_PROGRAM)?;
+    if account.owner != expected_owner {
+        anyhow::bail!(
+            "Pool {} is not owned by Raydium AMM v4 program (expected {}, got {}) - wrong pool type or address",
+            pool_id, expected_owner, account.owner
+        );
+    }
+    if account.data.len() != 752 {
+        anyhow::bail!(
+            "Pool {} has unexpected data length {} (expected 752 bytes for AmmInfo) - layout mismatch",
+            pool_id, account.data.len()
+        );
+    }
+    Ok(())
+}
+
 pub fn fetch_pool_vaults(client: &RpcClient, pool_id: &str) -> Result<PoolVaults> {
     let pool_pubkey = Pubkey::from_str(pool_id).context("Invalid pool pubkey format")?;
 
@@ -86,13 +104,10 @@ pub fn fetch_pool_vaults(client: &RpcClient, pool_id: &str) -> Result<PoolVaults
         .get_account(&pool_pubkey)
         .context("Failed to fetch pool account")?;
 
+    validate_pool_account(&account, pool_id)?;
+
     let amm_info =
         AmmInfo::try_from_slice(&account.data).context("Failed to deserialize AmmInfo")?;
-
-    let coin_account_info = client.get_account(&amm_info.coin_vault)?;
-    let owner_bytes = &coin_account_info.data[32..64];
-    let vault_owner = Pubkey::try_from(owner_bytes).context("Failed to parse vault owner")?;
-    tracing::info!("New pool's amm_authority: {}", vault_owner);
 
     Ok(PoolVaults {
         coin_vault: amm_info.coin_vault,
@@ -106,6 +121,8 @@ pub fn fetch_price(client: &RpcClient, pool_id: &str, pair: &str) -> Result<Pric
     let account = client
         .get_account(&pool_pubkey)
         .context("Failed to fetch pool account")?;
+
+    validate_pool_account(&account, pool_id)?;
 
     let amm_info =
         AmmInfo::try_from_slice(&account.data).context("Failed to deserialize AmmInfo")?;
@@ -128,8 +145,6 @@ pub fn fetch_price(client: &RpcClient, pool_id: &str, pair: &str) -> Result<Pric
         amm_info.pc_vault_mint
     );
 
-    // Normalize: base_liquidity = non-SOL token reserve, quote_liquidity = SOL reserve,
-    // price = SOL per unit of the other token. Consistent across every DEX module.
     let (base_liquidity, quote_liquidity, price) =
         if amm_info.pc_vault_mint.to_string() == WSOL_MINT {
             (coin_amount, pc_amount, pc_amount / coin_amount)
