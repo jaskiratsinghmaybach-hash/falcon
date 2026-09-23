@@ -3,6 +3,7 @@ use solana_sdk::signature::{Keypair, Signer};
 
 pub struct Config {
     pub helius_rpc_url: String,
+    pub helius_ws_url: String,
     pub jito_block_engine_url: String,
     pub keypair: Keypair,
     pub pair: String,
@@ -16,6 +17,9 @@ impl Config {
 
         let helius_rpc_url =
             std::env::var("HELIUS_RPC_URL").context("HELIUS_RPC_URL not set in environment")?;
+
+        let helius_ws_url =
+            std::env::var("HELIUS_WS_URL").context("HELIUS_WS_URL not set in environment")?;
 
         let jito_block_engine_url = std::env::var("JITO_BLOCK_ENGINE_URL")
             .context("JITO_BLOCK_ENGINE_URL not set in environment")?;
@@ -48,6 +52,7 @@ impl Config {
 
         Ok(Self {
             helius_rpc_url,
+            helius_ws_url,
             jito_block_engine_url,
             keypair,
             pair,

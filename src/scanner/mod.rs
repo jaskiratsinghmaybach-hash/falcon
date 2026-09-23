@@ -40,7 +40,7 @@ pub async fn run_realtime_loop(
     pair: &str,
     raydium_pool_id: &str,
     orca_pool_id: &str,
-    trade_size_hint: f64,
+    _trade_size_hint: f64,
 ) -> Result<()> {
     let client = RpcClient::new(rpc_url.to_string());
     let (tx, rx) = mpsc::channel::<RealtimeEvent>();
