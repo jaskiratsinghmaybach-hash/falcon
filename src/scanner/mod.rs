@@ -22,6 +22,7 @@ pub struct PriceUpdate {
     pub timestamp: std::time::SystemTime,
 }
 
+#[derive(Debug)]
 enum Source {
     Raydium,
     Orca,
@@ -110,6 +111,12 @@ pub async fn run_realtime_loop(
     }
 
     for event in rx {
+        tracing::info!(
+            "WebSocket event received from {:?} ({} bytes)",
+            event.source,
+            event.update.data.len()
+        );
+
         let decoded_price = match event.source {
             Source::Raydium => match raydium_cpmm::decode_pool_state(&event.update.data) {
                 Ok(_pool_state) => raydium_cpmm::fetch_price(&client, raydium_pool_id, pair).ok(),
