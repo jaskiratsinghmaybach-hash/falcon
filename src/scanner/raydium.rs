@@ -134,10 +134,18 @@ pub fn fetch_price(client: &RpcClient, pool_id: &str, pair: &str) -> Result<Pric
         .get_token_account_balance(&amm_info.pc_vault)
         .context("Failed to fetch pc vault balance")?;
 
-    let coin_amount: f64 = coin_balance
-        .ui_amount
-        .context("No ui_amount for coin vault")?;
-    let pc_amount: f64 = pc_balance.ui_amount.context("No ui_amount for pc vault")?;
+    // Raw on-chain smallest-unit amounts - execution-domain source of truth.
+    let coin_raw: u64 = coin_balance
+        .amount
+        .parse()
+        .context("Failed to parse raw amount for coin vault")?;
+    let pc_raw: u64 = pc_balance
+        .amount
+        .parse()
+        .context("Failed to parse raw amount for pc vault")?;
+
+    let coin_decimals = amm_info.coin_decimals as u8;
+    let pc_decimals = amm_info.pc_decimals as u8;
 
     tracing::debug!(
         "Raydium coin_vault_mint: {}, pc_vault_mint: {}",
@@ -145,22 +153,41 @@ pub fn fetch_price(client: &RpcClient, pool_id: &str, pair: &str) -> Result<Pric
         amm_info.pc_vault_mint
     );
 
-    let (base_liquidity, quote_liquidity, price) =
-        if amm_info.pc_vault_mint.to_string() == WSOL_MINT {
-            (coin_amount, pc_amount, pc_amount / coin_amount)
-        } else if amm_info.coin_vault_mint.to_string() == WSOL_MINT {
-            (pc_amount, coin_amount, coin_amount / pc_amount)
-        } else {
-            (coin_amount, pc_amount, pc_amount / coin_amount)
-        };
+    let is_pc_wsol = amm_info.pc_vault_mint.to_string() == WSOL_MINT;
 
-    let fee_pct = (amm_info.fees.swap_fee_numerator as f64
-        / amm_info.fees.swap_fee_denominator as f64)
-        * 100.0;
+    let (base_reserve_raw, quote_reserve_raw, base_decimals, quote_decimals) = if is_pc_wsol {
+        (coin_raw, pc_raw, coin_decimals, pc_decimals)
+    } else {
+        // Covers both "coin is WSOL" and the neither-is-WSOL fallback, which
+        // the original code also treated identically (pc = base side).
+        (pc_raw, coin_raw, pc_decimals, coin_decimals)
+    };
+
+    // Presentation-only f64 for logging.
+    let coin_amount_ui = coin_balance.ui_amount.unwrap_or(0.0);
+    let pc_amount_ui = pc_balance.ui_amount.unwrap_or(0.0);
+
+    let (base_liquidity, quote_liquidity, price) = if is_pc_wsol {
+        (coin_amount_ui, pc_amount_ui, pc_amount_ui / coin_amount_ui)
+    } else {
+        (pc_amount_ui, coin_amount_ui, coin_amount_ui / pc_amount_ui)
+    };
+
+    // Already an exact integer ratio in the account data - use it directly,
+    // never round-trip through f64 for the execution-domain value.
+    let fee_numerator = amm_info.fees.swap_fee_numerator;
+    let fee_denominator = amm_info.fees.swap_fee_denominator;
+    let fee_pct = (fee_numerator as f64 / fee_denominator as f64) * 100.0;
 
     Ok(PriceUpdate {
         dex: "Raydium".to_string(),
         pair: pair.to_string(),
+        base_reserve_raw,
+        quote_reserve_raw,
+        base_decimals,
+        quote_decimals,
+        fee_numerator,
+        fee_denominator,
         price,
         base_liquidity,
         quote_liquidity,
