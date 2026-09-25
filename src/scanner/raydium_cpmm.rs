@@ -134,9 +134,6 @@ pub fn fetch_price(client: &RpcClient, pool_id: &str, pair: &str) -> Result<Pric
         .get_token_account_balance(&pool_state.token_1_vault)
         .context("Failed to fetch token 1 vault balance")?;
 
-    // Raw on-chain smallest-unit amounts, straight from the RPC's `amount` string
-    // field (NOT `ui_amount`, which is already a lossy f64 division by decimals).
-    // This is the execution-domain source of truth for reserves.
     let vault_0_raw: u64 = vault_0_balance
         .amount
         .parse()
@@ -152,16 +149,11 @@ pub fn fetch_price(client: &RpcClient, pool_id: &str, pair: &str) -> Result<Pric
     let amm_config = AmmConfig::try_from_slice(&amm_config_account.data[8..])
         .context("Failed to deserialize AmmConfig")?;
 
-    // CPMM's trade_fee_rate is already an exact integer rate out of 1_000_000
-    // (e.g. 2500 => 0.25%). Keep it as an exact integer ratio for execution;
-    // the f64 percent below is derived ONLY for display.
     const CPMM_FEE_RATE_DENOMINATOR: u64 = 1_000_000;
     let fee_numerator = amm_config.trade_fee_rate;
     let fee_denominator = CPMM_FEE_RATE_DENOMINATOR;
     let fee_pct = (fee_numerator as f64 / fee_denominator as f64) * 100.0;
 
-    // Presentation-only f64 conversions for logging (never fed back into
-    // trading decisions - see PriceUpdate's doc comment).
     let vault_0_ui = vault_0_balance.ui_amount.unwrap_or(0.0);
     let vault_1_ui = vault_1_balance.ui_amount.unwrap_or(0.0);
 
@@ -176,8 +168,6 @@ pub fn fetch_price(client: &RpcClient, pool_id: &str, pair: &str) -> Result<Pric
             pool_state.mint_0_decimals,
         )
     } else {
-        // Covers both "token_1 is WSOL" and the neither-is-WSOL fallback that
-        // the original code also treated identically (token_0 = base).
         (
             vault_0_raw,
             vault_1_raw,
@@ -255,6 +245,9 @@ impl CpmmStaticContext {
         })
     }
 
+    /// Still-live fallback path: fetches both vault balances via RPC. Kept for
+    /// the initial seed call before any WebSocket push has arrived yet. NOT
+    /// used in the steady-state hot path anymore - see `price_from_raw_reserves`.
     pub fn fetch_price_with_context(&self, client: &RpcClient, pair: &str) -> Result<PriceUpdate> {
         let vault_0_balance = client
             .get_token_account_balance(&self.token_0_vault)
@@ -272,14 +265,31 @@ impl CpmmStaticContext {
             .parse()
             .context("Failed to parse raw amount for vault 1")?;
 
-        let (base_reserve_raw, quote_reserve_raw, base_decimals, quote_decimals) = if self.is_token_0_wsol {
-            (vault_1_raw, vault_0_raw, self.mint_1_decimals, self.mint_0_decimals)
-        } else {
-            (vault_0_raw, vault_1_raw, self.mint_0_decimals, self.mint_1_decimals)
-        };
+        Ok(self.price_from_raw_reserves(vault_0_raw, vault_1_raw, pair))
+    }
 
-        let vault_0_ui = vault_0_balance.ui_amount.unwrap_or(0.0);
-        let vault_1_ui = vault_1_balance.ui_amount.unwrap_or(0.0);
+    /// Hot-path constructor: builds a `PriceUpdate` directly from two raw u64
+    /// vault balances - no RPC call, no client, nothing but arithmetic. Used
+    /// when a vault account's WebSocket push has just decoded a fresh balance
+    /// locally (see `realtime::decode_token_account_balance`) and we already
+    /// have the *other* vault's last-known balance cached in scanner/mod.rs.
+    pub fn price_from_raw_reserves(
+        &self,
+        vault_0_raw: u64,
+        vault_1_raw: u64,
+        pair: &str,
+    ) -> PriceUpdate {
+        let (base_reserve_raw, quote_reserve_raw, base_decimals, quote_decimals) =
+            if self.is_token_0_wsol {
+                (vault_1_raw, vault_0_raw, self.mint_1_decimals, self.mint_0_decimals)
+            } else {
+                (vault_0_raw, vault_1_raw, self.mint_0_decimals, self.mint_1_decimals)
+            };
+
+        // UI (decimal-adjusted) amounts for display only - matches what
+        // get_token_account_balance's `ui_amount` would have given us.
+        let vault_0_ui = vault_0_raw as f64 / 10f64.powi(self.mint_0_decimals as i32);
+        let vault_1_ui = vault_1_raw as f64 / 10f64.powi(self.mint_1_decimals as i32);
 
         let (base_liquidity, quote_liquidity, price) = if self.is_token_0_wsol {
             (vault_1_ui, vault_0_ui, vault_0_ui / vault_1_ui)
@@ -287,7 +297,7 @@ impl CpmmStaticContext {
             (vault_0_ui, vault_1_ui, vault_1_ui / vault_0_ui)
         };
 
-        Ok(PriceUpdate {
+        PriceUpdate {
             dex: "RaydiumCPMM".to_string(),
             pair: pair.to_string(),
             base_reserve_raw,
@@ -301,6 +311,6 @@ impl CpmmStaticContext {
             quote_liquidity,
             fee_pct: self.fee_pct,
             timestamp: std::time::SystemTime::now(),
-        })
+        }
     }
 }

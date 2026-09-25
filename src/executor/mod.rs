@@ -69,6 +69,49 @@ pub struct OrcaPoolContext {
     pub info: WhirlpoolInfo,
 }
 
+impl OrcaPoolContext {
+    /// Loads the Whirlpool's static account layout once at startup (one-time
+    /// RPC call) - same lifecycle as `RaydiumPoolContext::load`.
+    pub fn load(client: &RpcClient, pool_id: &str) -> Result<Self> {
+        let pool_pubkey = Pubkey::from_str(pool_id).context("Invalid Orca Whirlpool pubkey")?;
+        let info = crate::scanner::orca::fetch_pool_info(client, pool_id)?;
+        Ok(Self {
+            pool_id: pool_pubkey,
+            info,
+        })
+    }
+}
+
+/// Cached ATA pubkeys + existence, computed ONCE at startup so the hot loop
+/// never calls `check_wallet_atas` (2x `get_account` RPC calls) per
+/// simulation. `ensure_wallet_atas` should be called first at startup to
+/// actually create any missing ATA on-chain - by the time this cache is
+/// built, both ATAs are expected to already exist.
+#[derive(Debug, Clone, Copy)]
+pub struct AtaCache {
+    pub wsol_ata: Pubkey,
+    pub wsol_exists: bool,
+    pub other_ata: Pubkey,
+    pub other_exists: bool,
+}
+
+impl AtaCache {
+    /// One-time RPC check at startup. Call this AFTER `ensure_wallet_atas`
+    /// (or your own ATA-creation step) so `wsol_exists`/`other_exists` come
+    /// back true and the hot loop can skip the create-account instructions
+    /// entirely.
+    pub fn load(client: &RpcClient, wallet: &Pubkey, other_token_mint: &Pubkey) -> Result<Self> {
+        let (wsol_ata, wsol_exists, other_ata, other_exists) =
+            check_wallet_atas(client, wallet, other_token_mint)?;
+        Ok(Self {
+            wsol_ata,
+            wsol_exists,
+            other_ata,
+            other_exists,
+        })
+    }
+}
+
 pub fn simulate_cpmm_swap(
     client: &RpcClient,
     payer: &Keypair,
@@ -430,6 +473,17 @@ fn build_leg_instruction(
 /// Builds and simulates the full atomic arb transaction: buy on `opportunity.buy_dex`,
 /// sell on `opportunity.sell_dex`, direction chosen entirely by the Analyzer's output.
 /// Never sends anything - simulation only.
+///
+/// `cached_blockhash`: pass the value read from your `BlockhashCache` to skip
+/// a synchronous `get_latest_blockhash` RPC call. Pass `None` to fall back to
+/// a live fetch.
+///
+/// `ata_cache`: pass a pre-loaded `AtaCache` (built once at startup via
+/// `AtaCache::load`, AFTER ensuring both ATAs exist on-chain) to skip the two
+/// `get_account` existence-check RPC calls this function used to make on
+/// every single call. If an ATA cache entry says an ATA doesn't exist, this
+/// function still emits the create-account instruction defensively - it just
+/// no longer *asks the network* every time to find that out.
 #[allow(clippy::too_many_arguments)]
 pub fn simulate_opportunity(
     client: &RpcClient,
@@ -439,26 +493,25 @@ pub fn simulate_opportunity(
     orca_ctx: &OrcaPoolContext,
     other_token_mint: &Pubkey,
     other_token_decimals: u32,
+    cached_blockhash: Option<Hash>,
+    ata_cache: &AtaCache,
 ) -> Result<()> {
     let wallet = payer.pubkey();
     let token_program = Pubkey::from_str(TOKEN_PROGRAM_ID)?;
     let wsol_mint = Pubkey::from_str(WSOL_MINT)?;
 
-    let (wsol_ata, wsol_exists, other_ata, other_exists) =
-        check_wallet_atas(client, &wallet, other_token_mint)?;
+    // No RPC call here anymore - reuses the existence check done once at
+    // startup. If your wallet's ATAs are ever closed mid-run, restart the
+    // bot to refresh this cache (or call AtaCache::load again manually).
+    let AtaCache {
+        wsol_ata,
+        wsol_exists,
+        other_ata,
+        other_exists,
+    } = *ata_cache;
 
-    // Execution-critical amounts now come straight from the Analyzer's own
-    // integer fields - no f64 round-trip. `other_token_decimals` is no longer
-    // needed for amount math (kept as a parameter for call-site compatibility
-    // and any future display use) since expected_output_after_buy_raw is
-    // already in raw base-token units.
     let _ = other_token_decimals;
     let amount_in_lamports = opportunity.trade_size_lamports;
-
-    // Use the Analyzer's own computed output from the buy leg, not a re-derived
-    // guess - this is the exact raw amount the buy leg is expected to produce,
-    // so the sell leg spends exactly that, keeping Analyzer and Executor in
-    // exact integer agreement (no precision loss from an intermediate f64).
     let other_token_amount_raw = opportunity.expected_output_after_buy_raw;
 
     let mut instructions = vec![];
@@ -480,7 +533,6 @@ pub fn simulate_opportunity(
         ));
     }
 
-    // Fund WSOL for the buy leg.
     instructions.push(system_instruction::transfer(
         &wallet,
         &wsol_ata,
@@ -491,7 +543,6 @@ pub fn simulate_opportunity(
         &wsol_ata,
     )?);
 
-    // Leg 1: buy - spend SOL, receive the other token.
     const SLIPPAGE_TOLERANCE_BPS: u32 = 100; // 1% tolerance below expected output
 
     let buy_minimum_out_raw = analyzer::calculate_minimum_out_raw(
@@ -513,7 +564,6 @@ pub fn simulate_opportunity(
     )?;
     instructions.push(buy_ix);
 
-    // Compute budget & Priority fees
     instructions.insert(
         0,
         solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(350_000),
@@ -523,15 +573,12 @@ pub fn simulate_opportunity(
         solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_price(25_000),
     );
 
-    // Leg 2: sell - spend the other token (amount = what we expect to have received),
-    // receive SOL back.
     let base_sell_minimum_out = analyzer::calculate_minimum_out_raw(
         opportunity.expected_output_after_sell_raw,
         SLIPPAGE_TOLERANCE_BPS,
     )
     .context("Failed to compute sell-leg minimum_out")?;
 
-    // Hard On-Chain Revert Guard: sell output MUST at least break even + 1000 lamports.
     let breakeven_lamports = amount_in_lamports + 1_000;
     let sell_minimum_out_lamports = base_sell_minimum_out.max(breakeven_lamports);
 
@@ -553,7 +600,7 @@ pub fn simulate_opportunity(
         opportunity.buy_dex, amount_in_lamports, opportunity.sell_dex, other_token_amount_raw
     );
 
-    simulate(client, payer, instructions)
+    simulate_with_blockhash(client, payer, instructions, cached_blockhash)
 }
 
 use solana_sdk::hash::Hash;

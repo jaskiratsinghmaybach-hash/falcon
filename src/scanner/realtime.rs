@@ -13,12 +13,15 @@ pub struct AccountUpdate {
     pub owner: Pubkey,
 }
 
+/// Subscribes to a single account over WebSocket and streams raw decoded bytes
+/// to `tx` as they arrive. Blocking - intended to be run on its own OS thread
+/// (see scanner/mod.rs, which spawns one of these per subscribed account).
 pub fn subscribe_to_account(
     ws_url: &str,
-    pool_id: &str,
+    account_id: &str,
     tx: mpsc::Sender<AccountUpdate>,
 ) -> Result<()> {
-    let pubkey = Pubkey::from_str(pool_id).context("Invalid pool pubkey")?;
+    let pubkey = Pubkey::from_str(account_id).context("Invalid account pubkey")?;
 
     let config = RpcAccountInfoConfig {
         commitment: Some(CommitmentConfig::confirmed()),
@@ -59,4 +62,27 @@ pub fn subscribe_to_account(
     }
 
     Ok(())
+}
+
+/// Decodes an SPL Token account's raw bytes into its `amount` field (u64,
+/// smallest units) with zero RPC calls and zero allocation beyond the copy.
+/// Layout per the SPL Token program (fixed 165-byte account):
+///   0..32   mint (Pubkey)
+///   32..64  owner (Pubkey)
+///   64..72  amount (u64, little-endian)
+///   ... (rest not needed here)
+/// This is the same `amount` the JSON-RPC `get_token_account_balance` call
+/// would return - just read directly from the bytes the WebSocket already
+/// pushed us, instead of making a second network round-trip to ask for it.
+pub fn decode_token_account_balance(data: &[u8]) -> Result<u64> {
+    if data.len() < 72 {
+        anyhow::bail!(
+            "Token account data too short to contain balance: {} bytes (need >= 72)",
+            data.len()
+        );
+    }
+    let amount_bytes: [u8; 8] = data[64..72]
+        .try_into()
+        .context("Failed to slice token account amount bytes")?;
+    Ok(u64::from_le_bytes(amount_bytes))
 }

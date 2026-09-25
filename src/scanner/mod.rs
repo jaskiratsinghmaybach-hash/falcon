@@ -9,61 +9,76 @@ use std::sync::mpsc;
 
 use crate::analyzer;
 use crate::config::DecoderType;
+use crate::executor;
 
-/// Raw execution-domain reserves and fee parameters for one pool side of a pair,
-/// plus f64 fields kept ONLY for human-readable logging/display (see logger.rs).
-///
-/// Numeric boundary rule (see numeric-migration deliverable notes): everything
-/// under "raw execution state" below is deterministic integer data and is what
-/// the Analyzer and Executor must use for any trading decision or instruction.
-/// The `price`/`base_liquidity`/`quote_liquidity` f64 fields are DISPLAY-ONLY
-/// convenience values for logs; never feed them back into calculations that
-/// approve, size, or execute a trade.
 #[derive(Debug, Clone)]
 pub struct PriceUpdate {
     pub dex: String,
     pub pair: String,
-
-    // --- raw execution state (integer, deterministic) ---
-    /// Raw base-token reserve, smallest units (i.e. accounting for the base
-    /// mint's decimals), from the vault this PriceUpdate was fetched from.
     pub base_reserve_raw: u64,
-    /// Raw quote-token reserve, smallest units. Quote is always the WSOL side
-    /// for this bot's pairs (see scanner-specific fetch_price for orientation).
     pub quote_reserve_raw: u64,
-    /// Base-token mint decimals (needed to convert base_reserve_raw for display
-    /// or when constructing instruction amounts that must be in base units).
     pub base_decimals: u8,
-    /// Quote-token (WSOL) mint decimals. Always 9 for SOL, but carried
-    /// explicitly rather than hardcoded so the type stays honest about units.
     pub quote_decimals: u8,
-    /// Trading fee as an exact integer ratio (numerator / denominator), taken
-    /// directly from each protocol's own fee parameters - never derived via f64.
     pub fee_numerator: u64,
     pub fee_denominator: u64,
-
-    // --- presentation-only (f64) - logging/display, NEVER execution ---
     pub price: f64,
     pub base_liquidity: f64,
     pub quote_liquidity: f64,
     pub fee_pct: f64,
-
     pub timestamp: std::time::SystemTime,
 }
 
-#[derive(Debug)]
-enum Source {
-    Raydium,
-    Orca,
+/// Everything the hot loop needs to simulate an opportunity the instant it's
+/// found - built once in main.rs (one-time RPC calls) and moved into the loop.
+pub struct ExecutionContext {
+    pub client: RpcClient,
+    pub payer: solana_sdk::signature::Keypair,
+    pub raydium_ctx: executor::RaydiumPoolContext,
+    pub orca_ctx: executor::OrcaPoolContext,
+    pub other_token_mint: solana_sdk::pubkey::Pubkey,
+    pub blockhash_cache: executor::BlockhashCache,
+    pub ata_cache: executor::AtaCache,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AccountRole {
+    RaydiumPoolState,
+    RaydiumVault0,
+    RaydiumVault1,
+    OrcaPoolState,
+    OrcaVaultA,
+    OrcaVaultB,
 }
 
 struct RealtimeEvent {
-    source: Source,
+    role: AccountRole,
     update: realtime::AccountUpdate,
 }
 
-/// Real-time event-driven loop: reacts the instant either pool's account changes,
-/// instead of polling on a timer. Decodes directly from the WebSocket payload.
+fn spawn_subscriber(
+    ws_url: String,
+    account_id: String,
+    role: AccountRole,
+    tx: mpsc::Sender<RealtimeEvent>,
+) {
+    std::thread::spawn(move || {
+        let (inner_tx, inner_rx) = mpsc::channel();
+        let ws_url_clone = ws_url.clone();
+        let account_clone = account_id.clone();
+        std::thread::spawn(move || {
+            if let Err(e) = realtime::subscribe_to_account(&ws_url_clone, &account_clone, inner_tx) {
+                tracing::error!("Subscription for {:?} ended: {}", role, e);
+            }
+        });
+        for update in inner_rx {
+            if tx.send(RealtimeEvent { role, update }).is_err() {
+                break;
+            }
+        }
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn run_realtime_loop(
     ws_url: &str,
     rpc_url: &str,
@@ -73,67 +88,11 @@ pub async fn run_realtime_loop(
     decoder: DecoderType,
     _trade_size_hint: f64,
     max_price_age_secs: u64,
+    exec_ctx: ExecutionContext,
 ) -> Result<()> {
     let client = RpcClient::new(rpc_url.to_string());
     let (tx, rx) = mpsc::channel::<RealtimeEvent>();
 
-    let ws_url_raydium = ws_url.to_string();
-    let raydium_pool_id_owned = raydium_pool_id.to_string();
-    let tx_raydium = tx.clone();
-    std::thread::spawn(move || {
-        let (inner_tx, inner_rx) = mpsc::channel();
-        let ws_url_clone = ws_url_raydium.clone();
-        let pool_clone = raydium_pool_id_owned.clone();
-        std::thread::spawn(move || {
-            if let Err(e) = realtime::subscribe_to_account(&ws_url_clone, &pool_clone, inner_tx) {
-                tracing::error!("Raydium subscription ended: {}", e);
-            }
-        });
-        for update in inner_rx {
-            if tx_raydium
-                .send(RealtimeEvent {
-                    source: Source::Raydium,
-                    update,
-                })
-                .is_err()
-            {
-                break;
-            }
-        }
-    });
-
-    let ws_url_orca = ws_url.to_string();
-    let orca_pool_id_owned = orca_pool_id.to_string();
-    let tx_orca = tx;
-    std::thread::spawn(move || {
-        let (inner_tx, inner_rx) = mpsc::channel();
-        let ws_url_clone = ws_url_orca.clone();
-        let pool_clone = orca_pool_id_owned.clone();
-        std::thread::spawn(move || {
-            if let Err(e) = realtime::subscribe_to_account(&ws_url_clone, &pool_clone, inner_tx) {
-                tracing::error!("Orca subscription ended: {}", e);
-            }
-        });
-        for update in inner_rx {
-            if tx_orca
-                .send(RealtimeEvent {
-                    source: Source::Orca,
-                    update,
-                })
-                .is_err()
-            {
-                break;
-            }
-        }
-    });
-
-    tracing::info!(
-        "Real-time WebSocket subscriptions started for {} (Raydium mode: {:?})",
-        pair,
-        decoder
-    );
-
-    // Pre-cache static pool contexts on boot to eliminate redundant RPC round-trips
     let cpmm_ctx = match decoder {
         DecoderType::Cpmm => match raydium_cpmm::CpmmStaticContext::load(&client, raydium_pool_id) {
             Ok(ctx) => {
@@ -159,16 +118,76 @@ pub async fn run_realtime_loop(
         }
     };
 
+    spawn_subscriber(
+        ws_url.to_string(),
+        raydium_pool_id.to_string(),
+        AccountRole::RaydiumPoolState,
+        tx.clone(),
+    );
+    if let Some(ctx) = &cpmm_ctx {
+        spawn_subscriber(
+            ws_url.to_string(),
+            ctx.token_0_vault.to_string(),
+            AccountRole::RaydiumVault0,
+            tx.clone(),
+        );
+        spawn_subscriber(
+            ws_url.to_string(),
+            ctx.token_1_vault.to_string(),
+            AccountRole::RaydiumVault1,
+            tx.clone(),
+        );
+    }
+
+    spawn_subscriber(
+        ws_url.to_string(),
+        orca_pool_id.to_string(),
+        AccountRole::OrcaPoolState,
+        tx.clone(),
+    );
+    if let Some(ctx) = &orca_ctx {
+        spawn_subscriber(
+            ws_url.to_string(),
+            ctx.token_vault_a.to_string(),
+            AccountRole::OrcaVaultA,
+            tx.clone(),
+        );
+        spawn_subscriber(
+            ws_url.to_string(),
+            ctx.token_vault_b.to_string(),
+            AccountRole::OrcaVaultB,
+            tx,
+        );
+    }
+
+    tracing::info!(
+        "Real-time WebSocket subscriptions started for {} (Raydium mode: {:?})",
+        pair,
+        decoder
+    );
+
     let mut last_raydium: Option<PriceUpdate> = None;
     let mut last_orca: Option<PriceUpdate> = None;
 
-    // Seed both sides once via a normal RPC call so we have a baseline before
-    // the first WebSocket event arrives.
+    let mut raydium_vault_0_raw: u64 = 0;
+    let mut raydium_vault_1_raw: u64 = 0;
+    let mut orca_vault_a_raw: u64 = 0;
+    let mut orca_vault_b_raw: u64 = 0;
+    let mut orca_sqrt_price: u128 = 0;
+    let mut orca_fee_rate: u16 = 0;
+
     match decoder {
         DecoderType::Cpmm => {
             if let Some(ctx) = &cpmm_ctx {
                 if let Ok(p) = ctx.fetch_price_with_context(&client, pair) {
                     last_raydium = Some(p);
+                }
+                if let (Ok(b0), Ok(b1)) = (
+                    client.get_token_account_balance(&ctx.token_0_vault),
+                    client.get_token_account_balance(&ctx.token_1_vault),
+                ) {
+                    raydium_vault_0_raw = b0.amount.parse().unwrap_or(0);
+                    raydium_vault_1_raw = b1.amount.parse().unwrap_or(0);
                 }
             } else if let Ok(p) = raydium_cpmm::fetch_price(&client, raydium_pool_id, pair) {
                 last_raydium = Some(p);
@@ -180,9 +199,25 @@ pub async fn run_realtime_loop(
             }
         }
     }
+
     if let Some(ctx) = &orca_ctx {
         if let Ok(p) = ctx.fetch_price_with_context(&client, pair) {
             last_orca = Some(p);
+        }
+        if let (Ok(b_a), Ok(b_b)) = (
+            client.get_token_account_balance(&ctx.token_vault_a),
+            client.get_token_account_balance(&ctx.token_vault_b),
+        ) {
+            orca_vault_a_raw = b_a.amount.parse().unwrap_or(0);
+            orca_vault_b_raw = b_b.amount.parse().unwrap_or(0);
+        }
+        if let Ok(pool_pubkey) = orca_pool_id.parse::<solana_sdk::pubkey::Pubkey>() {
+            if let Ok(account) = client.get_account(&pool_pubkey) {
+                if let Ok(wp) = orca::decode_whirlpool(&account.data) {
+                    orca_sqrt_price = wp.sqrt_price;
+                    orca_fee_rate = wp.fee_rate;
+                }
+            }
         }
     } else if let Ok(p) = orca::fetch_price(&client, orca_pool_id, pair) {
         last_orca = Some(p);
@@ -190,52 +225,99 @@ pub async fn run_realtime_loop(
 
     for event in rx {
         tracing::info!(
-            "WebSocket event received from {:?} ({} bytes)",
-            event.source,
+            "WebSocket event received: {:?} ({} bytes)",
+            event.role,
             event.update.data.len()
         );
 
-        let decoded_price = match event.source {
-            Source::Raydium => match decoder {
-                DecoderType::Cpmm => {
-                    if let Some(ctx) = &cpmm_ctx {
-                        ctx.fetch_price_with_context(&client, pair).ok()
-                    } else {
-                        raydium_cpmm::fetch_price(&client, raydium_pool_id, pair).ok()
+        match event.role {
+            AccountRole::RaydiumPoolState => {
+                if decoder == DecoderType::Cpmm {
+                    if let Err(e) = raydium_cpmm::decode_pool_state(&event.update.data) {
+                        tracing::warn!("Failed to decode Raydium CPMM pool state push: {}", e);
                     }
-                }
-                DecoderType::Amm => match raydium::decode_amm_info(&event.update.data) {
-                    Ok(_amm_info) => raydium::fetch_price(&client, raydium_pool_id, pair).ok(),
-                    Err(e) => {
-                        tracing::warn!("Failed to decode Raydium AMM update: {}", e);
-                        None
-                    }
-                },
-            },
-            Source::Orca => match orca::decode_whirlpool(&event.update.data) {
-                Ok(whirlpool) => {
-                    if let Some(ctx) = &orca_ctx {
-                        ctx.price_from_whirlpool(&client, &whirlpool, pair).ok()
-                    } else {
-                        orca::fetch_price(&client, orca_pool_id, pair).ok()
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to decode Orca update: {}", e);
-                    None
-                }
-            },
-        };
-
-        match event.source {
-            Source::Raydium => {
-                if let Some(p) = decoded_price {
-                    last_raydium = Some(p);
                 }
             }
-            Source::Orca => {
-                if let Some(p) = decoded_price {
-                    last_orca = Some(p);
+            AccountRole::RaydiumVault0 => {
+                match realtime::decode_token_account_balance(&event.update.data) {
+                    Ok(balance) => {
+                        raydium_vault_0_raw = balance;
+                        if let Some(ctx) = &cpmm_ctx {
+                            last_raydium = Some(ctx.price_from_raw_reserves(
+                                raydium_vault_0_raw,
+                                raydium_vault_1_raw,
+                                pair,
+                            ));
+                        }
+                    }
+                    Err(e) => tracing::warn!("Failed to decode Raydium vault 0 push: {}", e),
+                }
+            }
+            AccountRole::RaydiumVault1 => {
+                match realtime::decode_token_account_balance(&event.update.data) {
+                    Ok(balance) => {
+                        raydium_vault_1_raw = balance;
+                        if let Some(ctx) = &cpmm_ctx {
+                            last_raydium = Some(ctx.price_from_raw_reserves(
+                                raydium_vault_0_raw,
+                                raydium_vault_1_raw,
+                                pair,
+                            ));
+                        }
+                    }
+                    Err(e) => tracing::warn!("Failed to decode Raydium vault 1 push: {}", e),
+                }
+            }
+            AccountRole::OrcaPoolState => {
+                match orca::decode_whirlpool(&event.update.data) {
+                    Ok(whirlpool) => {
+                        orca_sqrt_price = whirlpool.sqrt_price;
+                        orca_fee_rate = whirlpool.fee_rate;
+                        if let Some(ctx) = &orca_ctx {
+                            last_orca = Some(ctx.price_from_whirlpool_and_reserves(
+                                orca_sqrt_price,
+                                orca_fee_rate,
+                                orca_vault_a_raw,
+                                orca_vault_b_raw,
+                                pair,
+                            ));
+                        }
+                    }
+                    Err(e) => tracing::warn!("Failed to decode Orca whirlpool push: {}", e),
+                }
+            }
+            AccountRole::OrcaVaultA => {
+                match realtime::decode_token_account_balance(&event.update.data) {
+                    Ok(balance) => {
+                        orca_vault_a_raw = balance;
+                        if let Some(ctx) = &orca_ctx {
+                            last_orca = Some(ctx.price_from_raw_reserves(
+                                orca_sqrt_price,
+                                orca_fee_rate,
+                                orca_vault_a_raw,
+                                orca_vault_b_raw,
+                                pair,
+                            ));
+                        }
+                    }
+                    Err(e) => tracing::warn!("Failed to decode Orca vault A push: {}", e),
+                }
+            }
+            AccountRole::OrcaVaultB => {
+                match realtime::decode_token_account_balance(&event.update.data) {
+                    Ok(balance) => {
+                        orca_vault_b_raw = balance;
+                        if let Some(ctx) = &orca_ctx {
+                            last_orca = Some(ctx.price_from_raw_reserves(
+                                orca_sqrt_price,
+                                orca_fee_rate,
+                                orca_vault_a_raw,
+                                orca_vault_b_raw,
+                                pair,
+                            ));
+                        }
+                    }
+                    Err(e) => tracing::warn!("Failed to decode Orca vault B push: {}", e),
                 }
             }
         }
@@ -264,6 +346,31 @@ pub async fn run_realtime_loop(
                         opp.net_profit_pct,
                         "APPROVED_REALTIME",
                     );
+
+                    let cached_hash = exec_ctx
+                        .blockhash_cache
+                        .read()
+                        .ok()
+                        .map(|guard| *guard);
+
+                    match executor::simulate_opportunity(
+                        &exec_ctx.client,
+                        &exec_ctx.payer,
+                        &opp,
+                        &exec_ctx.raydium_ctx,
+                        &exec_ctx.orca_ctx,
+                        &exec_ctx.other_token_mint,
+                        0,
+                        cached_hash,
+                        &exec_ctx.ata_cache,
+                    ) {
+                        Ok(()) => {
+                            tracing::warn!("Opportunity simulated successfully - see logs above for sim result.");
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to simulate opportunity: {:?}", e);
+                        }
+                    }
                 }
                 Err(reason) => {
                     tracing::info!(
@@ -281,12 +388,6 @@ pub async fn run_realtime_loop(
                     } else {
                         (o.dex.as_str(), r.dex.as_str())
                     };
-                    // Display-only spread for the rejection log row. This is
-                    // NOT used for any decision (the decision already happened
-                    // inside find_best_opportunity using integer bps math) -
-                    // it's purely so the CSV shows roughly how close the
-                    // market was, using the same f64 price fields as the
-                    // rest of the display-only log columns.
                     let raw_spread_pct = ((r.price.max(o.price) - r.price.min(o.price))
                         / r.price.min(o.price))
                         * 100.0;
