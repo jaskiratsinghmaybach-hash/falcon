@@ -5,8 +5,12 @@ pub mod raydium_cpmm;
 use anyhow::{bail, Context, Result};
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::{
-    instruction::Instruction, message::Message, pubkey::Pubkey, signature::Keypair, signer::Signer,
-    system_instruction, transaction::Transaction,
+    instruction::Instruction,
+    message::Message,
+    pubkey::Pubkey,
+    signature::{Keypair, Signer},
+    system_instruction,
+    transaction::Transaction,
 };
 use spl_associated_token_account::{
     get_associated_token_address, instruction::create_associated_token_account,
@@ -35,9 +39,13 @@ pub enum RaydiumPoolContext {
 impl RaydiumPoolContext {
     pub fn load_amm(client: &RpcClient, pool_id: &str) -> Result<Self> {
         let pool_pubkey = Pubkey::from_str(pool_id).context("Invalid Raydium pool pubkey")?;
+
         let vaults = crate::scanner::raydium::fetch_pool_vaults(client, pool_id)?;
+
         let amm_program = Pubkey::from_str("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8")?;
+
         let (amm_authority, _) = Pubkey::find_program_address(&[b"amm authority"], &amm_program);
+
         Ok(Self::Amm {
             pool_id: pool_pubkey,
             amm_authority,
@@ -48,6 +56,7 @@ impl RaydiumPoolContext {
 
     pub fn load_cpmm(client: &RpcClient, pool_id: &str) -> Result<Self> {
         let pool_info = crate::scanner::raydium_cpmm::fetch_pool_info(client, pool_id)?;
+
         Ok(Self::Cpmm { pool_info })
     }
 
@@ -70,11 +79,12 @@ pub struct OrcaPoolContext {
 }
 
 impl OrcaPoolContext {
-    /// Loads the Whirlpool's static account layout once at startup (one-time
-    /// RPC call) - same lifecycle as `RaydiumPoolContext::load`.
+    /// Loads the Whirlpool's static account layout once at startup.
     pub fn load(client: &RpcClient, pool_id: &str) -> Result<Self> {
         let pool_pubkey = Pubkey::from_str(pool_id).context("Invalid Orca Whirlpool pubkey")?;
+
         let info = crate::scanner::orca::fetch_pool_info(client, pool_id)?;
+
         Ok(Self {
             pool_id: pool_pubkey,
             info,
@@ -82,11 +92,7 @@ impl OrcaPoolContext {
     }
 }
 
-/// Cached ATA pubkeys + existence, computed ONCE at startup so the hot loop
-/// never calls `check_wallet_atas` (2x `get_account` RPC calls) per
-/// simulation. `ensure_wallet_atas` should be called first at startup to
-/// actually create any missing ATA on-chain - by the time this cache is
-/// built, both ATAs are expected to already exist.
+/// Cached ATA pubkeys + existence, computed once at startup.
 #[derive(Debug, Clone, Copy)]
 pub struct AtaCache {
     pub wsol_ata: Pubkey,
@@ -96,13 +102,11 @@ pub struct AtaCache {
 }
 
 impl AtaCache {
-    /// One-time RPC check at startup. Call this AFTER `ensure_wallet_atas`
-    /// (or your own ATA-creation step) so `wsol_exists`/`other_exists` come
-    /// back true and the hot loop can skip the create-account instructions
-    /// entirely.
+    /// One-time RPC check at startup.
     pub fn load(client: &RpcClient, wallet: &Pubkey, other_token_mint: &Pubkey) -> Result<Self> {
         let (wsol_ata, wsol_exists, other_ata, other_exists) =
             check_wallet_atas(client, wallet, other_token_mint)?;
+
         Ok(Self {
             wsol_ata,
             wsol_exists,
@@ -167,6 +171,7 @@ pub fn simulate_cpmm_swap(
             &token_program,
         ));
     }
+
     if !other_exists {
         instructions.push(create_associated_token_account(
             &wallet,
@@ -178,6 +183,7 @@ pub fn simulate_cpmm_swap(
 
     if *input_mint == wsol_mint {
         instructions.push(system_instruction::transfer(&wallet, &wsol_ata, amount_in));
+
         instructions.push(spl_token::instruction::sync_native(
             &token_program,
             &wsol_ata,
@@ -248,6 +254,7 @@ pub fn simulate_orca_swap(
             &token_program,
         ));
     }
+
     if !other_exists {
         instructions.push(create_associated_token_account(
             &wallet,
@@ -259,6 +266,7 @@ pub fn simulate_orca_swap(
 
     if *input_mint == wsol_mint {
         instructions.push(system_instruction::transfer(&wallet, &wsol_ata, amount_in));
+
         instructions.push(spl_token::instruction::sync_native(
             &token_program,
             &wsol_ata,
@@ -294,27 +302,45 @@ pub fn check_wallet_atas(
     let wsol_mint = Pubkey::from_str(WSOL_MINT).context("Invalid WSOL mint")?;
 
     let wsol_ata = get_associated_token_address(wallet, &wsol_mint);
+
     let other_ata = get_associated_token_address(wallet, other_token_mint);
 
     let wsol_exists = client.get_account(&wsol_ata).is_ok();
+
     let other_exists = client.get_account(&other_ata).is_ok();
 
     tracing::info!("WSOL ATA: {} (exists: {})", wsol_ata, wsol_exists);
+
     tracing::info!("Other token ATA: {} (exists: {})", other_ata, other_exists);
 
     Ok((wsol_ata, wsol_exists, other_ata, other_exists))
 }
 
-
 fn simulate(client: &RpcClient, payer: &Keypair, instructions: Vec<Instruction>) -> Result<()> {
     simulate_with_blockhash(client, payer, instructions, None)
 }
 
+/// Simulate a transaction and enforce simulation truth.
+///
+/// IMPORTANT:
+/// `RpcClient::simulate_transaction()` can return successfully at the RPC
+/// transport level while the simulated transaction itself contains a
+/// Solana program error in `sim.value.err`.
+///
+/// That program error is NOT a successful simulation.
+///
+/// Therefore:
+///
+///     RPC request success
+///         !=
+///     transaction simulation success
+///
+/// This function treats `sim.value.err` as a hard failure.
 fn simulate_with_blockhash(
     client: &RpcClient,
     payer: &Keypair,
     instructions: Vec<Instruction>,
-    cached_blockhash: Option<Hash>,
+    cached_blockhash: Option<solana_sdk::hash::Hash>,
 ) -> Result<()> {
     let recent_blockhash = match cached_blockhash {
         Some(h) => h,
@@ -324,7 +350,9 @@ fn simulate_with_blockhash(
     };
 
     let message = Message::new(&instructions, Some(&payer.pubkey()));
+
     let mut tx = Transaction::new_unsigned(message);
+
     tx.sign(&[payer], recent_blockhash);
 
     tracing::info!(
@@ -336,25 +364,30 @@ fn simulate_with_blockhash(
         .simulate_transaction(&tx)
         .context("Failed to simulate transaction")?;
 
-    if let Some(err) = &sim.value.err {
-        tracing::warn!("Simulation returned an error: {:?}", err);
-    } else {
-        tracing::info!("Simulation succeeded with no error!");
-    }
-
     if let Some(logs) = &sim.value.logs {
-        for log in logs {
-            tracing::info!("LOG: {}", log);
+        for (index, log) in logs.iter().enumerate() {
+            tracing::info!("LOG[{}]: {}", index, log);
         }
     }
 
     tracing::info!("Compute units consumed: {:?}", sim.value.units_consumed);
 
+    if let Some(err) = &sim.value.err {
+        tracing::error!(
+            "SIMULATION FAILED: transaction returned a Solana execution error: {:?}",
+            err
+        );
+
+        bail!("transaction simulation failed: {:?}", err);
+    }
+
+    tracing::info!("SIMULATION SUCCESS: transaction executed successfully with no error");
+
     Ok(())
 }
 
-/// Builds a single swap instruction for the named DEX, spending `input_mint` for the
-/// other token. Direction-agnostic: works whether SOL or the other token is being spent.
+/// Builds a single swap instruction for the named DEX, spending `input_mint`
+/// for the other token. Direction-agnostic.
 fn build_leg_instruction(
     dex_name: &str,
     raydium_ctx: &RaydiumPoolContext,
@@ -394,6 +427,7 @@ fn build_leg_instruction(
 
                 raydium::build_swap_instruction(&accounts, amount_in, minimum_amount_out)
             }
+
             RaydiumPoolContext::Cpmm { pool_info } => {
                 let output_mint = if pool_info.token_0_mint == *input_mint {
                     pool_info.token_1_mint
@@ -438,8 +472,10 @@ fn build_leg_instruction(
                 raydium_cpmm::build_swap_instruction(&accounts, amount_in, minimum_amount_out)
             }
         },
+
         "Orca" => {
             let info = &orca_ctx.info;
+
             let (token_owner_account_a, token_owner_account_b) = if info.token_mint_a == wsol_mint {
                 (wsol_ata, other_ata)
             } else {
@@ -466,24 +502,16 @@ fn build_leg_instruction(
                 a_to_b,
             )
         }
+
         other => bail!("Unknown DEX: {other}"),
     }
 }
 
-/// Builds and simulates the full atomic arb transaction: buy on `opportunity.buy_dex`,
-/// sell on `opportunity.sell_dex`, direction chosen entirely by the Analyzer's output.
+/// Builds and simulates the full atomic arbitrage transaction.
+///
 /// Never sends anything - simulation only.
 ///
-/// `cached_blockhash`: pass the value read from your `BlockhashCache` to skip
-/// a synchronous `get_latest_blockhash` RPC call. Pass `None` to fall back to
-/// a live fetch.
-///
-/// `ata_cache`: pass a pre-loaded `AtaCache` (built once at startup via
-/// `AtaCache::load`, AFTER ensuring both ATAs exist on-chain) to skip the two
-/// `get_account` existence-check RPC calls this function used to make on
-/// every single call. If an ATA cache entry says an ATA doesn't exist, this
-/// function still emits the create-account instruction defensively - it just
-/// no longer *asks the network* every time to find that out.
+/// The analyzer's expected buy output is used directly as the sell input.
 #[allow(clippy::too_many_arguments)]
 pub fn simulate_opportunity(
     client: &RpcClient,
@@ -493,16 +521,15 @@ pub fn simulate_opportunity(
     orca_ctx: &OrcaPoolContext,
     other_token_mint: &Pubkey,
     other_token_decimals: u32,
-    cached_blockhash: Option<Hash>,
+    cached_blockhash: Option<solana_sdk::hash::Hash>,
     ata_cache: &AtaCache,
 ) -> Result<()> {
     let wallet = payer.pubkey();
+
     let token_program = Pubkey::from_str(TOKEN_PROGRAM_ID)?;
+
     let wsol_mint = Pubkey::from_str(WSOL_MINT)?;
 
-    // No RPC call here anymore - reuses the existence check done once at
-    // startup. If your wallet's ATAs are ever closed mid-run, restart the
-    // bot to refresh this cache (or call AtaCache::load again manually).
     let AtaCache {
         wsol_ata,
         wsol_exists,
@@ -511,7 +538,9 @@ pub fn simulate_opportunity(
     } = *ata_cache;
 
     let _ = other_token_decimals;
+
     let amount_in_lamports = opportunity.trade_size_lamports;
+
     let other_token_amount_raw = opportunity.expected_output_after_buy_raw;
 
     let mut instructions = vec![];
@@ -524,6 +553,7 @@ pub fn simulate_opportunity(
             &token_program,
         ));
     }
+
     if !other_exists {
         instructions.push(create_associated_token_account(
             &wallet,
@@ -538,12 +568,13 @@ pub fn simulate_opportunity(
         &wsol_ata,
         amount_in_lamports,
     ));
+
     instructions.push(spl_token::instruction::sync_native(
         &token_program,
         &wsol_ata,
     )?);
 
-    const SLIPPAGE_TOLERANCE_BPS: u32 = 100; // 1% tolerance below expected output
+    const SLIPPAGE_TOLERANCE_BPS: u32 = 100;
 
     let buy_minimum_out_raw = analyzer::calculate_minimum_out_raw(
         opportunity.expected_output_after_buy_raw,
@@ -562,12 +593,14 @@ pub fn simulate_opportunity(
         amount_in_lamports,
         buy_minimum_out_raw,
     )?;
+
     instructions.push(buy_ix);
 
     instructions.insert(
         0,
         solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(350_000),
     );
+
     instructions.insert(
         1,
         solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_price(25_000),
@@ -580,6 +613,7 @@ pub fn simulate_opportunity(
     .context("Failed to compute sell-leg minimum_out")?;
 
     let breakeven_lamports = amount_in_lamports + 1_000;
+
     let sell_minimum_out_lamports = base_sell_minimum_out.max(breakeven_lamports);
 
     let sell_ix = build_leg_instruction(
@@ -593,11 +627,15 @@ pub fn simulate_opportunity(
         other_token_amount_raw,
         sell_minimum_out_lamports,
     )?;
+
     instructions.push(sell_ix);
 
     tracing::info!(
         "Built atomic opportunity tx: buy on {} ({} lamports SOL in), sell on {} ({} raw units token in)",
-        opportunity.buy_dex, amount_in_lamports, opportunity.sell_dex, other_token_amount_raw
+        opportunity.buy_dex,
+        amount_in_lamports,
+        opportunity.sell_dex,
+        other_token_amount_raw
     );
 
     simulate_with_blockhash(client, payer, instructions, cached_blockhash)
@@ -610,22 +648,27 @@ pub type BlockhashCache = Arc<RwLock<Hash>>;
 
 pub fn spawn_blockhash_poller(rpc_url: String, interval_ms: u64) -> Result<BlockhashCache> {
     let client = RpcClient::new(rpc_url);
-    let initial_hash = client.get_latest_blockhash().context("Failed to get initial blockhash")?;
+
+    let initial_hash = client
+        .get_latest_blockhash()
+        .context("Failed to get initial blockhash")?;
+
     let cache = Arc::new(RwLock::new(initial_hash));
+
     let cache_clone = Arc::clone(&cache);
 
-    std::thread::spawn(move || {
-        loop {
-            std::thread::sleep(std::time::Duration::from_millis(interval_ms));
-            match client.get_latest_blockhash() {
-                Ok(hash) => {
-                    if let Ok(mut lock) = cache_clone.write() {
-                        *lock = hash;
-                    }
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_millis(interval_ms));
+
+        match client.get_latest_blockhash() {
+            Ok(hash) => {
+                if let Ok(mut lock) = cache_clone.write() {
+                    *lock = hash;
                 }
-                Err(e) => {
-                    tracing::warn!("Failed to refresh blockhash: {}", e);
-                }
+            }
+
+            Err(e) => {
+                tracing::warn!("Failed to refresh blockhash: {}", e);
             }
         }
     });
@@ -639,13 +682,16 @@ pub fn ensure_wallet_atas(
     other_token_mint: &Pubkey,
 ) -> Result<(Pubkey, Pubkey)> {
     let wallet = payer.pubkey();
+
     let token_program = Pubkey::from_str(TOKEN_PROGRAM_ID)?;
+
     let wsol_mint = Pubkey::from_str(WSOL_MINT)?;
 
     let (wsol_ata, wsol_exists, other_ata, other_exists) =
         check_wallet_atas(client, &wallet, other_token_mint)?;
 
     let mut setup_ixs = Vec::new();
+
     if !wsol_exists {
         setup_ixs.push(create_associated_token_account(
             &wallet,
@@ -654,6 +700,7 @@ pub fn ensure_wallet_atas(
             &token_program,
         ));
     }
+
     if !other_exists {
         setup_ixs.push(create_associated_token_account(
             &wallet,
@@ -665,11 +712,19 @@ pub fn ensure_wallet_atas(
 
     if !setup_ixs.is_empty() {
         tracing::info!("Pre-creating {} missing ATA(s)...", setup_ixs.len());
+
         let recent_blockhash = client.get_latest_blockhash()?;
+
         let message = Message::new(&setup_ixs, Some(&wallet));
+
         let mut tx = Transaction::new_unsigned(message);
+
         tx.sign(&[payer], recent_blockhash);
-        client.send_and_confirm_transaction(&tx).context("Failed to pre-create ATAs")?;
+
+        client
+            .send_and_confirm_transaction(&tx)
+            .context("Failed to pre-create ATAs")?;
+
         tracing::info!("ATAs successfully pre-created and ready!");
     } else {
         tracing::info!("All necessary ATAs already exist!");
