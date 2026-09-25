@@ -20,11 +20,47 @@ pub const TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 pub const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
 
 /// Known accounts for a specific Raydium pool. Loaded once per run from live chain state.
-pub struct RaydiumPoolContext {
-    pub pool_id: Pubkey,
-    pub amm_authority: Pubkey,
-    pub coin_vault: Pubkey,
-    pub pc_vault: Pubkey,
+pub enum RaydiumPoolContext {
+    Amm {
+        pool_id: Pubkey,
+        amm_authority: Pubkey,
+        coin_vault: Pubkey,
+        pc_vault: Pubkey,
+    },
+    Cpmm {
+        pool_info: crate::scanner::raydium_cpmm::CpmmPoolInfo,
+    },
+}
+
+impl RaydiumPoolContext {
+    pub fn load_amm(client: &RpcClient, pool_id: &str) -> Result<Self> {
+        let pool_pubkey = Pubkey::from_str(pool_id).context("Invalid Raydium pool pubkey")?;
+        let vaults = crate::scanner::raydium::fetch_pool_vaults(client, pool_id)?;
+        let amm_program = Pubkey::from_str("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8")?;
+        let (amm_authority, _) = Pubkey::find_program_address(&[b"amm authority"], &amm_program);
+        Ok(Self::Amm {
+            pool_id: pool_pubkey,
+            amm_authority,
+            coin_vault: vaults.coin_vault,
+            pc_vault: vaults.pc_vault,
+        })
+    }
+
+    pub fn load_cpmm(client: &RpcClient, pool_id: &str) -> Result<Self> {
+        let pool_info = crate::scanner::raydium_cpmm::fetch_pool_info(client, pool_id)?;
+        Ok(Self::Cpmm { pool_info })
+    }
+
+    pub fn load(
+        client: &RpcClient,
+        pool_id: &str,
+        decoder: crate::config::DecoderType,
+    ) -> Result<Self> {
+        match decoder {
+            crate::config::DecoderType::Amm => Self::load_amm(client, pool_id),
+            crate::config::DecoderType::Cpmm => Self::load_cpmm(client, pool_id),
+        }
+    }
 }
 
 /// Known accounts for a specific Orca pool. Loaded once per run from live chain state.
@@ -277,25 +313,75 @@ fn build_leg_instruction(
     let wsol_mint = Pubkey::from_str(WSOL_MINT)?;
 
     match dex_name {
-        "Raydium" => {
-            let (user_source, user_destination) = if *input_mint == wsol_mint {
-                (wsol_ata, other_ata)
-            } else {
-                (other_ata, wsol_ata)
-            };
+        "Raydium" | "RaydiumCPMM" => match raydium_ctx {
+            RaydiumPoolContext::Amm {
+                pool_id,
+                amm_authority,
+                coin_vault,
+                pc_vault,
+            } => {
+                let (user_source, user_destination) = if *input_mint == wsol_mint {
+                    (wsol_ata, other_ata)
+                } else {
+                    (other_ata, wsol_ata)
+                };
 
-            let accounts = raydium::SwapAccounts {
-                amm_pool: raydium_ctx.pool_id,
-                amm_authority: raydium_ctx.amm_authority,
-                pool_coin_token_account: raydium_ctx.coin_vault,
-                pool_pc_token_account: raydium_ctx.pc_vault,
-                user_source,
-                user_destination,
-                user_owner: wallet,
-            };
+                let accounts = raydium::SwapAccounts {
+                    amm_pool: *pool_id,
+                    amm_authority: *amm_authority,
+                    pool_coin_token_account: *coin_vault,
+                    pool_pc_token_account: *pc_vault,
+                    user_source,
+                    user_destination,
+                    user_owner: wallet,
+                };
 
-            raydium::build_swap_instruction(&accounts, amount_in, minimum_amount_out)
-        }
+                raydium::build_swap_instruction(&accounts, amount_in, minimum_amount_out)
+            }
+            RaydiumPoolContext::Cpmm { pool_info } => {
+                let output_mint = if pool_info.token_0_mint == *input_mint {
+                    pool_info.token_1_mint
+                } else {
+                    pool_info.token_0_mint
+                };
+
+                let (input_token_account, output_token_account) = if *input_mint == wsol_mint {
+                    (wsol_ata, other_ata)
+                } else {
+                    (other_ata, wsol_ata)
+                };
+
+                let (input_vault, output_vault) = if pool_info.token_0_mint == *input_mint {
+                    (pool_info.token_0_vault, pool_info.token_1_vault)
+                } else {
+                    (pool_info.token_1_vault, pool_info.token_0_vault)
+                };
+
+                let (input_token_program, output_token_program) =
+                    if pool_info.token_0_mint == *input_mint {
+                        (pool_info.token_0_program, pool_info.token_1_program)
+                    } else {
+                        (pool_info.token_1_program, pool_info.token_0_program)
+                    };
+
+                let accounts = raydium_cpmm::SwapAccounts {
+                    payer: wallet,
+                    amm_config: pool_info.amm_config,
+                    pool_state: pool_info.pool_state,
+                    input_token_account,
+                    output_token_account,
+                    input_vault,
+                    output_vault,
+                    input_token_program,
+                    output_token_program,
+                    input_token_mint: *input_mint,
+                    output_token_mint: output_mint,
+                    observation_state: pool_info.observation_key,
+                };
+
+                raydium_cpmm::build_swap_instruction(&accounts, amount_in, minimum_amount_out)
+            }
+        },
         "Orca" => {
             let info = &orca_ctx.info;
             let (token_owner_account_a, token_owner_account_b) = if info.token_mint_a == wsol_mint {
@@ -348,14 +434,19 @@ pub fn simulate_opportunity(
     let (wsol_ata, wsol_exists, other_ata, other_exists) =
         check_wallet_atas(client, &wallet, other_token_mint)?;
 
-    let amount_in_sol_ui = opportunity.trade_size_base * opportunity.buy_price;
-    let amount_in_lamports = (amount_in_sol_ui * 1_000_000_000.0) as u64;
+    // Execution-critical amounts now come straight from the Analyzer's own
+    // integer fields - no f64 round-trip. `other_token_decimals` is no longer
+    // needed for amount math (kept as a parameter for call-site compatibility
+    // and any future display use) since expected_output_after_buy_raw is
+    // already in raw base-token units.
+    let _ = other_token_decimals;
+    let amount_in_lamports = opportunity.trade_size_lamports;
 
-    // Use the Analyzer's own computed output from the buy leg, not a re-derived guess -
-    // this is the exact amount the buy leg is expected to produce, so the sell leg
-    // spends exactly that, keeping Analyzer and Executor in agreement.
-    let other_token_amount_raw =
-        (opportunity.expected_output_after_buy * 10f64.powi(other_token_decimals as i32)) as u64;
+    // Use the Analyzer's own computed output from the buy leg, not a re-derived
+    // guess - this is the exact raw amount the buy leg is expected to produce,
+    // so the sell leg spends exactly that, keeping Analyzer and Executor in
+    // exact integer agreement (no precision loss from an intermediate f64).
+    let other_token_amount_raw = opportunity.expected_output_after_buy_raw;
 
     let mut instructions = vec![];
 
@@ -388,13 +479,13 @@ pub fn simulate_opportunity(
     )?);
 
     // Leg 1: buy - spend SOL, receive the other token.
-    const SLIPPAGE_TOLERANCE_PCT: f64 = 1.0; // 1% tolerance below expected output
+    const SLIPPAGE_TOLERANCE_BPS: u32 = 100; // 1% tolerance below expected output
 
-    let buy_minimum_out_ui = analyzer::calculate_minimum_out(
-        opportunity.expected_output_after_buy,
-        SLIPPAGE_TOLERANCE_PCT,
-    );
-    let buy_minimum_out_raw = (buy_minimum_out_ui * 10f64.powi(other_token_decimals as i32)) as u64;
+    let buy_minimum_out_raw = analyzer::calculate_minimum_out_raw(
+        opportunity.expected_output_after_buy_raw,
+        SLIPPAGE_TOLERANCE_BPS,
+    )
+    .context("Failed to compute buy-leg minimum_out")?;
 
     let buy_ix = build_leg_instruction(
         &opportunity.buy_dex,
@@ -411,11 +502,11 @@ pub fn simulate_opportunity(
 
     // Leg 2: sell - spend the other token (amount = what we expect to have received),
     // receive SOL back.
-    let sell_minimum_out_sol = analyzer::calculate_minimum_out(
-        opportunity.expected_output_after_sell,
-        SLIPPAGE_TOLERANCE_PCT,
-    );
-    let sell_minimum_out_lamports = (sell_minimum_out_sol * 1_000_000_000.0) as u64;
+    let sell_minimum_out_lamports = analyzer::calculate_minimum_out_raw(
+        opportunity.expected_output_after_sell_raw,
+        SLIPPAGE_TOLERANCE_BPS,
+    )
+    .context("Failed to compute sell-leg minimum_out")?;
 
     let sell_ix = build_leg_instruction(
         &opportunity.sell_dex,

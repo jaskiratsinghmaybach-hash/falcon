@@ -26,6 +26,7 @@ async fn main() -> anyhow::Result<()> {
         &config.pair,
         &config.raydium_pool_id,
         &config.orca_pool_id,
+        config.decoder,
         50_000_000.0,
     )
     .await?;

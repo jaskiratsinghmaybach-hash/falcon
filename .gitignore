@@ -1,3 +1,5 @@
 /target
 .env
 opportunity_log.csv
+.env.local
+*.zip

@@ -1,6 +1,12 @@
 use anyhow::{Context, Result};
 use solana_sdk::signature::{Keypair, Signer};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecoderType {
+    Cpmm,
+    Amm,
+}
+
 pub struct Config {
     pub helius_rpc_url: String,
     pub helius_ws_url: String,
@@ -9,6 +15,7 @@ pub struct Config {
     pub pair: String,
     pub raydium_pool_id: String,
     pub orca_pool_id: String,
+    pub decoder: DecoderType,
 }
 
 impl Config {
@@ -42,12 +49,20 @@ impl Config {
         let orca_pool_id =
             std::env::var("ORCA_POOL_ID").context("ORCA_POOL_ID not set in environment")?;
 
+        let decoder_str = std::env::var("DECODER").unwrap_or_else(|_| "CPMM".to_string());
+        let decoder = match decoder_str.trim().to_uppercase().as_str() {
+            "AMM" | "AMMV4" | "LEGACY" => DecoderType::Amm,
+            "CPMM" => DecoderType::Cpmm,
+            other => anyhow::bail!("Invalid DECODER '{other}' in .env: must be CPMM or AMM"),
+        };
+
         tracing::info!("Config loaded. Wallet pubkey: {}", keypair.pubkey());
         tracing::info!(
-            "Pair: {}, Raydium pool: {}, Orca pool: {}",
+            "Pair: {}, Raydium pool: {}, Orca pool: {}, Decoder: {:?}",
             pair,
             raydium_pool_id,
-            orca_pool_id
+            orca_pool_id,
+            decoder,
         );
 
         Ok(Self {
@@ -58,6 +73,7 @@ impl Config {
             pair,
             raydium_pool_id,
             orca_pool_id,
+            decoder,
         })
     }
 }

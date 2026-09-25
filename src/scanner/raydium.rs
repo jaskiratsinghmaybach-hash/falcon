@@ -168,3 +168,13 @@ pub fn fetch_price(client: &RpcClient, pool_id: &str, pair: &str) -> Result<Pric
         timestamp: std::time::SystemTime::now(),
     })
 }
+
+pub fn decode_amm_info(data: &[u8]) -> Result<AmmInfo> {
+    if data.len() != 752 {
+        anyhow::bail!(
+            "Raydium AMM v4 account data length mismatch: expected 752, got {}",
+            data.len()
+        );
+    }
+    AmmInfo::try_from_slice(data).context("Failed to deserialize AmmInfo")
+}

@@ -1,70 +1,210 @@
 use anyhow::{Context, Result};
-use solana_sdk::{
-    instruction::{AccountMeta, Instruction},
-    pubkey::Pubkey,
-};
+use borsh::BorshDeserialize;
+use solana_client::rpc_client::RpcClient;
+use solana_sdk::pubkey::Pubkey;
 use std::str::FromStr;
 
-pub const RAYDIUM_CPMM_PROGRAM: &str = "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C";
+use super::PriceUpdate;
 
-const SWAP_BASE_INPUT_DISCRIMINATOR: [u8; 8] = [143, 190, 90, 218, 196, 30, 51, 222];
+const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
+const RAYDIUM_CPMM_PROGRAM: &str = "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C";
 
-pub struct SwapAccounts {
-    pub payer: Pubkey,
+#[derive(BorshDeserialize, Debug)]
+pub struct PoolState {
     pub amm_config: Pubkey,
+    pub pool_creator: Pubkey,
+    pub token_0_vault: Pubkey,
+    pub token_1_vault: Pubkey,
+    pub lp_mint: Pubkey,
+    pub token_0_mint: Pubkey,
+    pub token_1_mint: Pubkey,
+    pub token_0_program: Pubkey,
+    pub token_1_program: Pubkey,
+    pub observation_key: Pubkey,
+    pub auth_bump: u8,
+    pub status: u8,
+    pub lp_mint_decimals: u8,
+    pub mint_0_decimals: u8,
+    pub mint_1_decimals: u8,
+    pub lp_supply: u64,
+    pub protocol_fees_token_0: u64,
+    pub protocol_fees_token_1: u64,
+    pub fund_fees_token_0: u64,
+    pub fund_fees_token_1: u64,
+    pub open_time: u64,
+    pub recent_epoch: u64,
+    pub creator_fee_on: u8,
+    pub enable_creator_fee: bool,
+    pub padding1: [u8; 6],
+    pub creator_fees_token_0: u64,
+    pub creator_fees_token_1: u64,
+    pub padding: [u64; 28],
+}
+
+#[derive(BorshDeserialize, Debug)]
+pub struct AmmConfig {
+    pub bump: u8,
+    pub disable_create_pool: bool,
+    pub index: u16,
+    pub trade_fee_rate: u64,
+    pub protocol_fee_rate: u64,
+    pub fund_fee_rate: u64,
+    pub create_pool_fee: u64,
+    pub protocol_owner: Pubkey,
+    pub fund_owner: Pubkey,
+    pub creator_fee_rate: u64,
+    pub padding: [u64; 15],
+}
+
+#[derive(Debug, Clone)]
+pub struct CpmmPoolInfo {
     pub pool_state: Pubkey,
-    pub input_token_account: Pubkey,
-    pub output_token_account: Pubkey,
-    pub input_vault: Pubkey,
-    pub output_vault: Pubkey,
-    pub input_token_program: Pubkey,
-    pub output_token_program: Pubkey,
-    pub input_token_mint: Pubkey,
-    pub output_token_mint: Pubkey,
-    pub observation_state: Pubkey,
+    pub amm_config: Pubkey,
+    pub token_0_vault: Pubkey,
+    pub token_1_vault: Pubkey,
+    pub token_0_mint: Pubkey,
+    pub token_1_mint: Pubkey,
+    pub token_0_program: Pubkey,
+    pub token_1_program: Pubkey,
+    pub observation_key: Pubkey,
 }
 
-fn program_id() -> Result<Pubkey> {
-    Pubkey::from_str(RAYDIUM_CPMM_PROGRAM).context("Invalid CPMM program ID")
+fn validate_pool_account(account: &solana_sdk::account::Account, pool_id: &str) -> Result<()> {
+    let expected_owner = Pubkey::from_str(RAYDIUM_CPMM_PROGRAM)?;
+    if account.owner != expected_owner {
+        anyhow::bail!(
+            "Pool {} is not owned by Raydium CPMM program (expected {}, got {}) - wrong pool type or address",
+            pool_id, expected_owner, account.owner
+        );
+    }
+    Ok(())
 }
 
-fn derive_authority() -> Result<Pubkey> {
-    let (pda, _) = Pubkey::find_program_address(&[b"vault_and_lp_mint_auth_seed"], &program_id()?);
-    Ok(pda)
+fn load_pool_state(client: &RpcClient, pool_id: &str) -> Result<PoolState> {
+    let pool_pubkey = Pubkey::from_str(pool_id).context("Invalid CPMM pool pubkey format")?;
+
+    let account = client
+        .get_account(&pool_pubkey)
+        .context("Failed to fetch CPMM pool account")?;
+
+    validate_pool_account(&account, pool_id)?;
+
+    let data = &account.data[8..];
+
+    PoolState::try_from_slice(data).context("Failed to deserialize CPMM PoolState")
 }
 
-/// Raydium CPMM SwapBaseInput.
-pub fn build_swap_instruction(
-    accounts: &SwapAccounts,
-    amount_in: u64,
-    minimum_amount_out: u64,
-) -> Result<Instruction> {
-    let program = program_id()?;
-    let authority = derive_authority()?;
+/// Decodes PoolState from raw account bytes (no RPC call) - used by both the
+/// RPC-based fetch path and the WebSocket real-time path.
+pub fn decode_pool_state(data: &[u8]) -> Result<PoolState> {
+    let inner = &data[8..];
+    PoolState::try_from_slice(inner).context("Failed to deserialize CPMM PoolState")
+}
 
-    let mut data = SWAP_BASE_INPUT_DISCRIMINATOR.to_vec();
-    data.extend_from_slice(&amount_in.to_le_bytes());
-    data.extend_from_slice(&minimum_amount_out.to_le_bytes());
+pub fn fetch_pool_info(client: &RpcClient, pool_id: &str) -> Result<CpmmPoolInfo> {
+    let pool_pubkey = Pubkey::from_str(pool_id).context("Invalid CPMM pool pubkey format")?;
+    let pool_state = load_pool_state(client, pool_id)?;
 
-    let account_metas = vec![
-        AccountMeta::new_readonly(accounts.payer, true),
-        AccountMeta::new_readonly(authority, false),
-        AccountMeta::new_readonly(accounts.amm_config, false),
-        AccountMeta::new(accounts.pool_state, false),
-        AccountMeta::new(accounts.input_token_account, false),
-        AccountMeta::new(accounts.output_token_account, false),
-        AccountMeta::new(accounts.input_vault, false),
-        AccountMeta::new(accounts.output_vault, false),
-        AccountMeta::new_readonly(accounts.input_token_program, false),
-        AccountMeta::new_readonly(accounts.output_token_program, false),
-        AccountMeta::new_readonly(accounts.input_token_mint, false),
-        AccountMeta::new_readonly(accounts.output_token_mint, false),
-        AccountMeta::new(accounts.observation_state, false),
-    ];
+    Ok(CpmmPoolInfo {
+        pool_state: pool_pubkey,
+        amm_config: pool_state.amm_config,
+        token_0_vault: pool_state.token_0_vault,
+        token_1_vault: pool_state.token_1_vault,
+        token_0_mint: pool_state.token_0_mint,
+        token_1_mint: pool_state.token_1_mint,
+        token_0_program: pool_state.token_0_program,
+        token_1_program: pool_state.token_1_program,
+        observation_key: pool_state.observation_key,
+    })
+}
 
-    Ok(Instruction {
-        program_id: program,
-        accounts: account_metas,
-        data,
+pub fn fetch_price(client: &RpcClient, pool_id: &str, pair: &str) -> Result<PriceUpdate> {
+    let pool_state = load_pool_state(client, pool_id)?;
+
+    tracing::debug!(
+        "CPMM token_0_mint: {}, token_1_mint: {}",
+        pool_state.token_0_mint,
+        pool_state.token_1_mint
+    );
+
+    let vault_0_balance = client
+        .get_token_account_balance(&pool_state.token_0_vault)
+        .context("Failed to fetch token 0 vault balance")?;
+    let vault_1_balance = client
+        .get_token_account_balance(&pool_state.token_1_vault)
+        .context("Failed to fetch token 1 vault balance")?;
+
+    // Raw on-chain smallest-unit amounts, straight from the RPC's `amount` string
+    // field (NOT `ui_amount`, which is already a lossy f64 division by decimals).
+    // This is the execution-domain source of truth for reserves.
+    let vault_0_raw: u64 = vault_0_balance
+        .amount
+        .parse()
+        .context("Failed to parse raw amount for vault 0")?;
+    let vault_1_raw: u64 = vault_1_balance
+        .amount
+        .parse()
+        .context("Failed to parse raw amount for vault 1")?;
+
+    let amm_config_account = client
+        .get_account(&pool_state.amm_config)
+        .context("Failed to fetch AmmConfig account")?;
+    let amm_config = AmmConfig::try_from_slice(&amm_config_account.data[8..])
+        .context("Failed to deserialize AmmConfig")?;
+
+    // CPMM's trade_fee_rate is already an exact integer rate out of 1_000_000
+    // (e.g. 2500 => 0.25%). Keep it as an exact integer ratio for execution;
+    // the f64 percent below is derived ONLY for display.
+    const CPMM_FEE_RATE_DENOMINATOR: u64 = 1_000_000;
+    let fee_numerator = amm_config.trade_fee_rate;
+    let fee_denominator = CPMM_FEE_RATE_DENOMINATOR;
+    let fee_pct = (fee_numerator as f64 / fee_denominator as f64) * 100.0;
+
+    // Presentation-only f64 conversions for logging (never fed back into
+    // trading decisions - see PriceUpdate's doc comment).
+    let vault_0_ui = vault_0_balance.ui_amount.unwrap_or(0.0);
+    let vault_1_ui = vault_1_balance.ui_amount.unwrap_or(0.0);
+
+    let is_token_0_wsol = pool_state.token_0_mint.to_string() == WSOL_MINT;
+
+    let (base_reserve_raw, quote_reserve_raw, base_decimals, quote_decimals) = if is_token_0_wsol
+    {
+        (
+            vault_1_raw,
+            vault_0_raw,
+            pool_state.mint_1_decimals,
+            pool_state.mint_0_decimals,
+        )
+    } else {
+        // Covers both "token_1 is WSOL" and the neither-is-WSOL fallback that
+        // the original code also treated identically (token_0 = base).
+        (
+            vault_0_raw,
+            vault_1_raw,
+            pool_state.mint_0_decimals,
+            pool_state.mint_1_decimals,
+        )
+    };
+
+    let (base_liquidity, quote_liquidity, price) = if is_token_0_wsol {
+        (vault_1_ui, vault_0_ui, vault_0_ui / vault_1_ui)
+    } else {
+        (vault_0_ui, vault_1_ui, vault_1_ui / vault_0_ui)
+    };
+
+    Ok(PriceUpdate {
+        dex: "RaydiumCPMM".to_string(),
+        pair: pair.to_string(),
+        base_reserve_raw,
+        quote_reserve_raw,
+        base_decimals,
+        quote_decimals,
+        fee_numerator,
+        fee_denominator,
+        price,
+        base_liquidity,
+        quote_liquidity,
+        fee_pct,
+        timestamp: std::time::SystemTime::now(),
     })
 }

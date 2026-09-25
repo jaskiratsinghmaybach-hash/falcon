@@ -5,20 +5,49 @@ pub mod realtime;
 
 use anyhow::Result;
 use solana_client::rpc_client::RpcClient;
-use solana_sdk::{pubkey::Pubkey, signature::Keypair};
 use std::sync::mpsc;
-use std::time::Duration;
 
 use crate::analyzer;
+use crate::config::DecoderType;
 
+/// Raw execution-domain reserves and fee parameters for one pool side of a pair,
+/// plus f64 fields kept ONLY for human-readable logging/display (see logger.rs).
+///
+/// Numeric boundary rule (see numeric-migration deliverable notes): everything
+/// under "raw execution state" below is deterministic integer data and is what
+/// the Analyzer and Executor must use for any trading decision or instruction.
+/// The `price`/`base_liquidity`/`quote_liquidity` f64 fields are DISPLAY-ONLY
+/// convenience values for logs; never feed them back into calculations that
+/// approve, size, or execute a trade.
 #[derive(Debug, Clone)]
 pub struct PriceUpdate {
     pub dex: String,
     pub pair: String,
+
+    // --- raw execution state (integer, deterministic) ---
+    /// Raw base-token reserve, smallest units (i.e. accounting for the base
+    /// mint's decimals), from the vault this PriceUpdate was fetched from.
+    pub base_reserve_raw: u64,
+    /// Raw quote-token reserve, smallest units. Quote is always the WSOL side
+    /// for this bot's pairs (see scanner-specific fetch_price for orientation).
+    pub quote_reserve_raw: u64,
+    /// Base-token mint decimals (needed to convert base_reserve_raw for display
+    /// or when constructing instruction amounts that must be in base units).
+    pub base_decimals: u8,
+    /// Quote-token (WSOL) mint decimals. Always 9 for SOL, but carried
+    /// explicitly rather than hardcoded so the type stays honest about units.
+    pub quote_decimals: u8,
+    /// Trading fee as an exact integer ratio (numerator / denominator), taken
+    /// directly from each protocol's own fee parameters - never derived via f64.
+    pub fee_numerator: u64,
+    pub fee_denominator: u64,
+
+    // --- presentation-only (f64) - logging/display, NEVER execution ---
     pub price: f64,
     pub base_liquidity: f64,
     pub quote_liquidity: f64,
     pub fee_pct: f64,
+
     pub timestamp: std::time::SystemTime,
 }
 
@@ -41,6 +70,7 @@ pub async fn run_realtime_loop(
     pair: &str,
     raydium_pool_id: &str,
     orca_pool_id: &str,
+    decoder: DecoderType,
     _trade_size_hint: f64,
 ) -> Result<()> {
     let client = RpcClient::new(rpc_url.to_string());
@@ -96,15 +126,28 @@ pub async fn run_realtime_loop(
         }
     });
 
-    tracing::info!("Real-time WebSocket subscriptions started for {}", pair);
+    tracing::info!(
+        "Real-time WebSocket subscriptions started for {} (Raydium mode: {:?})",
+        pair,
+        decoder
+    );
 
     let mut last_raydium: Option<PriceUpdate> = None;
     let mut last_orca: Option<PriceUpdate> = None;
 
     // Seed both sides once via a normal RPC call so we have a baseline before
     // the first WebSocket event arrives.
-    if let Ok(p) = raydium_cpmm::fetch_price(&client, raydium_pool_id, pair) {
-        last_raydium = Some(p);
+    match decoder {
+        DecoderType::Cpmm => {
+            if let Ok(p) = raydium_cpmm::fetch_price(&client, raydium_pool_id, pair) {
+                last_raydium = Some(p);
+            }
+        }
+        DecoderType::Amm => {
+            if let Ok(p) = raydium::fetch_price(&client, raydium_pool_id, pair) {
+                last_raydium = Some(p);
+            }
+        }
     }
     if let Ok(p) = orca::fetch_price(&client, orca_pool_id, pair) {
         last_orca = Some(p);
@@ -118,12 +161,23 @@ pub async fn run_realtime_loop(
         );
 
         let decoded_price = match event.source {
-            Source::Raydium => match raydium_cpmm::decode_pool_state(&event.update.data) {
-                Ok(_pool_state) => raydium_cpmm::fetch_price(&client, raydium_pool_id, pair).ok(),
-                Err(e) => {
-                    tracing::warn!("Failed to decode Raydium update: {}", e);
-                    None
-                }
+            Source::Raydium => match decoder {
+                DecoderType::Cpmm => match raydium_cpmm::decode_pool_state(&event.update.data) {
+                    Ok(_pool_state) => {
+                        raydium_cpmm::fetch_price(&client, raydium_pool_id, pair).ok()
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to decode Raydium CPMM update: {}", e);
+                        None
+                    }
+                },
+                DecoderType::Amm => match raydium::decode_amm_info(&event.update.data) {
+                    Ok(_amm_info) => raydium::fetch_price(&client, raydium_pool_id, pair).ok(),
+                    Err(e) => {
+                        tracing::warn!("Failed to decode Raydium AMM update: {}", e);
+                        None
+                    }
+                },
             },
             Source::Orca => match orca::decode_whirlpool(&event.update.data) {
                 Ok(_whirlpool) => orca::fetch_price(&client, orca_pool_id, pair).ok(),
@@ -173,7 +227,47 @@ pub async fn run_realtime_loop(
                     );
                 }
                 Err(reason) => {
-                    tracing::debug!("No opportunity: {:?}", reason);
+                    tracing::info!(
+                        "[{}] Opportunity check: {:?} | {} price: {:.10}, {} price: {:.10}",
+                        pair,
+                        reason,
+                        r.dex,
+                        r.price,
+                        o.dex,
+                        o.price
+                    );
+
+                    let (buy_dex, sell_dex) = if r.price < o.price {
+                        (r.dex.as_str(), o.dex.as_str())
+                    } else {
+                        (o.dex.as_str(), r.dex.as_str())
+                    };
+                    // Display-only spread for the rejection log row. This is
+                    // NOT used for any decision (the decision already happened
+                    // inside find_best_opportunity using integer bps math) -
+                    // it's purely so the CSV shows roughly how close the
+                    // market was, using the same f64 price fields as the
+                    // rest of the display-only log columns.
+                    let raw_spread_pct = ((r.price.max(o.price) - r.price.min(o.price))
+                        / r.price.min(o.price))
+                        * 100.0;
+
+                    let _ = crate::logger::log_row(
+                        pair,
+                        r.price,
+                        o.price,
+                        r.base_liquidity,
+                        r.quote_liquidity,
+                        o.base_liquidity,
+                        o.quote_liquidity,
+                        buy_dex,
+                        sell_dex,
+                        raw_spread_pct,
+                        0.0,
+                        0.0,
+                        reason.as_display_pct(),
+                        &format!("{:?}", reason),
+                    );
                 }
             }
         }

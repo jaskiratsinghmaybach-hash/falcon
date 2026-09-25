@@ -110,14 +110,8 @@ pub fn fetch_price(client: &RpcClient, pool_id: &str, pair: &str) -> Result<Pric
         .get_token_supply(&whirlpool.token_mint_b)
         .context("Failed to fetch token B mint info")?;
 
-    let decimals_a = mint_a_info.decimals as i32;
-    let decimals_b = mint_b_info.decimals as i32;
-
-    let sqrt_price_f64 = whirlpool.sqrt_price as f64 / (2f64.powi(64));
-    let raw_price = sqrt_price_f64 * sqrt_price_f64;
-
-    let decimal_adjustment = 10f64.powi(decimals_a - decimals_b);
-    let price_b_per_a = raw_price * decimal_adjustment;
+    let decimals_a = mint_a_info.decimals;
+    let decimals_b = mint_b_info.decimals;
 
     let vault_a_balance = client
         .get_token_account_balance(&whirlpool.token_vault_a)
@@ -126,27 +120,78 @@ pub fn fetch_price(client: &RpcClient, pool_id: &str, pair: &str) -> Result<Pric
         .get_token_account_balance(&whirlpool.token_vault_b)
         .context("Failed to fetch token vault B balance")?;
 
-    let vault_a_amount = vault_a_balance
-        .ui_amount
-        .context("No ui_amount for vault A")?;
-    let vault_b_amount = vault_b_balance
-        .ui_amount
-        .context("No ui_amount for vault B")?;
+    // Raw on-chain smallest-unit amounts - execution-domain source of truth.
+    // The Analyzer sizes trades and computes swap outputs from THESE reserves,
+    // never from sqrt_price - so sqrt_price's f64 conversion below only ever
+    // feeds the display `price` field, never a trading decision.
+    let vault_a_raw: u64 = vault_a_balance
+        .amount
+        .parse()
+        .context("Failed to parse raw amount for vault A")?;
+    let vault_b_raw: u64 = vault_b_balance
+        .amount
+        .parse()
+        .context("Failed to parse raw amount for vault B")?;
 
-    let (base_liquidity, quote_liquidity, price) =
-        if whirlpool.token_mint_a.to_string() == WSOL_MINT {
-            (vault_b_amount, vault_a_amount, 1.0 / price_b_per_a)
-        } else if whirlpool.token_mint_b.to_string() == WSOL_MINT {
-            (vault_a_amount, vault_b_amount, price_b_per_a)
-        } else {
-            (vault_a_amount, vault_b_amount, price_b_per_a)
-        };
+    let is_a_wsol = whirlpool.token_mint_a.to_string() == WSOL_MINT;
 
-    let fee_pct = whirlpool.fee_rate as f64 / 10_000.0;
+    let (base_reserve_raw, quote_reserve_raw, base_decimals, quote_decimals) = if is_a_wsol {
+        (vault_b_raw, vault_a_raw, decimals_b, decimals_a)
+    } else {
+        // Covers both "B is WSOL" and the neither-is-WSOL fallback, which the
+        // original code also treated identically (A = base side).
+        (vault_a_raw, vault_b_raw, decimals_a, decimals_b)
+    };
+
+    // --- presentation-only from here down: f64 sqrt_price -> display price ---
+    // TODO(numeric-migration): sqrt_price is Q64.64 fixed-point on-chain
+    // (price = sqrt_price^2 / 2^128, base units). This f64 conversion is fine
+    // for a human-readable log line, but if Orca-side execution math (e.g.
+    // exact CLMM tick-crossing output) is implemented later, that MUST use
+    // sqrt_price/liquidity directly in u128/i128 fixed-point per Orca's own
+    // whirlpool math - not this display float. Left as a TODO per the
+    // "preserve existing protocol-specific structure, don't invent exact CLMM
+    // math here" instruction.
+    let sqrt_price_f64 = whirlpool.sqrt_price as f64 / (2f64.powi(64));
+    let raw_price = sqrt_price_f64 * sqrt_price_f64;
+    let decimal_adjustment = 10f64.powi(decimals_a as i32 - decimals_b as i32);
+    let price_b_per_a = raw_price * decimal_adjustment;
+
+    let vault_a_ui = vault_a_balance.ui_amount.unwrap_or(0.0);
+    let vault_b_ui = vault_b_balance.ui_amount.unwrap_or(0.0);
+
+    let (base_liquidity, quote_liquidity, price) = if is_a_wsol {
+        (vault_b_ui, vault_a_ui, 1.0 / price_b_per_a)
+    } else {
+        (vault_a_ui, vault_b_ui, price_b_per_a)
+    };
+
+    // Orca's fee_rate is stored in hundredths of a basis point, per Orca's own
+    // docs: swap_fee = (input_amount * fee_rate) / 1_000_000. Use it directly
+    // as an exact integer ratio.
+    //
+    // BUG FIX during numeric migration: the pre-migration code divided by
+    // 10_000 here (treating fee_rate as plain basis points), which understated
+    // fee_pct by 100x versus Orca's documented formula. Confirmed against
+    // https://docs.orca.so/developers/architecture/whirlpool-fees. This only
+    // affected the f64 display value in the old code, but since fee_pct also
+    // fed straight into the old analyzer's fee-adjusted-spread math, it means
+    // prior runs UNDERSTATED Orca's real fee in the profitability check. Worth
+    // knowing when reviewing any historical opportunity_log.csv rows.
+    let fee_numerator = whirlpool.fee_rate as u64;
+    const ORCA_FEE_RATE_DENOMINATOR: u64 = 1_000_000;
+    let fee_denominator = ORCA_FEE_RATE_DENOMINATOR;
+    let fee_pct = (fee_numerator as f64 / fee_denominator as f64) * 100.0;
 
     Ok(PriceUpdate {
         dex: "Orca".to_string(),
         pair: pair.to_string(),
+        base_reserve_raw,
+        quote_reserve_raw,
+        base_decimals,
+        quote_decimals,
+        fee_numerator,
+        fee_denominator,
         price,
         base_liquidity,
         quote_liquidity,
