@@ -262,10 +262,23 @@ pub fn check_wallet_atas(
     Ok((wsol_ata, wsol_exists, other_ata, other_exists))
 }
 
+
 fn simulate(client: &RpcClient, payer: &Keypair, instructions: Vec<Instruction>) -> Result<()> {
-    let recent_blockhash = client
-        .get_latest_blockhash()
-        .context("Failed to fetch recent blockhash")?;
+    simulate_with_blockhash(client, payer, instructions, None)
+}
+
+fn simulate_with_blockhash(
+    client: &RpcClient,
+    payer: &Keypair,
+    instructions: Vec<Instruction>,
+    cached_blockhash: Option<Hash>,
+) -> Result<()> {
+    let recent_blockhash = match cached_blockhash {
+        Some(h) => h,
+        None => client
+            .get_latest_blockhash()
+            .context("Failed to fetch recent blockhash")?,
+    };
 
     let message = Message::new(&instructions, Some(&payer.pubkey()));
     let mut tx = Transaction::new_unsigned(message);
@@ -500,13 +513,27 @@ pub fn simulate_opportunity(
     )?;
     instructions.push(buy_ix);
 
+    // Compute budget & Priority fees
+    instructions.insert(
+        0,
+        solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(350_000),
+    );
+    instructions.insert(
+        1,
+        solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_price(25_000),
+    );
+
     // Leg 2: sell - spend the other token (amount = what we expect to have received),
     // receive SOL back.
-    let sell_minimum_out_lamports = analyzer::calculate_minimum_out_raw(
+    let base_sell_minimum_out = analyzer::calculate_minimum_out_raw(
         opportunity.expected_output_after_sell_raw,
         SLIPPAGE_TOLERANCE_BPS,
     )
     .context("Failed to compute sell-leg minimum_out")?;
+
+    // Hard On-Chain Revert Guard: sell output MUST at least break even + 1000 lamports.
+    let breakeven_lamports = amount_in_lamports + 1_000;
+    let sell_minimum_out_lamports = base_sell_minimum_out.max(breakeven_lamports);
 
     let sell_ix = build_leg_instruction(
         &opportunity.sell_dex,
@@ -527,4 +554,79 @@ pub fn simulate_opportunity(
     );
 
     simulate(client, payer, instructions)
+}
+
+use solana_sdk::hash::Hash;
+use std::sync::{Arc, RwLock};
+
+pub type BlockhashCache = Arc<RwLock<Hash>>;
+
+pub fn spawn_blockhash_poller(rpc_url: String, interval_ms: u64) -> Result<BlockhashCache> {
+    let client = RpcClient::new(rpc_url);
+    let initial_hash = client.get_latest_blockhash().context("Failed to get initial blockhash")?;
+    let cache = Arc::new(RwLock::new(initial_hash));
+    let cache_clone = Arc::clone(&cache);
+
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(interval_ms));
+            match client.get_latest_blockhash() {
+                Ok(hash) => {
+                    if let Ok(mut lock) = cache_clone.write() {
+                        *lock = hash;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to refresh blockhash: {}", e);
+                }
+            }
+        }
+    });
+
+    Ok(cache)
+}
+
+pub fn ensure_wallet_atas(
+    client: &RpcClient,
+    payer: &Keypair,
+    other_token_mint: &Pubkey,
+) -> Result<(Pubkey, Pubkey)> {
+    let wallet = payer.pubkey();
+    let token_program = Pubkey::from_str(TOKEN_PROGRAM_ID)?;
+    let wsol_mint = Pubkey::from_str(WSOL_MINT)?;
+
+    let (wsol_ata, wsol_exists, other_ata, other_exists) =
+        check_wallet_atas(client, &wallet, other_token_mint)?;
+
+    let mut setup_ixs = Vec::new();
+    if !wsol_exists {
+        setup_ixs.push(create_associated_token_account(
+            &wallet,
+            &wallet,
+            &wsol_mint,
+            &token_program,
+        ));
+    }
+    if !other_exists {
+        setup_ixs.push(create_associated_token_account(
+            &wallet,
+            &wallet,
+            other_token_mint,
+            &token_program,
+        ));
+    }
+
+    if !setup_ixs.is_empty() {
+        tracing::info!("Pre-creating {} missing ATA(s)...", setup_ixs.len());
+        let recent_blockhash = client.get_latest_blockhash()?;
+        let message = Message::new(&setup_ixs, Some(&wallet));
+        let mut tx = Transaction::new_unsigned(message);
+        tx.sign(&[payer], recent_blockhash);
+        client.send_and_confirm_transaction(&tx).context("Failed to pre-create ATAs")?;
+        tracing::info!("ATAs successfully pre-created and ready!");
+    } else {
+        tracing::info!("All necessary ATAs already exist!");
+    }
+
+    Ok((wsol_ata, other_ata))
 }

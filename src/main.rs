@@ -20,6 +20,10 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("Falcon initialized and ready - starting real-time engine");
 
+    // Spawn background blockhash poller (1.5s refresh) so executor has 0ms blockhash lookup
+    let _blockhash_cache = executor::spawn_blockhash_poller(config.helius_rpc_url.clone(), 1500)?;
+    tracing::info!("Background blockhash cache started (1500ms interval)");
+
     scanner::run_realtime_loop(
         &config.helius_ws_url,
         &config.helius_rpc_url,
@@ -28,6 +32,7 @@ async fn main() -> anyhow::Result<()> {
         &config.orca_pool_id,
         config.decoder,
         50_000_000.0,
+        config.max_price_age_secs,
     )
     .await?;
 

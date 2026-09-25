@@ -63,10 +63,12 @@ impl Config {
             .parse()
             .unwrap_or(25_000);
 
+        // Default to 0 (disabled) so resting on-chain liquidity during quiet periods
+        // can still be arbitraged when the other pool moves.
         let max_price_age_secs: u64 = std::env::var("MAX_PRICE_AGE_SECS")
-            .unwrap_or_else(|_| "120".to_string())
+            .unwrap_or_else(|_| "0".to_string())
             .parse()
-            .unwrap_or(120);
+            .unwrap_or(0);
 
         tracing::info!("Config loaded. Wallet pubkey: {}", keypair.pubkey());
         tracing::info!(

@@ -208,3 +208,99 @@ pub fn fetch_price(client: &RpcClient, pool_id: &str, pair: &str) -> Result<Pric
         timestamp: std::time::SystemTime::now(),
     })
 }
+
+#[derive(Debug, Clone)]
+pub struct CpmmStaticContext {
+    pub pool_id: Pubkey,
+    pub token_0_vault: Pubkey,
+    pub token_1_vault: Pubkey,
+    pub token_0_mint: Pubkey,
+    pub token_1_mint: Pubkey,
+    pub mint_0_decimals: u8,
+    pub mint_1_decimals: u8,
+    pub fee_numerator: u64,
+    pub fee_denominator: u64,
+    pub fee_pct: f64,
+    pub is_token_0_wsol: bool,
+}
+
+impl CpmmStaticContext {
+    pub fn load(client: &RpcClient, pool_id: &str) -> Result<Self> {
+        let pool_pubkey = Pubkey::from_str(pool_id).context("Invalid CPMM pool pubkey format")?;
+        let pool_state = load_pool_state(client, pool_id)?;
+        let amm_config_account = client
+            .get_account(&pool_state.amm_config)
+            .context("Failed to fetch AmmConfig account")?;
+        let amm_config = AmmConfig::try_from_slice(&amm_config_account.data[8..])
+            .context("Failed to deserialize AmmConfig")?;
+
+        const CPMM_FEE_RATE_DENOMINATOR: u64 = 1_000_000;
+        let fee_numerator = amm_config.trade_fee_rate;
+        let fee_denominator = CPMM_FEE_RATE_DENOMINATOR;
+        let fee_pct = (fee_numerator as f64 / fee_denominator as f64) * 100.0;
+        let is_token_0_wsol = pool_state.token_0_mint.to_string() == WSOL_MINT;
+
+        Ok(Self {
+            pool_id: pool_pubkey,
+            token_0_vault: pool_state.token_0_vault,
+            token_1_vault: pool_state.token_1_vault,
+            token_0_mint: pool_state.token_0_mint,
+            token_1_mint: pool_state.token_1_mint,
+            mint_0_decimals: pool_state.mint_0_decimals,
+            mint_1_decimals: pool_state.mint_1_decimals,
+            fee_numerator,
+            fee_denominator,
+            fee_pct,
+            is_token_0_wsol,
+        })
+    }
+
+    pub fn fetch_price_with_context(&self, client: &RpcClient, pair: &str) -> Result<PriceUpdate> {
+        let vault_0_balance = client
+            .get_token_account_balance(&self.token_0_vault)
+            .context("Failed to fetch token 0 vault balance")?;
+        let vault_1_balance = client
+            .get_token_account_balance(&self.token_1_vault)
+            .context("Failed to fetch token 1 vault balance")?;
+
+        let vault_0_raw: u64 = vault_0_balance
+            .amount
+            .parse()
+            .context("Failed to parse raw amount for vault 0")?;
+        let vault_1_raw: u64 = vault_1_balance
+            .amount
+            .parse()
+            .context("Failed to parse raw amount for vault 1")?;
+
+        let (base_reserve_raw, quote_reserve_raw, base_decimals, quote_decimals) = if self.is_token_0_wsol {
+            (vault_1_raw, vault_0_raw, self.mint_1_decimals, self.mint_0_decimals)
+        } else {
+            (vault_0_raw, vault_1_raw, self.mint_0_decimals, self.mint_1_decimals)
+        };
+
+        let vault_0_ui = vault_0_balance.ui_amount.unwrap_or(0.0);
+        let vault_1_ui = vault_1_balance.ui_amount.unwrap_or(0.0);
+
+        let (base_liquidity, quote_liquidity, price) = if self.is_token_0_wsol {
+            (vault_1_ui, vault_0_ui, vault_0_ui / vault_1_ui)
+        } else {
+            (vault_0_ui, vault_1_ui, vault_1_ui / vault_0_ui)
+        };
+
+        Ok(PriceUpdate {
+            dex: "RaydiumCPMM".to_string(),
+            pair: pair.to_string(),
+            base_reserve_raw,
+            quote_reserve_raw,
+            base_decimals,
+            quote_decimals,
+            fee_numerator: self.fee_numerator,
+            fee_denominator: self.fee_denominator,
+            price,
+            base_liquidity,
+            quote_liquidity,
+            fee_pct: self.fee_pct,
+            timestamp: std::time::SystemTime::now(),
+        })
+    }
+}

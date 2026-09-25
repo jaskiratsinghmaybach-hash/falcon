@@ -71,6 +71,10 @@ pub enum RejectReason {
     NetProfitNotPositive {
         net_profit_lamports: i128,
     },
+    StalePrice {
+        age_secs: u64,
+        max_age_secs: u64,
+    },
 }
 
 impl RejectReason {
@@ -84,6 +88,7 @@ impl RejectReason {
             RejectReason::NetProfitNotPositive {
                 net_profit_lamports,
             } => *net_profit_lamports as f64 / 1_000_000_000.0,
+            RejectReason::StalePrice { age_secs, .. } => *age_secs as f64,
         }
     }
 }
@@ -539,6 +544,26 @@ pub fn find_best_opportunity(
     }
 }
 
+/// Evaluates price updates with a staleness check. If either pool's snapshot is older
+/// than `max_price_age_secs`, rejects the opportunity to prevent trading on phantom/ghost spreads.
+pub fn find_best_opportunity_with_staleness(
+    price_a: &PriceUpdate,
+    price_b: &PriceUpdate,
+    max_price_age_secs: u64,
+) -> Result<Opportunity, RejectReason> {
+    let now = std::time::SystemTime::now();
+    let age_a = now.duration_since(price_a.timestamp).unwrap_or_default().as_secs();
+    let age_b = now.duration_since(price_b.timestamp).unwrap_or_default().as_secs();
+    let max_age = age_a.max(age_b);
+    if max_price_age_secs > 0 && max_age > max_price_age_secs {
+        return Err(RejectReason::StalePrice {
+            age_secs: max_age,
+            max_age_secs: max_price_age_secs,
+        });
+    }
+    find_best_opportunity(price_a, price_b)
+}
+
 // ===========================================================================
 // TESTS
 // ===========================================================================
@@ -591,7 +616,7 @@ mod tests {
         // 1% spread, but each side charges 0.6% -> 1.2% total fees -> should reject
         let a = pu("A", 1_000_000_000, 1_000_000_000, 6_000, 1_000_000); // 0.6% fee
         let b = pu("B", 1_000_000_000, 1_010_000_000, 6_000, 1_000_000); // 0.6% fee, 1% higher price
-        let result = find_opportunity(&a, &b, 1_000_000);
+        let result = find_opportunity(&a, &b, 50_000_000);
         assert!(matches!(result, Err(RejectReason::FeesExceedSpread { .. })));
     }
 
@@ -614,7 +639,7 @@ mod tests {
     // 4. slippage boundaries
     #[test]
     fn slippage_zero_for_negligible_trade() {
-        let bps = estimate_slippage_bps(1_000_000_000_000, 1_000_000_000_000, 1).unwrap();
+        let bps = estimate_slippage_bps(1_000_000_000_000, 1_000_000_000_000, 1_000_000).unwrap();
         assert!(
             bps.abs() < 2,
             "expected ~0 bps slippage for a tiny trade, got {bps}"
@@ -641,7 +666,7 @@ mod tests {
         // Large, clearly profitable spread with negligible fees/slippage at tiny size.
         let a = pu("A", 1_000_000_000_000, 1_000_000_000_000, 1, 1_000_000);
         let b = pu("B", 1_000_000_000_000, 1_100_000_000_000, 1, 1_000_000); // 10% higher
-        let result = find_opportunity(&a, &b, 1_000_000);
+        let result = find_opportunity(&a, &b, 50_000_000);
         match result {
             Ok(opp) => {
                 assert!(opp.net_profit_lamports > 0);
@@ -698,12 +723,12 @@ mod tests {
     fn leg1_output_feeds_leg2_input_exactly() {
         let a = pu("A", 500_000_000_000, 500_000_000_000, 2_500, 1_000_000);
         let b = pu("B", 500_000_000_000, 520_000_000_000, 2_500, 1_000_000);
-        let opp = find_opportunity(&a, &b, 5_000_000).expect("should approve");
+        let opp = find_opportunity(&a, &b, 50_000_000).expect("should approve");
 
         // Recompute leg 1 independently and confirm the Opportunity carries
         // the exact same integer value through to what leg 2 used as input.
         let expected_leg1 =
-            estimate_output_amount_raw(a.quote_reserve_raw, a.base_reserve_raw, 5_000_000).unwrap();
+            estimate_output_amount_raw(a.quote_reserve_raw, a.base_reserve_raw, 50_000_000).unwrap();
         assert_eq!(opp.expected_output_after_buy_raw, expected_leg1);
 
         let expected_leg2 =

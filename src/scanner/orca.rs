@@ -199,3 +199,104 @@ pub fn fetch_price(client: &RpcClient, pool_id: &str, pair: &str) -> Result<Pric
         timestamp: std::time::SystemTime::now(),
     })
 }
+
+#[derive(Debug, Clone)]
+pub struct OrcaStaticContext {
+    pub pool_id: Pubkey,
+    pub token_mint_a: Pubkey,
+    pub token_mint_b: Pubkey,
+    pub token_vault_a: Pubkey,
+    pub token_vault_b: Pubkey,
+    pub decimals_a: u8,
+    pub decimals_b: u8,
+    pub is_a_wsol: bool,
+}
+
+impl OrcaStaticContext {
+    pub fn load(client: &RpcClient, pool_id: &str) -> Result<Self> {
+        let pool_pubkey = Pubkey::from_str(pool_id).context("Invalid Whirlpool pubkey format")?;
+        let whirlpool = load_whirlpool(client, pool_id)?;
+        let mint_a_info = client
+            .get_token_supply(&whirlpool.token_mint_a)
+            .context("Failed to fetch token A mint info")?;
+        let mint_b_info = client
+            .get_token_supply(&whirlpool.token_mint_b)
+            .context("Failed to fetch token B mint info")?;
+        let is_a_wsol = whirlpool.token_mint_a.to_string() == WSOL_MINT;
+
+        Ok(Self {
+            pool_id: pool_pubkey,
+            token_mint_a: whirlpool.token_mint_a,
+            token_mint_b: whirlpool.token_mint_b,
+            token_vault_a: whirlpool.token_vault_a,
+            token_vault_b: whirlpool.token_vault_b,
+            decimals_a: mint_a_info.decimals,
+            decimals_b: mint_b_info.decimals,
+            is_a_wsol,
+        })
+    }
+
+    pub fn fetch_price_with_context(&self, client: &RpcClient, pair: &str) -> Result<PriceUpdate> {
+        let whirlpool = load_whirlpool(client, &self.pool_id.to_string())?;
+        self.price_from_whirlpool(client, &whirlpool, pair)
+    }
+
+    pub fn price_from_whirlpool(&self, client: &RpcClient, whirlpool: &Whirlpool, pair: &str) -> Result<PriceUpdate> {
+        let vault_a_balance = client
+            .get_token_account_balance(&whirlpool.token_vault_a)
+            .context("Failed to fetch token vault A balance")?;
+        let vault_b_balance = client
+            .get_token_account_balance(&whirlpool.token_vault_b)
+            .context("Failed to fetch token vault B balance")?;
+
+        let vault_a_raw: u64 = vault_a_balance
+            .amount
+            .parse()
+            .context("Failed to parse raw amount for vault A")?;
+        let vault_b_raw: u64 = vault_b_balance
+            .amount
+            .parse()
+            .context("Failed to parse raw amount for vault B")?;
+
+        let (base_reserve_raw, quote_reserve_raw, base_decimals, quote_decimals) = if self.is_a_wsol {
+            (vault_b_raw, vault_a_raw, self.decimals_b, self.decimals_a)
+        } else {
+            (vault_a_raw, vault_b_raw, self.decimals_a, self.decimals_b)
+        };
+
+        let sqrt_price_f64 = whirlpool.sqrt_price as f64 / (2f64.powi(64));
+        let raw_price = sqrt_price_f64 * sqrt_price_f64;
+        let decimal_adjustment = 10f64.powi(self.decimals_a as i32 - self.decimals_b as i32);
+        let price_b_per_a = raw_price * decimal_adjustment;
+
+        let vault_a_ui = vault_a_balance.ui_amount.unwrap_or(0.0);
+        let vault_b_ui = vault_b_balance.ui_amount.unwrap_or(0.0);
+
+        let (base_liquidity, quote_liquidity, price) = if self.is_a_wsol {
+            (vault_b_ui, vault_a_ui, 1.0 / price_b_per_a)
+        } else {
+            (vault_a_ui, vault_b_ui, price_b_per_a)
+        };
+
+        let fee_numerator = whirlpool.fee_rate as u64;
+        const ORCA_FEE_RATE_DENOMINATOR: u64 = 1_000_000;
+        let fee_denominator = ORCA_FEE_RATE_DENOMINATOR;
+        let fee_pct = (fee_numerator as f64 / fee_denominator as f64) * 100.0;
+
+        Ok(PriceUpdate {
+            dex: "Orca".to_string(),
+            pair: pair.to_string(),
+            base_reserve_raw,
+            quote_reserve_raw,
+            base_decimals,
+            quote_decimals,
+            fee_numerator,
+            fee_denominator,
+            price,
+            base_liquidity,
+            quote_liquidity,
+            fee_pct,
+            timestamp: std::time::SystemTime::now(),
+        })
+    }
+}

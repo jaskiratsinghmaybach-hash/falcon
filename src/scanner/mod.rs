@@ -72,6 +72,7 @@ pub async fn run_realtime_loop(
     orca_pool_id: &str,
     decoder: DecoderType,
     _trade_size_hint: f64,
+    max_price_age_secs: u64,
 ) -> Result<()> {
     let client = RpcClient::new(rpc_url.to_string());
     let (tx, rx) = mpsc::channel::<RealtimeEvent>();
@@ -132,6 +133,32 @@ pub async fn run_realtime_loop(
         decoder
     );
 
+    // Pre-cache static pool contexts on boot to eliminate redundant RPC round-trips
+    let cpmm_ctx = match decoder {
+        DecoderType::Cpmm => match raydium_cpmm::CpmmStaticContext::load(&client, raydium_pool_id) {
+            Ok(ctx) => {
+                tracing::info!("Pre-cached Raydium CPMM static pool metadata");
+                Some(ctx)
+            }
+            Err(e) => {
+                tracing::warn!("Failed to pre-cache CPMM metadata, falling back to dynamic fetch: {}", e);
+                None
+            }
+        },
+        DecoderType::Amm => None,
+    };
+
+    let orca_ctx = match orca::OrcaStaticContext::load(&client, orca_pool_id) {
+        Ok(ctx) => {
+            tracing::info!("Pre-cached Orca Whirlpool static pool metadata");
+            Some(ctx)
+        }
+        Err(e) => {
+            tracing::warn!("Failed to pre-cache Orca metadata, falling back to dynamic fetch: {}", e);
+            None
+        }
+    };
+
     let mut last_raydium: Option<PriceUpdate> = None;
     let mut last_orca: Option<PriceUpdate> = None;
 
@@ -139,7 +166,11 @@ pub async fn run_realtime_loop(
     // the first WebSocket event arrives.
     match decoder {
         DecoderType::Cpmm => {
-            if let Ok(p) = raydium_cpmm::fetch_price(&client, raydium_pool_id, pair) {
+            if let Some(ctx) = &cpmm_ctx {
+                if let Ok(p) = ctx.fetch_price_with_context(&client, pair) {
+                    last_raydium = Some(p);
+                }
+            } else if let Ok(p) = raydium_cpmm::fetch_price(&client, raydium_pool_id, pair) {
                 last_raydium = Some(p);
             }
         }
@@ -149,7 +180,11 @@ pub async fn run_realtime_loop(
             }
         }
     }
-    if let Ok(p) = orca::fetch_price(&client, orca_pool_id, pair) {
+    if let Some(ctx) = &orca_ctx {
+        if let Ok(p) = ctx.fetch_price_with_context(&client, pair) {
+            last_orca = Some(p);
+        }
+    } else if let Ok(p) = orca::fetch_price(&client, orca_pool_id, pair) {
         last_orca = Some(p);
     }
 
@@ -162,15 +197,13 @@ pub async fn run_realtime_loop(
 
         let decoded_price = match event.source {
             Source::Raydium => match decoder {
-                DecoderType::Cpmm => match raydium_cpmm::decode_pool_state(&event.update.data) {
-                    Ok(_pool_state) => {
+                DecoderType::Cpmm => {
+                    if let Some(ctx) = &cpmm_ctx {
+                        ctx.fetch_price_with_context(&client, pair).ok()
+                    } else {
                         raydium_cpmm::fetch_price(&client, raydium_pool_id, pair).ok()
                     }
-                    Err(e) => {
-                        tracing::warn!("Failed to decode Raydium CPMM update: {}", e);
-                        None
-                    }
-                },
+                }
                 DecoderType::Amm => match raydium::decode_amm_info(&event.update.data) {
                     Ok(_amm_info) => raydium::fetch_price(&client, raydium_pool_id, pair).ok(),
                     Err(e) => {
@@ -180,7 +213,13 @@ pub async fn run_realtime_loop(
                 },
             },
             Source::Orca => match orca::decode_whirlpool(&event.update.data) {
-                Ok(_whirlpool) => orca::fetch_price(&client, orca_pool_id, pair).ok(),
+                Ok(whirlpool) => {
+                    if let Some(ctx) = &orca_ctx {
+                        ctx.price_from_whirlpool(&client, &whirlpool, pair).ok()
+                    } else {
+                        orca::fetch_price(&client, orca_pool_id, pair).ok()
+                    }
+                }
                 Err(e) => {
                     tracing::warn!("Failed to decode Orca update: {}", e);
                     None
@@ -202,7 +241,7 @@ pub async fn run_realtime_loop(
         }
 
         if let (Some(r), Some(o)) = (&last_raydium, &last_orca) {
-            match analyzer::find_best_opportunity(r, o) {
+            match analyzer::find_best_opportunity_with_staleness(r, o, max_price_age_secs) {
                 Ok(opp) => {
                     tracing::warn!(
                         "REAL-TIME OPPORTUNITY: buy on {} @ {:.10}, sell on {} @ {:.10}, NET PROFIT: {:.4}%",
