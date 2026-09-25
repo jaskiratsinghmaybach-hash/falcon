@@ -170,6 +170,9 @@ pub fn fetch_price(client: &RpcClient, pool_id: &str, pair: &str) -> Result<Pric
         quote_liquidity,
         fee_pct,
         timestamp: std::time::SystemTime::now(),
+        clmm_sqrt_price_q64: whirlpool.sqrt_price,
+        clmm_liquidity: whirlpool.liquidity,
+        clmm_is_a_wsol: is_a_wsol,
     })
 }
 
@@ -234,7 +237,7 @@ impl OrcaStaticContext {
             .parse()
             .context("Failed to parse raw amount for vault B")?;
 
-        Ok(self.price_from_whirlpool_and_reserves(whirlpool.sqrt_price, whirlpool.fee_rate, vault_a_raw, vault_b_raw, pair))
+        Ok(self.price_from_whirlpool_and_reserves(whirlpool.sqrt_price, whirlpool.liquidity, whirlpool.fee_rate, vault_a_raw, vault_b_raw, pair))
     }
 
     /// Hot-path constructor for a plain reserve update (e.g. only a vault
@@ -243,12 +246,13 @@ impl OrcaStaticContext {
     pub fn price_from_raw_reserves(
         &self,
         sqrt_price: u128,
+        liquidity: u128,
         fee_rate: u16,
         vault_a_raw: u64,
         vault_b_raw: u64,
         pair: &str,
     ) -> PriceUpdate {
-        self.price_from_whirlpool_and_reserves(sqrt_price, fee_rate, vault_a_raw, vault_b_raw, pair)
+        self.price_from_whirlpool_and_reserves(sqrt_price, liquidity, fee_rate, vault_a_raw, vault_b_raw, pair)
     }
 
     /// Hot-path constructor: builds a `PriceUpdate` purely from values already
@@ -257,6 +261,7 @@ impl OrcaStaticContext {
     pub fn price_from_whirlpool_and_reserves(
         &self,
         sqrt_price: u128,
+        liquidity: u128,
         fee_rate: u16,
         vault_a_raw: u64,
         vault_b_raw: u64,
@@ -301,6 +306,9 @@ impl OrcaStaticContext {
             quote_liquidity,
             fee_pct,
             timestamp: std::time::SystemTime::now(),
+            clmm_sqrt_price_q64: sqrt_price,
+            clmm_liquidity: liquidity,
+            clmm_is_a_wsol: self.is_a_wsol,
         }
     }
 }

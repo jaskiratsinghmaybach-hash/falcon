@@ -8,7 +8,7 @@ use solana_client::rpc_client::RpcClient;
 use std::sync::mpsc;
 
 use crate::analyzer;
-use crate::config::DecoderType;
+use crate::config::{CapitalSource, DecoderType};
 use crate::executor;
 
 #[derive(Debug, Clone)]
@@ -26,10 +26,14 @@ pub struct PriceUpdate {
     pub quote_liquidity: f64,
     pub fee_pct: f64,
     pub timestamp: std::time::SystemTime,
+    /// Orca Whirlpool CLMM fields. Non-zero only for Orca legs.
+    /// `clmm_liquidity == 0` means: constant-product pool, use reserve math.
+    /// Non-zero: use the CLMM tick math in the analyzer.
+    pub clmm_sqrt_price_q64: u128,
+    pub clmm_liquidity: u128,
+    pub clmm_is_a_wsol: bool,
 }
 
-/// Everything the hot loop needs to simulate an opportunity the instant it's
-/// found - built once in main.rs (one-time RPC calls) and moved into the loop.
 pub struct ExecutionContext {
     pub client: RpcClient,
     pub payer: solana_sdk::signature::Keypair,
@@ -88,6 +92,7 @@ pub async fn run_realtime_loop(
     decoder: DecoderType,
     _trade_size_hint: f64,
     max_price_age_secs: u64,
+    capital_source: CapitalSource,
     exec_ctx: ExecutionContext,
 ) -> Result<()> {
     let client = RpcClient::new(rpc_url.to_string());
@@ -174,6 +179,7 @@ pub async fn run_realtime_loop(
     let mut orca_vault_a_raw: u64 = 0;
     let mut orca_vault_b_raw: u64 = 0;
     let mut orca_sqrt_price: u128 = 0;
+    let mut orca_liquidity: u128 = 0;
     let mut orca_fee_rate: u16 = 0;
 
     match decoder {
@@ -215,6 +221,7 @@ pub async fn run_realtime_loop(
             if let Ok(account) = client.get_account(&pool_pubkey) {
                 if let Ok(wp) = orca::decode_whirlpool(&account.data) {
                     orca_sqrt_price = wp.sqrt_price;
+                    orca_liquidity = wp.liquidity;
                     orca_fee_rate = wp.fee_rate;
                 }
             }
@@ -272,10 +279,12 @@ pub async fn run_realtime_loop(
                 match orca::decode_whirlpool(&event.update.data) {
                     Ok(whirlpool) => {
                         orca_sqrt_price = whirlpool.sqrt_price;
+                        orca_liquidity = whirlpool.liquidity;
                         orca_fee_rate = whirlpool.fee_rate;
                         if let Some(ctx) = &orca_ctx {
                             last_orca = Some(ctx.price_from_whirlpool_and_reserves(
                                 orca_sqrt_price,
+                                orca_liquidity,
                                 orca_fee_rate,
                                 orca_vault_a_raw,
                                 orca_vault_b_raw,
@@ -293,6 +302,7 @@ pub async fn run_realtime_loop(
                         if let Some(ctx) = &orca_ctx {
                             last_orca = Some(ctx.price_from_raw_reserves(
                                 orca_sqrt_price,
+                                orca_liquidity,
                                 orca_fee_rate,
                                 orca_vault_a_raw,
                                 orca_vault_b_raw,
@@ -310,6 +320,7 @@ pub async fn run_realtime_loop(
                         if let Some(ctx) = &orca_ctx {
                             last_orca = Some(ctx.price_from_raw_reserves(
                                 orca_sqrt_price,
+                                orca_liquidity,
                                 orca_fee_rate,
                                 orca_vault_a_raw,
                                 orca_vault_b_raw,
@@ -323,7 +334,7 @@ pub async fn run_realtime_loop(
         }
 
         if let (Some(r), Some(o)) = (&last_raydium, &last_orca) {
-            match analyzer::find_best_opportunity_with_staleness(r, o, max_price_age_secs) {
+            match analyzer::find_best_opportunity_with_staleness(r, o, max_price_age_secs, capital_source) {
                 Ok(opp) => {
                     tracing::warn!(
                         "REAL-TIME OPPORTUNITY: buy on {} @ {:.10}, sell on {} @ {:.10}, NET PROFIT: {:.4}%",

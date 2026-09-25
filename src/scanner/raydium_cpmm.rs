@@ -196,6 +196,9 @@ pub fn fetch_price(client: &RpcClient, pool_id: &str, pair: &str) -> Result<Pric
         quote_liquidity,
         fee_pct,
         timestamp: std::time::SystemTime::now(),
+        clmm_sqrt_price_q64: 0,
+        clmm_liquidity: 0,
+        clmm_is_a_wsol: false,
     })
 }
 
@@ -311,6 +314,9 @@ impl CpmmStaticContext {
             quote_liquidity,
             fee_pct: self.fee_pct,
             timestamp: std::time::SystemTime::now(),
+            clmm_sqrt_price_q64: 0,
+            clmm_liquidity: 0,
+            clmm_is_a_wsol: false,
         }
     }
 }

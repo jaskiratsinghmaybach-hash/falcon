@@ -20,11 +20,9 @@ async fn main() -> anyhow::Result<()> {
 
     let config = config::Config::load()?;
 
-    // Spawn background blockhash poller (1.5s refresh) so executor has 0ms blockhash lookup
     let blockhash_cache = executor::spawn_blockhash_poller(config.helius_rpc_url.clone(), 1500)?;
     tracing::info!("Background blockhash cache started (1500ms interval)");
 
-    // Load executor-side pool contexts once at startup (one-time RPC calls).
     let exec_client = RpcClient::new(config.helius_rpc_url.clone());
     let raydium_exec_ctx =
         executor::RaydiumPoolContext::load(&exec_client, &config.raydium_pool_id, config.decoder)
@@ -39,15 +37,9 @@ async fn main() -> anyhow::Result<()> {
         orca_exec_ctx.info.token_mint_a
     };
 
-    // Ensure both ATAs exist on-chain BEFORE caching their existence - this
-    // sends one real (non-simulated) setup transaction if either is missing,
-    // so the cache built right after can safely assume both exist from here
-    // on. This is the only place in the whole run that ATA creation happens.
     executor::ensure_wallet_atas(&exec_client, &config.keypair, &other_token_mint)
         .expect("Failed to ensure wallet ATAs exist");
 
-    // Cache ATA pubkeys + existence ONCE - removes 2 RPC calls (get_account
-    // x2) from every single simulate_opportunity call in the hot loop.
     let ata_cache = executor::AtaCache::load(&exec_client, &config.keypair.pubkey(), &other_token_mint)
         .expect("Failed to load ATA cache");
     tracing::info!(
@@ -66,6 +58,7 @@ async fn main() -> anyhow::Result<()> {
         config.decoder,
         50_000_000.0,
         config.max_price_age_secs,
+        config.capital_source,
         scanner::ExecutionContext {
             client: exec_client,
             payer: config.keypair,

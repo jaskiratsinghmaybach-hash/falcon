@@ -318,6 +318,198 @@ pub fn calculate_minimum_out_raw(
     u64::try_from(minimum_out).map_err(|_| MathError::OutputTooLarge)
 }
 
+// ===========================================================================
+// ORCA WHIRLPOOL (CLMM) SWAP MATH
+// ===========================================================================
+// Orca Whirlpools are Concentrated Liquidity Market Makers (CLMM), not
+// constant-product pools. Their swap output is governed by:
+//
+//   sqrt_price (Q64.64 fixed-point)  and  active liquidity
+//
+// rather than by vault reserve ratios. Using x*y=k for an Orca CLMM leg
+// would systematically underestimate output, causing execution to fail with
+// AmountOutBelowMinimum (error 6036) because the minimum we send on-chain
+// would be set too high relative to what the pool actually returns.
+//
+// Both functions assume a single-tick-range swap (no tick-crossing). This is
+// correct for the small trade sizes we target; crossing a tick boundary
+// requires fetching tick-array account data from the chain and is out of
+// scope for the hot-path estimator.
+//
+// Overflow strategy:
+//   sqrt_price_q64 is typically ~2^69 for realistic prices (verified against
+//   live Orca pool data). Multiplying two such values gives ~2^138, which
+//   overflows u128. The (>> 32) scaling trick keeps all intermediate products
+//   within u128 while introducing at most 1 ULP error per shifted term.
+
+/// Orca CLMM swap: spending token B (SOL/quote) to receive token A (base).
+/// Direction when `is_a_wsol = false` (SOL is token_b, base token is token_a).
+///
+/// Formula derivation:
+///   new_sqrt_price = sqrt_price + amount_net * 2^64 / liquidity
+///   amount_out_a   = amount_net * 2^64 / ((sqrt_price >> 32) * (new_sqrt_price >> 32))
+///
+/// The `>> 32` on both sqrt_price terms brings the product of the two into
+/// u128 range without losing significant precision for our trade sizes.
+fn clmm_output_b_to_a(
+    sqrt_price_q64: u128,
+    liquidity: u128,
+    fee_numerator: u64,
+    fee_denominator: u64,
+    amount_in: u64,
+) -> Result<u64, MathError> {
+    if liquidity == 0 {
+        return Err(MathError::ZeroReserve);
+    }
+
+    let fee_denom = fee_denominator.max(1) as u128;
+    let amount_net = (amount_in as u128)
+        .checked_mul(fee_denom - fee_numerator as u128)
+        .ok_or(MathError::Overflow("clmm_b_to_a fee_net"))?
+        / fee_denom;
+
+    if amount_net == 0 {
+        return Ok(0);
+    }
+
+    // delta_sqrt_price = amount_net * 2^64 / liquidity  (Q64.64)
+    // amount_net <= ~u64, so amount_net * 2^64 fits in u128.
+    let delta_num = amount_net
+        .checked_mul(1u128 << 64)
+        .ok_or(MathError::Overflow("clmm_b_to_a delta_num"))?;
+    let delta_sqrt_price = delta_num / liquidity;
+
+    let new_sqrt_price = sqrt_price_q64
+        .checked_add(delta_sqrt_price)
+        .ok_or(MathError::Overflow("clmm_b_to_a new_sqrt_price"))?;
+
+    // amount_out_a = amount_net * 2^64 / (sp32 * nsp32)
+    // (equivalent to: amount_net / (actual_sqrt * actual_new_sqrt) in real units)
+    let sp32 = sqrt_price_q64 >> 32;
+    let nsp32 = new_sqrt_price >> 32;
+    if sp32 == 0 || nsp32 == 0 {
+        return Err(MathError::ZeroReserve);
+    }
+
+    let denom = sp32
+        .checked_mul(nsp32)
+        .ok_or(MathError::Overflow("clmm_b_to_a sp32*nsp32"))?;
+
+    // delta_num is already amount_net * 2^64
+    let amount_out = delta_num / denom;
+    u64::try_from(amount_out).map_err(|_| MathError::OutputTooLarge)
+}
+
+/// Orca CLMM swap: spending token A (base) to receive token B (SOL/quote).
+/// Direction when `is_a_wsol = false` (SOL is token_b, base token is token_a).
+///
+/// Formula:
+///   new_sqrt_price = sqrt_price * liquidity / (liquidity + amount_net * sqrt_price >> 64)
+///   amount_out_b   = liquidity * (sqrt_price - new_sqrt_price) >> 64
+fn clmm_output_a_to_b(
+    sqrt_price_q64: u128,
+    liquidity: u128,
+    fee_numerator: u64,
+    fee_denominator: u64,
+    amount_in: u64,
+) -> Result<u64, MathError> {
+    if liquidity == 0 {
+        return Err(MathError::ZeroReserve);
+    }
+
+    let fee_denom = fee_denominator.max(1) as u128;
+    let amount_net = (amount_in as u128)
+        .checked_mul(fee_denom - fee_numerator as u128)
+        .ok_or(MathError::Overflow("clmm_a_to_b fee_net"))?
+        / fee_denom;
+
+    if amount_net == 0 {
+        return Ok(0);
+    }
+
+    // The increase in liquidity-per-root-price that amount_net of token A provides.
+    // (amount_net * sqrt_price) >> 64 gives it in the same units as liquidity.
+    let amount_sqrt = amount_net
+        .checked_mul(sqrt_price_q64)
+        .ok_or(MathError::Overflow("clmm_a_to_b amount_sqrt"))?
+        >> 64;
+
+    let new_denom = liquidity
+        .checked_add(amount_sqrt)
+        .ok_or(MathError::Overflow("clmm_a_to_b new_denom"))?;
+
+    if new_denom == 0 {
+        return Err(MathError::DivisionByZero("clmm_a_to_b new_denom"));
+    }
+
+    let new_sqrt_price = sqrt_price_q64
+        .checked_mul(liquidity)
+        .ok_or(MathError::Overflow("clmm_a_to_b sqrt*liq"))?
+        / new_denom;
+
+    if new_sqrt_price >= sqrt_price_q64 {
+        // Selling A pushes price down; if it didn't, there is a degenerate input.
+        return Ok(0);
+    }
+
+    let delta_sqrt = sqrt_price_q64 - new_sqrt_price;
+
+    // amount_out_b = liquidity * delta_sqrt / 2^64
+    let amount_out = liquidity
+        .checked_mul(delta_sqrt)
+        .ok_or(MathError::Overflow("clmm_a_to_b liq*delta"))?
+        >> 64;
+
+    u64::try_from(amount_out).map_err(|_| MathError::OutputTooLarge)
+}
+
+/// Unified output estimator for one swap leg. Dispatches to:
+///   - Orca CLMM math when `pool.clmm_liquidity > 0`  (Whirlpool)
+///   - Constant-product math otherwise                  (Raydium CPMM/AMM)
+///
+/// `spending_quote` = true  → we're spending SOL/quote to receive base token  (buy leg)
+/// `spending_quote` = false → we're spending base token to receive SOL/quote  (sell leg)
+fn estimate_leg_output(
+    pool: &crate::scanner::PriceUpdate,
+    amount_in: u64,
+    spending_quote: bool,
+) -> Result<u64, MathError> {
+    if pool.clmm_liquidity > 0 {
+        // CLMM path (Orca Whirlpool)
+        // spending_quote=true  → spend SOL → b_to_a when SOL is token_b (!is_a_wsol)
+        //                                    a_to_b when SOL is token_a ( is_a_wsol)
+        // spending_quote=false → spend base → a_to_b when base is token_a (!is_a_wsol)
+        //                                     b_to_a when base is token_b ( is_a_wsol)
+        let b_to_a = spending_quote ^ pool.clmm_is_a_wsol;
+        if b_to_a {
+            clmm_output_b_to_a(
+                pool.clmm_sqrt_price_q64,
+                pool.clmm_liquidity,
+                pool.fee_numerator,
+                pool.fee_denominator,
+                amount_in,
+            )
+        } else {
+            clmm_output_a_to_b(
+                pool.clmm_sqrt_price_q64,
+                pool.clmm_liquidity,
+                pool.fee_numerator,
+                pool.fee_denominator,
+                amount_in,
+            )
+        }
+    } else {
+        // Constant-product path (Raydium CPMM / AMM)
+        let (reserve_in, reserve_out) = if spending_quote {
+            (pool.quote_reserve_raw, pool.base_reserve_raw)
+        } else {
+            (pool.base_reserve_raw, pool.quote_reserve_raw)
+        };
+        estimate_output_amount_raw(reserve_in, reserve_out, amount_in)
+    }
+}
+
+
 pub fn find_opportunity(
     price_a: &PriceUpdate,
     price_b: &PriceUpdate,
@@ -390,20 +582,17 @@ pub fn find_opportunity(
     }
 
     // --- exact quote engine: chain leg 1's real output into leg 2's real input ---
-    let expected_output_after_buy_raw = match estimate_output_amount_raw(
-        buy.quote_reserve_raw,
-        buy.base_reserve_raw,
-        trade_size_lamports,
-    ) {
+    // Buy leg: spend SOL/quote on the cheaper DEX, receive base token.
+    // For Orca CLMM legs this uses sqrt_price + liquidity math; for Raydium
+    // CPMM/AMM legs it falls back to the constant-product formula.
+    let expected_output_after_buy_raw = match estimate_leg_output(buy, trade_size_lamports, true) {
         Ok(v) => v,
         Err(_) => return Err(RejectReason::NoSpread),
     };
 
-    let expected_output_after_sell_raw = match estimate_output_amount_raw(
-        sell.base_reserve_raw,
-        sell.quote_reserve_raw,
-        expected_output_after_buy_raw,
-    ) {
+    // Sell leg: spend the base tokens received above on the pricier DEX,
+    // receiving SOL/quote back. Same dispatch logic as the buy leg.
+    let expected_output_after_sell_raw = match estimate_leg_output(sell, expected_output_after_buy_raw, false) {
         Ok(v) => v,
         Err(_) => return Err(RejectReason::NoSpread),
     };
@@ -482,9 +671,19 @@ pub fn find_opportunity(
 /// raw reserves) and returns whichever produces the best outcome - either the
 /// highest-profit approved Opportunity (by integer lamports, not a
 /// percentage), or if none are profitable, the least-bad rejection.
+///
+/// `capital_source` decides whether each candidate size gets clamped to a
+/// real balance ceiling before being evaluated:
+///   - `CapitalSource::Wallet { max_lamports }`: every candidate is clamped
+///     to `max_lamports` - sizing never proposes spending more than the
+///     wallet can actually afford, no matter how deep the pool is.
+///   - `CapitalSource::Pool`: no clamp - sizing is exactly what it was
+///     before, purely a function of pool depth. This is the flash-loan
+///     placeholder path; do not select it against a real wallet's own funds.
 pub fn find_best_opportunity(
     price_a: &PriceUpdate,
     price_b: &PriceUpdate,
+    capital_source: crate::config::CapitalSource,
 ) -> Result<Opportunity, RejectReason> {
     // Same six sizes as before (0.1%, 0.5%, 1%, 2%, 5%, 10%), now as exact
     // integer bps instead of f64 fractions.
@@ -502,7 +701,20 @@ pub fn find_best_opportunity(
     let mut least_bad_net = i128::MIN;
 
     for fraction_bps in SIZE_FRACTIONS_BPS {
-        let trade_size = thinner_quote_reserve * fraction_bps / BPS_DENOMINATOR;
+        let pool_derived_size = thinner_quote_reserve * fraction_bps / BPS_DENOMINATOR;
+
+        // The ONLY place capital_source affects anything: clamp the
+        // pool-derived candidate down to the wallet's real ceiling when
+        // running in Wallet mode. In Pool mode this is a no-op - the
+        // candidate passes through exactly as pool-depth sizing produced it,
+        // same as before this change existed.
+        let trade_size = match capital_source {
+            crate::config::CapitalSource::Wallet { max_lamports } => {
+                pool_derived_size.min(max_lamports as u128)
+            }
+            crate::config::CapitalSource::Pool => pool_derived_size,
+        };
+
         let trade_size_lamports = trade_size.min(u64::MAX as u128) as u64;
 
         if trade_size_lamports == 0 {
@@ -550,6 +762,7 @@ pub fn find_best_opportunity_with_staleness(
     price_a: &PriceUpdate,
     price_b: &PriceUpdate,
     max_price_age_secs: u64,
+    capital_source: crate::config::CapitalSource,
 ) -> Result<Opportunity, RejectReason> {
     let now = std::time::SystemTime::now();
     let age_a = now.duration_since(price_a.timestamp).unwrap_or_default().as_secs();
@@ -561,7 +774,7 @@ pub fn find_best_opportunity_with_staleness(
             max_age_secs: max_price_age_secs,
         });
     }
-    find_best_opportunity(price_a, price_b)
+    find_best_opportunity(price_a, price_b, capital_source)
 }
 
 // ===========================================================================
@@ -592,6 +805,9 @@ mod tests {
             quote_liquidity: quote_reserve as f64,
             fee_pct: (fee_num as f64 / fee_den as f64) * 100.0,
             timestamp: std::time::SystemTime::now(),
+            clmm_sqrt_price_q64: 0,
+            clmm_liquidity: 0,
+            clmm_is_a_wsol: false,
         }
     }
 
