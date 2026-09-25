@@ -3,3 +3,5 @@
 opportunity_log.csv
 .env.local
 *.zip
+*.csv
+*.log

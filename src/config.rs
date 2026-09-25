@@ -16,6 +16,8 @@ pub struct Config {
     pub raydium_pool_id: String,
     pub orca_pool_id: String,
     pub decoder: DecoderType,
+    pub priority_fee_micro_lamports: u64,
+    pub max_price_age_secs: u64,
 }
 
 impl Config {
@@ -56,6 +58,16 @@ impl Config {
             other => anyhow::bail!("Invalid DECODER '{other}' in .env: must be CPMM or AMM"),
         };
 
+        let priority_fee_micro_lamports: u64 = std::env::var("PRIORITY_FEE_MICRO_LAMPORTS")
+            .unwrap_or_else(|_| "25000".to_string())
+            .parse()
+            .unwrap_or(25_000);
+
+        let max_price_age_secs: u64 = std::env::var("MAX_PRICE_AGE_SECS")
+            .unwrap_or_else(|_| "120".to_string())
+            .parse()
+            .unwrap_or(120);
+
         tracing::info!("Config loaded. Wallet pubkey: {}", keypair.pubkey());
         tracing::info!(
             "Pair: {}, Raydium pool: {}, Orca pool: {}, Decoder: {:?}",
@@ -74,6 +86,8 @@ impl Config {
             raydium_pool_id,
             orca_pool_id,
             decoder,
+            priority_fee_micro_lamports,
+            max_price_age_secs,
         })
     }
 }
