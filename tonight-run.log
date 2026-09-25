@@ -1,0 +1,638 @@
+warning: use of deprecated module `solana_sdk::system_instruction`: Use `solana_system_interface` crate instead
+ --> src/executor/mod.rs:9:5
+  |
+9 |     system_instruction, transaction::Transaction,
+  |     ^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(deprecated)]` on by default
+
+warning: fields `pair`, `trade_size_lamports`, `expected_output_after_buy_raw`, and `expected_output_after_sell_raw` are never read
+  --> src/analyzer/mod.rs:30:9
+   |
+27 | pub struct Opportunity {
+   |            ----------- fields in this struct
+...
+30 |     pub pair: String,
+   |         ^^^^
+...
+34 |     pub trade_size_lamports: u64,
+   |         ^^^^^^^^^^^^^^^^^^^
+...
+38 |     pub expected_output_after_buy_raw: u64,
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+39 |     /// Exact raw lamports the sell leg is expected to produce.
+40 |     pub expected_output_after_sell_raw: u64,
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `Opportunity` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `min_required_bps` is never read
+  --> src/analyzer/mod.rs:63:9
+   |
+61 |     SpreadTooSmall {
+   |     -------------- field in this variant
+62 |         spread_bps: i128,
+63 |         min_required_bps: i128,
+   |         ^^^^^^^^^^^^^^^^
+   |
+   = note: `RejectReason` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: variant `InvalidInput` is never constructed
+   --> src/analyzer/mod.rs:105:5
+    |
+ 95 | pub enum MathError {
+    |          --------- variant in this enum
+...
+105 |     InvalidInput(&'static str),
+    |     ^^^^^^^^^^^^
+    |
+    = note: `MathError` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: function `is_still_fresh` is never used
+   --> src/analyzer/mod.rs:161:8
+    |
+161 | pub fn is_still_fresh(
+    |        ^^^^^^^^^^^^^^
+
+warning: function `safe_trade_size_raw` is never used
+   --> src/analyzer/mod.rs:272:8
+    |
+272 | pub fn safe_trade_size_raw(pool_a_base_reserve: u64, pool_b_base_reserve: u64) -> u64 {
+    |        ^^^^^^^^^^^^^^^^^^^
+
+warning: function `calculate_minimum_out_raw` is never used
+   --> src/analyzer/mod.rs:289:8
+    |
+289 | pub fn calculate_minimum_out_raw(
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: fields `jito_block_engine_url` and `keypair` are never read
+  --> src/config.rs:13:9
+   |
+10 | pub struct Config {
+   |            ------ fields in this struct
+...
+13 |     pub jito_block_engine_url: String,
+   |         ^^^^^^^^^^^^^^^^^^^^^
+14 |     pub keypair: Keypair,
+   |         ^^^^^^^
+
+warning: constant `TOKEN_PROGRAM_ID` is never used
+  --> src/executor/mod.rs:19:11
+   |
+19 | pub const TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+   |           ^^^^^^^^^^^^^^^^
+
+warning: constant `WSOL_MINT` is never used
+  --> src/executor/mod.rs:20:11
+   |
+20 | pub const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
+   |           ^^^^^^^^^
+
+warning: enum `RaydiumPoolContext` is never used
+  --> src/executor/mod.rs:23:10
+   |
+23 | pub enum RaydiumPoolContext {
+   |          ^^^^^^^^^^^^^^^^^^
+
+warning: associated functions `load_amm`, `load_cpmm`, and `load` are never used
+  --> src/executor/mod.rs:36:12
+   |
+35 | impl RaydiumPoolContext {
+   | ----------------------- associated functions in this implementation
+36 |     pub fn load_amm(client: &RpcClient, pool_id: &str) -> Result<Self> {
+   |            ^^^^^^^^
+...
+49 |     pub fn load_cpmm(client: &RpcClient, pool_id: &str) -> Result<Self> {
+   |            ^^^^^^^^^
+...
+54 |     pub fn load(
+   |            ^^^^
+
+warning: struct `OrcaPoolContext` is never constructed
+  --> src/executor/mod.rs:67:12
+   |
+67 | pub struct OrcaPoolContext {
+   |            ^^^^^^^^^^^^^^^
+
+warning: function `simulate_cpmm_swap` is never used
+  --> src/executor/mod.rs:72:8
+   |
+72 | pub fn simulate_cpmm_swap(
+   |        ^^^^^^^^^^^^^^^^^^
+
+warning: function `simulate_orca_swap` is never used
+   --> src/executor/mod.rs:168:8
+    |
+168 | pub fn simulate_orca_swap(
+    |        ^^^^^^^^^^^^^^^^^^
+
+warning: function `check_wallet_atas` is never used
+   --> src/executor/mod.rs:246:8
+    |
+246 | pub fn check_wallet_atas(
+    |        ^^^^^^^^^^^^^^^^^
+
+warning: function `simulate` is never used
+   --> src/executor/mod.rs:265:4
+    |
+265 | fn simulate(client: &RpcClient, payer: &Keypair, instructions: Vec<Instruction>) -> Result<()> {
+    |    ^^^^^^^^
+
+warning: function `build_leg_instruction` is never used
+   --> src/executor/mod.rs:302:4
+    |
+302 | fn build_leg_instruction(
+    |    ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `simulate_opportunity` is never used
+   --> src/executor/mod.rs:421:8
+    |
+421 | pub fn simulate_opportunity(
+    |        ^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `ORCA_WHIRLPOOL_PROGRAM` is never used
+  --> src/executor/orca.rs:10:11
+   |
+10 | pub const ORCA_WHIRLPOOL_PROGRAM: &str = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc";
+   |           ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `TICK_ARRAY_SIZE` is never used
+  --> src/executor/orca.rs:12:7
+   |
+12 | const TICK_ARRAY_SIZE: i32 = 88;
+   |       ^^^^^^^^^^^^^^^
+
+warning: constant `SWAP_DISCRIMINATOR` is never used
+  --> src/executor/orca.rs:14:7
+   |
+14 | const SWAP_DISCRIMINATOR: [u8; 8] = [0xf8, 0xc6, 0x9e, 0x91, 0xe1, 0x75, 0x87, 0xc8];
+   |       ^^^^^^^^^^^^^^^^^^
+
+warning: constant `MIN_SQRT_PRICE` is never used
+  --> src/executor/orca.rs:16:7
+   |
+16 | const MIN_SQRT_PRICE: u128 = 4_295_048_016;
+   |       ^^^^^^^^^^^^^^
+
+warning: constant `MAX_SQRT_PRICE` is never used
+  --> src/executor/orca.rs:17:7
+   |
+17 | const MAX_SQRT_PRICE: u128 = 79_226_673_515_401_279_992_447_579_055;
+   |       ^^^^^^^^^^^^^^
+
+warning: struct `SwapAccounts` is never constructed
+  --> src/executor/orca.rs:19:12
+   |
+19 | pub struct SwapAccounts {
+   |            ^^^^^^^^^^^^
+
+warning: function `program_id` is never used
+  --> src/executor/orca.rs:28:4
+   |
+28 | fn program_id() -> Result<Pubkey> {
+   |    ^^^^^^^^^^
+
+warning: function `tick_array_start_index` is never used
+  --> src/executor/orca.rs:32:4
+   |
+32 | fn tick_array_start_index(tick_index: i32, tick_spacing: u16) -> i32 {
+   |    ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `derive_tick_array_pda` is never used
+  --> src/executor/orca.rs:37:4
+   |
+37 | fn derive_tick_array_pda(whirlpool: &Pubkey, start_tick_index: i32) -> Result<Pubkey> {
+   |    ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `derive_oracle_pda` is never used
+  --> src/executor/orca.rs:46:4
+   |
+46 | fn derive_oracle_pda(whirlpool: &Pubkey) -> Result<Pubkey> {
+   |    ^^^^^^^^^^^^^^^^^
+
+warning: function `derive_tick_arrays` is never used
+  --> src/executor/orca.rs:51:4
+   |
+51 | fn derive_tick_arrays(
+   |    ^^^^^^^^^^^^^^^^^^
+
+warning: function `build_swap_instruction` is never used
+  --> src/executor/orca.rs:69:8
+   |
+69 | pub fn build_swap_instruction(
+   |        ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `RAYDIUM_AMM_V4_PROGRAM` is never used
+  --> src/executor/raydium.rs:10:11
+   |
+10 | pub const RAYDIUM_AMM_V4_PROGRAM: &str = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8";
+   |           ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `SwapAccounts` is never constructed
+  --> src/executor/raydium.rs:12:12
+   |
+12 | pub struct SwapAccounts {
+   |            ^^^^^^^^^^^^
+
+warning: function `build_swap_instruction` is never used
+  --> src/executor/raydium.rs:23:8
+   |
+23 | pub fn build_swap_instruction(
+   |        ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `RAYDIUM_CPMM_PROGRAM` is never used
+ --> src/executor/raydium_cpmm.rs:8:11
+  |
+8 | pub const RAYDIUM_CPMM_PROGRAM: &str = "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C";
+  |           ^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `SWAP_BASE_INPUT_DISCRIMINATOR` is never used
+  --> src/executor/raydium_cpmm.rs:10:7
+   |
+10 | const SWAP_BASE_INPUT_DISCRIMINATOR: [u8; 8] = [143, 190, 90, 218, 196, 30, 51, 222];
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `SwapAccounts` is never constructed
+  --> src/executor/raydium_cpmm.rs:12:12
+   |
+12 | pub struct SwapAccounts {
+   |            ^^^^^^^^^^^^
+
+warning: function `program_id` is never used
+  --> src/executor/raydium_cpmm.rs:27:4
+   |
+27 | fn program_id() -> Result<Pubkey> {
+   |    ^^^^^^^^^^
+
+warning: function `derive_authority` is never used
+  --> src/executor/raydium_cpmm.rs:31:4
+   |
+31 | fn derive_authority() -> Result<Pubkey> {
+   |    ^^^^^^^^^^^^^^^^
+
+warning: function `build_swap_instruction` is never used
+  --> src/executor/raydium_cpmm.rs:37:8
+   |
+37 | pub fn build_swap_instruction(
+   |        ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: fields `base_decimals`, `quote_decimals`, `fee_pct`, and `timestamp` are never read
+  --> src/scanner/mod.rs:36:9
+   |
+23 | pub struct PriceUpdate {
+   |            ----------- fields in this struct
+...
+36 |     pub base_decimals: u8,
+   |         ^^^^^^^^^^^^^
+...
+39 |     pub quote_decimals: u8,
+   |         ^^^^^^^^^^^^^^
+...
+49 |     pub fee_pct: f64,
+   |         ^^^^^^^
+50 |
+51 |     pub timestamp: std::time::SystemTime,
+   |         ^^^^^^^^^
+   |
+   = note: `PriceUpdate` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: fields `mint`, `vault`, `authority`, `emissions_per_second_x64`, and `growth_global_x64` are never read
+  --> src/scanner/orca.rs:14:9
+   |
+13 | pub struct WhirlpoolRewardInfo {
+   |            ------------------- fields in this struct
+14 |     pub mint: Pubkey,
+   |         ^^^^
+15 |     pub vault: Pubkey,
+   |         ^^^^^
+16 |     pub authority: Pubkey,
+   |         ^^^^^^^^^
+17 |     pub emissions_per_second_x64: u128,
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^
+18 |     pub growth_global_x64: u128,
+   |         ^^^^^^^^^^^^^^^^^
+   |
+   = note: `WhirlpoolRewardInfo` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: multiple fields are never read
+  --> src/scanner/orca.rs:23:9
+   |
+22 | pub struct Whirlpool {
+   |            --------- fields in this struct
+23 |     pub whirlpools_config: Pubkey,
+   |         ^^^^^^^^^^^^^^^^^
+24 |     pub whirlpool_bump: [u8; 1],
+   |         ^^^^^^^^^^^^^^
+25 |     pub tick_spacing: u16,
+   |         ^^^^^^^^^^^^
+26 |     pub tick_spacing_seed: [u8; 2],
+   |         ^^^^^^^^^^^^^^^^^
+27 |     pub fee_rate: u16,
+28 |     pub protocol_fee_rate: u16,
+   |         ^^^^^^^^^^^^^^^^^
+29 |     pub liquidity: u128,
+   |         ^^^^^^^^^
+30 |     pub sqrt_price: u128,
+31 |     pub tick_current_index: i32,
+   |         ^^^^^^^^^^^^^^^^^^
+32 |     pub protocol_fee_owed_a: u64,
+   |         ^^^^^^^^^^^^^^^^^^^
+33 |     pub protocol_fee_owed_b: u64,
+   |         ^^^^^^^^^^^^^^^^^^^
+...
+36 |     pub fee_growth_global_a: u128,
+   |         ^^^^^^^^^^^^^^^^^^^
+...
+39 |     pub fee_growth_global_b: u128,
+   |         ^^^^^^^^^^^^^^^^^^^
+40 |     pub reward_last_updated_timestamp: u64,
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+41 |     pub reward_infos: [WhirlpoolRewardInfo; 3],
+   |         ^^^^^^^^^^^^
+   |
+   = note: `Whirlpool` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: struct `WhirlpoolInfo` is never constructed
+  --> src/scanner/orca.rs:45:12
+   |
+45 | pub struct WhirlpoolInfo {
+   |            ^^^^^^^^^^^^^
+
+warning: function `fetch_pool_info` is never used
+  --> src/scanner/orca.rs:84:8
+   |
+84 | pub fn fetch_pool_info(client: &RpcClient, pool_id: &str) -> Result<WhirlpoolInfo> {
+   |        ^^^^^^^^^^^^^^^
+
+warning: fields `min_separate_numerator`, `min_separate_denominator`, `trade_fee_numerator`, `trade_fee_denominator`, `pnl_numerator`, and `pnl_denominator` are never read
+  --> src/scanner/raydium.rs:14:9
+   |
+13 | pub struct Fees {
+   |            ---- fields in this struct
+14 |     pub min_separate_numerator: u64,
+   |         ^^^^^^^^^^^^^^^^^^^^^^
+15 |     pub min_separate_denominator: u64,
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^
+16 |     pub trade_fee_numerator: u64,
+   |         ^^^^^^^^^^^^^^^^^^^
+17 |     pub trade_fee_denominator: u64,
+   |         ^^^^^^^^^^^^^^^^^^^^^
+18 |     pub pnl_numerator: u64,
+   |         ^^^^^^^^^^^^^
+19 |     pub pnl_denominator: u64,
+   |         ^^^^^^^^^^^^^^^
+   |
+   = note: `Fees` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: multiple fields are never read
+  --> src/scanner/raydium.rs:26:9
+   |
+25 | pub struct StateData {
+   |            --------- fields in this struct
+26 |     pub need_take_pnl_coin: u64,
+   |         ^^^^^^^^^^^^^^^^^^
+27 |     pub need_take_pnl_pc: u64,
+   |         ^^^^^^^^^^^^^^^^
+28 |     pub total_pnl_pc: u64,
+   |         ^^^^^^^^^^^^
+29 |     pub total_pnl_coin: u64,
+   |         ^^^^^^^^^^^^^^
+30 |     pub pool_open_time: u64,
+   |         ^^^^^^^^^^^^^^
+31 |     pub padding: [u64; 2],
+   |         ^^^^^^^
+32 |     pub orderbook_to_init_time: u64,
+   |         ^^^^^^^^^^^^^^^^^^^^^^
+33 |     pub swap_coin_in_amount: u128,
+   |         ^^^^^^^^^^^^^^^^^^^
+34 |     pub swap_pc_out_amount: u128,
+   |         ^^^^^^^^^^^^^^^^^^
+35 |     pub swap_acc_pc_fee: u64,
+   |         ^^^^^^^^^^^^^^^
+36 |     pub swap_pc_in_amount: u128,
+   |         ^^^^^^^^^^^^^^^^^
+37 |     pub swap_coin_out_amount: u128,
+   |         ^^^^^^^^^^^^^^^^^^^^
+38 |     pub swap_acc_coin_fee: u64,
+   |         ^^^^^^^^^^^^^^^^^
+   |
+   = note: `StateData` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: multiple fields are never read
+  --> src/scanner/raydium.rs:43:9
+   |
+42 | pub struct AmmInfo {
+   |            ------- fields in this struct
+43 |     pub status: u64,
+   |         ^^^^^^
+44 |     pub nonce: u64,
+   |         ^^^^^
+45 |     pub order_num: u64,
+   |         ^^^^^^^^^
+46 |     pub depth: u64,
+   |         ^^^^^
+...
+49 |     pub state: u64,
+   |         ^^^^^
+50 |     pub reset_flag: u64,
+   |         ^^^^^^^^^^
+51 |     pub min_size: u64,
+   |         ^^^^^^^^
+52 |     pub vol_max_cut_ratio: u64,
+   |         ^^^^^^^^^^^^^^^^^
+53 |     pub amount_wave: u64,
+   |         ^^^^^^^^^^^
+54 |     pub coin_lot_size: u64,
+   |         ^^^^^^^^^^^^^
+55 |     pub pc_lot_size: u64,
+   |         ^^^^^^^^^^^
+56 |     pub min_price_multiplier: u64,
+   |         ^^^^^^^^^^^^^^^^^^^^
+57 |     pub max_price_multiplier: u64,
+   |         ^^^^^^^^^^^^^^^^^^^^
+58 |     pub sys_decimal_value: u64,
+   |         ^^^^^^^^^^^^^^^^^
+59 |     pub fees: Fees,
+60 |     pub state_data: StateData,
+   |         ^^^^^^^^^^
+...
+65 |     pub lp_mint: Pubkey,
+   |         ^^^^^^^
+66 |     pub open_orders: Pubkey,
+   |         ^^^^^^^^^^^
+67 |     pub market: Pubkey,
+   |         ^^^^^^
+68 |     pub market_program: Pubkey,
+   |         ^^^^^^^^^^^^^^
+69 |     pub target_orders: Pubkey,
+   |         ^^^^^^^^^^^^^
+70 |     pub padding1: [u64; 8],
+   |         ^^^^^^^^
+71 |     pub amm_owner: Pubkey,
+   |         ^^^^^^^^^
+72 |     pub lp_amount: u64,
+   |         ^^^^^^^^^
+73 |     pub client_order_id: u64,
+   |         ^^^^^^^^^^^^^^^
+74 |     pub recent_epoch: u64,
+   |         ^^^^^^^^^^^^
+75 |     pub padding2: u64,
+   |         ^^^^^^^^
+   |
+   = note: `AmmInfo` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: struct `PoolVaults` is never constructed
+  --> src/scanner/raydium.rs:78:12
+   |
+78 | pub struct PoolVaults {
+   |            ^^^^^^^^^^
+
+warning: function `fetch_pool_vaults` is never used
+   --> src/scanner/raydium.rs:100:8
+    |
+100 | pub fn fetch_pool_vaults(client: &RpcClient, pool_id: &str) -> Result<PoolVaults> {
+    |        ^^^^^^^^^^^^^^^^^
+
+warning: multiple fields are never read
+  --> src/scanner/raydium_cpmm.rs:15:9
+   |
+13 | pub struct PoolState {
+   |            --------- fields in this struct
+14 |     pub amm_config: Pubkey,
+15 |     pub pool_creator: Pubkey,
+   |         ^^^^^^^^^^^^
+...
+18 |     pub lp_mint: Pubkey,
+   |         ^^^^^^^
+...
+21 |     pub token_0_program: Pubkey,
+   |         ^^^^^^^^^^^^^^^
+22 |     pub token_1_program: Pubkey,
+   |         ^^^^^^^^^^^^^^^
+23 |     pub observation_key: Pubkey,
+   |         ^^^^^^^^^^^^^^^
+24 |     pub auth_bump: u8,
+   |         ^^^^^^^^^
+25 |     pub status: u8,
+   |         ^^^^^^
+26 |     pub lp_mint_decimals: u8,
+   |         ^^^^^^^^^^^^^^^^
+...
+29 |     pub lp_supply: u64,
+   |         ^^^^^^^^^
+30 |     pub protocol_fees_token_0: u64,
+   |         ^^^^^^^^^^^^^^^^^^^^^
+31 |     pub protocol_fees_token_1: u64,
+   |         ^^^^^^^^^^^^^^^^^^^^^
+32 |     pub fund_fees_token_0: u64,
+   |         ^^^^^^^^^^^^^^^^^
+33 |     pub fund_fees_token_1: u64,
+   |         ^^^^^^^^^^^^^^^^^
+34 |     pub open_time: u64,
+   |         ^^^^^^^^^
+35 |     pub recent_epoch: u64,
+   |         ^^^^^^^^^^^^
+36 |     pub creator_fee_on: u8,
+   |         ^^^^^^^^^^^^^^
+37 |     pub enable_creator_fee: bool,
+   |         ^^^^^^^^^^^^^^^^^^
+38 |     pub padding1: [u8; 6],
+   |         ^^^^^^^^
+39 |     pub creator_fees_token_0: u64,
+   |         ^^^^^^^^^^^^^^^^^^^^
+40 |     pub creator_fees_token_1: u64,
+   |         ^^^^^^^^^^^^^^^^^^^^
+41 |     pub padding: [u64; 28],
+   |         ^^^^^^^
+   |
+   = note: `PoolState` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: multiple fields are never read
+  --> src/scanner/raydium_cpmm.rs:46:9
+   |
+45 | pub struct AmmConfig {
+   |            --------- fields in this struct
+46 |     pub bump: u8,
+   |         ^^^^
+47 |     pub disable_create_pool: bool,
+   |         ^^^^^^^^^^^^^^^^^^^
+48 |     pub index: u16,
+   |         ^^^^^
+49 |     pub trade_fee_rate: u64,
+50 |     pub protocol_fee_rate: u64,
+   |         ^^^^^^^^^^^^^^^^^
+51 |     pub fund_fee_rate: u64,
+   |         ^^^^^^^^^^^^^
+52 |     pub create_pool_fee: u64,
+   |         ^^^^^^^^^^^^^^^
+53 |     pub protocol_owner: Pubkey,
+   |         ^^^^^^^^^^^^^^
+54 |     pub fund_owner: Pubkey,
+   |         ^^^^^^^^^^
+55 |     pub creator_fee_rate: u64,
+   |         ^^^^^^^^^^^^^^^^
+56 |     pub padding: [u64; 15],
+   |         ^^^^^^^
+   |
+   = note: `AmmConfig` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: struct `CpmmPoolInfo` is never constructed
+  --> src/scanner/raydium_cpmm.rs:60:12
+   |
+60 | pub struct CpmmPoolInfo {
+   |            ^^^^^^^^^^^^
+
+warning: function `fetch_pool_info` is never used
+   --> src/scanner/raydium_cpmm.rs:104:8
+    |
+104 | pub fn fetch_pool_info(client: &RpcClient, pool_id: &str) -> Result<CpmmPoolInfo> {
+    |        ^^^^^^^^^^^^^^^
+
+warning: field `owner` is never read
+  --> src/scanner/realtime.rs:13:9
+   |
+11 | pub struct AccountUpdate {
+   |            ------------- field in this struct
+12 |     pub data: Vec<u8>,
+13 |     pub owner: Pubkey,
+   |         ^^^^^
+
+warning: `falcon` (bin "falcon") generated 55 warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.92s
+     Running `target/debug/falcon`
+[2m2026-09-25T04:02:13.362263Z[0m [32m INFO[0m [2mfalcon[0m[2m:[0m Falcon starting up
+[2m2026-09-25T04:02:13.363457Z[0m [32m INFO[0m [2mfalcon::config[0m[2m:[0m Config loaded. Wallet pubkey: CiMBUn1RVeyYmuxgN3rTgTGRJvNH9dVWsQ2SRLpZvhe8
+[2m2026-09-25T04:02:13.363552Z[0m [32m INFO[0m [2mfalcon::config[0m[2m:[0m Pair: USELESSSOL, Raydium pool: Q2sPHPdUWFMg7M7wwrQKLrn619cAucfRsmhVJffodSp, Orca pool: HsQGWEh3ib6w59rBh5n1jXmi8VXFBqKEjxozL6PGfcgb, Decoder: Cpmm
+[2m2026-09-25T04:02:13.363574Z[0m [32m INFO[0m [2mfalcon[0m[2m:[0m Falcon initialized and ready - starting real-time engine
+[2m2026-09-25T04:02:13.365557Z[0m [32m INFO[0m [2mfalcon::scanner[0m[2m:[0m Real-time WebSocket subscriptions started for USELESSSOL (Raydium mode: Cpmm)
+[2m2026-09-25T04:02:15.755729Z[0m [32m INFO[0m [2mfalcon::scanner[0m[2m:[0m WebSocket event received from Raydium (637 bytes)
+[2m2026-09-25T04:02:16.314105Z[0m [33m WARN[0m [2mfalcon::scanner[0m[2m:[0m REAL-TIME OPPORTUNITY: buy on Orca @ 2.3389006891, sell on RaydiumCPMM @ 2.3925928667, NET PROFIT: 1.0988%
+[2m2026-09-25T04:03:46.932764Z[0m [32m INFO[0m [2mfalcon::scanner[0m[2m:[0m WebSocket event received from Raydium (637 bytes)
+[2m2026-09-25T04:03:47.939186Z[0m [33m WARN[0m [2mfalcon::scanner[0m[2m:[0m REAL-TIME OPPORTUNITY: buy on Orca @ 2.3389006891, sell on RaydiumCPMM @ 2.3917555573, NET PROFIT: 1.0635%
+[2m2026-09-25T04:03:49.577101Z[0m [32m INFO[0m [2mfalcon::scanner[0m[2m:[0m WebSocket event received from Raydium (637 bytes)
+[2m2026-09-25T04:03:50.162938Z[0m [33m WARN[0m [2mfalcon::scanner[0m[2m:[0m REAL-TIME OPPORTUNITY: buy on Orca @ 2.3389006891, sell on RaydiumCPMM @ 2.3917555573, NET PROFIT: 1.0635%
+[2m2026-09-25T04:03:52.674439Z[0m [32m INFO[0m [2mfalcon::scanner[0m[2m:[0m WebSocket event received from Raydium (637 bytes)
+[2m2026-09-25T04:03:53.501562Z[0m [33m WARN[0m [2mfalcon::scanner[0m[2m:[0m REAL-TIME OPPORTUNITY: buy on Orca @ 2.3389006891, sell on RaydiumCPMM @ 2.3917555573, NET PROFIT: 1.0635%
+[2m2026-09-25T04:03:53.502492Z[0m [32m INFO[0m [2mfalcon::scanner[0m[2m:[0m WebSocket event received from Raydium (637 bytes)
+[2m2026-09-25T04:03:54.170012Z[0m [33m WARN[0m [2mfalcon::scanner[0m[2m:[0m REAL-TIME OPPORTUNITY: buy on Orca @ 2.3389006891, sell on RaydiumCPMM @ 2.3917555573, NET PROFIT: 1.0635%
+[2m2026-09-25T04:03:54.789710Z[0m [32m INFO[0m [2mfalcon::scanner[0m[2m:[0m WebSocket event received from Raydium (637 bytes)
+[2m2026-09-25T04:03:55.580537Z[0m [33m WARN[0m [2mfalcon::scanner[0m[2m:[0m REAL-TIME OPPORTUNITY: buy on Orca @ 2.3389006891, sell on RaydiumCPMM @ 2.3917555573, NET PROFIT: 1.0635%
+[2m2026-09-25T04:03:56.600506Z[0m [32m INFO[0m [2mfalcon::scanner[0m[2m:[0m WebSocket event received from Raydium (637 bytes)
+[2m2026-09-25T04:03:57.241383Z[0m [33m WARN[0m [2mfalcon::scanner[0m[2m:[0m REAL-TIME OPPORTUNITY: buy on Orca @ 2.3389006891, sell on RaydiumCPMM @ 2.3917808392, NET PROFIT: 1.0645%
+[2m2026-09-25T04:03:57.241762Z[0m [32m INFO[0m [2mfalcon::scanner[0m[2m:[0m WebSocket event received from Raydium (637 bytes)
+[2m2026-09-25T04:03:57.779352Z[0m [33m WARN[0m [2mfalcon::scanner[0m[2m:[0m REAL-TIME OPPORTUNITY: buy on Orca @ 2.3389006891, sell on RaydiumCPMM @ 2.3917808392, NET PROFIT: 1.0645%
+[2m2026-09-25T04:04:09.094186Z[0m [32m INFO[0m [2mfalcon::scanner[0m[2m:[0m WebSocket event received from Raydium (637 bytes)
+[2m2026-09-25T04:04:09.771950Z[0m [33m WARN[0m [2mfalcon::scanner[0m[2m:[0m REAL-TIME OPPORTUNITY: buy on Orca @ 2.3389006891, sell on RaydiumCPMM @ 2.3957486093, NET PROFIT: 1.2320%
+[2m2026-09-25T04:04:11.422682Z[0m [32m INFO[0m [2mfalcon::scanner[0m[2m:[0m WebSocket event received from Raydium (637 bytes)
+[2m2026-09-25T04:04:11.979826Z[0m [33m WARN[0m [2mfalcon::scanner[0m[2m:[0m REAL-TIME OPPORTUNITY: buy on Orca @ 2.3389006891, sell on RaydiumCPMM @ 2.3957486093, NET PROFIT: 1.2320%
+[2m2026-09-25T04:04:11.980282Z[0m [32m INFO[0m [2mfalcon::scanner[0m[2m:[0m WebSocket event received from Raydium (637 bytes)
+[2m2026-09-25T04:04:12.539967Z[0m [33m WARN[0m [2mfalcon::scanner[0m[2m:[0m REAL-TIME OPPORTUNITY: buy on Orca @ 2.3389006891, sell on RaydiumCPMM @ 2.3957486093, NET PROFIT: 1.2320%
+[2m2026-09-25T04:04:12.540328Z[0m [32m INFO[0m [2mfalcon::scanner[0m[2m:[0m WebSocket event received from Raydium (637 bytes)
+[2m2026-09-25T04:04:13.221526Z[0m [33m WARN[0m [2mfalcon::scanner[0m[2m:[0m REAL-TIME OPPORTUNITY: buy on Orca @ 2.3389006891, sell on RaydiumCPMM @ 2.3957486093, NET PROFIT: 1.2320%
+[2m2026-09-25T04:04:13.221823Z[0m [32m INFO[0m [2mfalcon::scanner[0m[2m:[0m WebSocket event received from Raydium (637 bytes)
+[2m2026-09-25T04:04:13.886632Z[0m [33m WARN[0m [2mfalcon::scanner[0m[2m:[0m REAL-TIME OPPORTUNITY: buy on Orca @ 2.3389006891, sell on RaydiumCPMM @ 2.3957486093, NET PROFIT: 1.2320%
+[2m2026-09-25T04:04:13.886938Z[0m [32m INFO[0m [2mfalcon::scanner[0m[2m:[0m WebSocket event received from Raydium (637 bytes)
+[2m2026-09-25T04:04:14.448335Z[0m [33m WARN[0m [2mfalcon::scanner[0m[2m:[0m REAL-TIME OPPORTUNITY: buy on Orca @ 2.3389006891, sell on RaydiumCPMM @ 2.3957486093, NET PROFIT: 1.2320%
+[2m2026-09-25T04:04:14.448997Z[0m [32m INFO[0m [2mfalcon::scanner[0m[2m:[0m WebSocket event received from Raydium (637 bytes)
