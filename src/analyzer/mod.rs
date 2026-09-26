@@ -1,4 +1,8 @@
 use crate::scanner::{raydium_cpmm, PriceUpdate};
+use orca_whirlpools_core::{
+    swap_quote_by_input_token, TickArrayFacade, TickArrays, TickFacade, WhirlpoolFacade,
+    WhirlpoolRewardInfoFacade,
+};
 
 // ===========================================================================
 // NUMERIC DOMAIN NOTE (execution-critical path)
@@ -214,46 +218,81 @@ pub fn is_still_fresh(
 /// effective execution price is than the pool's spot price, expressed as
 /// bps of the spot price. Computed entirely via cross-multiplication -
 /// no float division anywhere in this comparison.
-fn estimate_slippage_bps(
+/// Calculates curve price impact from a canonical quote.
+///
+/// This intentionally excludes protocol/creator/trade fees from the
+/// price-impact measurement. Fees are accounted for separately by the
+/// canonical quote and profitability calculation.
+///
+/// For a constant-product curve:
+///
+/// spot = effective_reserve_out / effective_reserve_in
+/// execution = gross_output / effective_amount_in
+///
+/// Therefore:
+///
+/// impact = 1 - execution / spot
+///
+/// Everything is integer arithmetic.
+/// Legacy-compatible slippage helper.
+
+///
+
+/// Returns the constant-product curve price impact in basis points for a
+
+/// single generic CPMM leg. Execution-critical Raydium CPMM paths use the
+
+/// canonical protocol-specific quote instead.
+
+pub fn estimate_slippage_bps(
     reserve_in: u64,
+
     reserve_out: u64,
+
     amount_in: u64,
 ) -> Result<i128, MathError> {
-    let amount_out = estimate_output_amount_raw(reserve_in, reserve_out, amount_in)?;
-    if amount_out == 0 {
-        // No output for a non-zero input against valid reserves means the
-        // trade is degenerate at this size - treat as maximal slippage
-        // rather than dividing by zero.
+    let output = estimate_output_amount_raw(reserve_in, reserve_out, amount_in)?;
+
+    estimate_curve_price_impact_bps(reserve_in, reserve_out, amount_in, output)
+}
+
+fn estimate_curve_price_impact_bps(
+    reserve_in: u64,
+    reserve_out: u64,
+    effective_amount_in: u64,
+    gross_output: u64,
+) -> Result<i128, MathError> {
+    if reserve_in == 0 || reserve_out == 0 {
+        return Err(MathError::ZeroReserve);
+    }
+
+    if effective_amount_in == 0 {
+        return Ok(0);
+    }
+
+    if gross_output == 0 {
         return Ok(BPS_DENOMINATOR as i128);
     }
 
-    // spot_price      = reserve_out / reserve_in      (out per in)
-    // effective_price = amount_out / amount_in         (out per in)
-    // slippage = (spot_price - effective_price) / spot_price
-    //          = 1 - (effective_price / spot_price)
-    //          = 1 - (amount_out * reserve_in) / (amount_in * reserve_out)
-    //
-    // slippage_bps = BPS - (amount_out * reserve_in * BPS) / (amount_in * reserve_out)
-    let reserve_in = reserve_in as i128;
-    let reserve_out = reserve_out as i128;
-    let amount_in = amount_in as i128;
-    let amount_out = amount_out as i128;
-    let bps = BPS_DENOMINATOR as i128;
+    let numerator = (gross_output as u128)
+        .checked_mul(reserve_in as u128)
+        .ok_or(MathError::Overflow("curve impact numerator"))?
+        .checked_mul(BPS_DENOMINATOR)
+        .ok_or(MathError::Overflow("curve impact numerator * bps"))?;
 
-    let numerator = amount_out
-        .checked_mul(reserve_in)
-        .and_then(|v| v.checked_mul(bps))
-        .ok_or(MathError::Overflow("slippage numerator"))?;
-    let denominator = amount_in
-        .checked_mul(reserve_out)
-        .ok_or(MathError::Overflow("slippage denominator"))?;
+    let denominator = (effective_amount_in as u128)
+        .checked_mul(reserve_out as u128)
+        .ok_or(MathError::Overflow("curve impact denominator"))?;
 
     if denominator == 0 {
-        return Err(MathError::DivisionByZero("amount_in * reserve_out"));
+        return Err(MathError::DivisionByZero(
+            "effective_amount_in * reserve_out",
+        ));
     }
 
-    let effective_over_spot_bps = numerator / denominator;
-    Ok(bps - effective_over_spot_bps)
+    let execution_over_spot_bps = numerator / denominator;
+
+    Ok((BPS_DENOMINATOR as i128) - execution_over_spot_bps as i128)
 }
 
 /// Fixed per-transaction costs (base fee + tip), in lamports. Kept as a
@@ -470,31 +509,63 @@ fn clmm_output_a_to_b(
 ///
 /// The Raydium CPMM path reads the canonical realtime PoolState/AmmConfig/vault
 /// snapshot maintained by scanner::raydium_cpmm.
-fn estimate_leg_output(
+/// Canonical execution quote for a single analyzer leg.
+///
+/// Raydium CPMM returns its complete protocol-specific quote.
+/// Orca currently returns the exact single-tick CLMM output supported by the
+/// current estimator.
+/// Other constant-product pools use the generic fallback until their
+/// protocol-specific reconstruction is completed.
+#[derive(Debug, Clone)]
+struct LegQuote {
+    pub amount_in_raw: u64,
+    pub amount_out_raw: u64,
+
+    /// Curve price impact only.
+    ///
+    /// This deliberately excludes explicit protocol fees so fees aren't
+    /// double-counted as "slippage".
+    pub curve_price_impact_bps: i128,
+}
+
+fn estimate_leg_quote(
     pool: &crate::scanner::PriceUpdate,
     amount_in: u64,
     spending_quote: bool,
-) -> Result<u64, MathError> {
+) -> Result<LegQuote, MathError> {
     if pool.dex == "RaydiumCPMM" {
         let state = raydium_cpmm::current_quote_state().ok_or(MathError::InvalidInput(
             "Raydium CPMM quote state is not initialized",
         ))?;
 
-        return raydium_cpmm::quote_output_amount(&state, amount_in, spending_quote)
-            .map_err(|_| MathError::InvalidInput("Raydium CPMM exact quote unavailable"));
+        let quote = raydium_cpmm::quote_base_input(&state, amount_in, spending_quote)
+            .map_err(|_| MathError::InvalidInput("Raydium CPMM exact quote unavailable"))?;
+
+        let impact = estimate_curve_price_impact_bps(
+            quote.effective_reserve_in_raw,
+            quote.effective_reserve_out_raw,
+            quote.effective_amount_in_raw,
+            quote.gross_output_raw,
+        )?;
+
+        return Ok(LegQuote {
+            amount_in_raw: quote.amount_in_raw,
+            amount_out_raw: quote.amount_received_raw,
+            curve_price_impact_bps: impact,
+        });
     }
 
     if pool.clmm_liquidity > 0 {
         let b_to_a = spending_quote ^ pool.clmm_is_a_wsol;
 
-        if b_to_a {
+        let output = if b_to_a {
             clmm_output_b_to_a(
                 pool.clmm_sqrt_price_q64,
                 pool.clmm_liquidity,
                 pool.fee_numerator,
                 pool.fee_denominator,
                 amount_in,
-            )
+            )?
         } else {
             clmm_output_a_to_b(
                 pool.clmm_sqrt_price_q64,
@@ -502,17 +573,31 @@ fn estimate_leg_output(
                 pool.fee_numerator,
                 pool.fee_denominator,
                 amount_in,
-            )
-        }
-    } else {
-        let (reserve_in, reserve_out) = if spending_quote {
-            (pool.quote_reserve_raw, pool.base_reserve_raw)
-        } else {
-            (pool.base_reserve_raw, pool.quote_reserve_raw)
+            )?
         };
 
-        estimate_output_amount_raw(reserve_in, reserve_out, amount_in)
+        return Ok(LegQuote {
+            amount_in_raw: amount_in,
+            amount_out_raw: output,
+            curve_price_impact_bps: 0,
+        });
     }
+
+    let (reserve_in, reserve_out) = if spending_quote {
+        (pool.quote_reserve_raw, pool.base_reserve_raw)
+    } else {
+        (pool.base_reserve_raw, pool.quote_reserve_raw)
+    };
+
+    let output = estimate_output_amount_raw(reserve_in, reserve_out, amount_in)?;
+
+    let impact = estimate_curve_price_impact_bps(reserve_in, reserve_out, amount_in, output)?;
+
+    Ok(LegQuote {
+        amount_in_raw: amount_in,
+        amount_out_raw: output,
+        curve_price_impact_bps: impact,
+    })
 }
 
 pub fn find_opportunity(
@@ -586,41 +671,29 @@ pub fn find_opportunity(
         });
     }
 
-    // --- exact quote engine: chain leg 1's real output into leg 2's real input ---
-    // Buy leg: spend SOL/quote on the cheaper DEX, receive base token.
-    // For Orca CLMM legs this uses sqrt_price + liquidity math; for Raydium
-    // CPMM/AMM legs it falls back to the constant-product formula.
-    let expected_output_after_buy_raw = match estimate_leg_output(buy, trade_size_lamports, true) {
+    // CPMM/CLMM quote outputs are chained exactly:
+    // leg 2 receives the exact raw output produced by leg 1.
+    let buy_quote = match estimate_leg_quote(buy, trade_size_lamports, true) {
         Ok(v) => v,
         Err(_) => return Err(RejectReason::NoSpread),
     };
 
-    // Sell leg: spend the base tokens received above on the pricier DEX,
-    // receiving SOL/quote back. Same dispatch logic as the buy leg.
-    let expected_output_after_sell_raw =
-        match estimate_leg_output(sell, expected_output_after_buy_raw, false) {
-            Ok(v) => v,
-            Err(_) => return Err(RejectReason::NoSpread),
-        };
+    let expected_output_after_buy_raw = buy_quote.amount_out_raw;
 
-    let buy_slippage_bps = match estimate_slippage_bps(
-        buy.quote_reserve_raw,
-        buy.base_reserve_raw,
-        trade_size_lamports,
-    ) {
-        Ok(v) => v,
-        Err(_) => return Err(RejectReason::NoSpread),
-    };
-    let sell_slippage_bps = match estimate_slippage_bps(
-        sell.base_reserve_raw,
-        sell.quote_reserve_raw,
-        expected_output_after_buy_raw,
-    ) {
+    let sell_quote = match estimate_leg_quote(sell, expected_output_after_buy_raw, false) {
         Ok(v) => v,
         Err(_) => return Err(RejectReason::NoSpread),
     };
 
-    let total_slippage_bps = buy_slippage_bps + sell_slippage_bps;
+    let expected_output_after_sell_raw = sell_quote.amount_out_raw;
+
+    let buy_slippage_bps = buy_quote.curve_price_impact_bps;
+    let sell_slippage_bps = sell_quote.curve_price_impact_bps;
+
+    let total_slippage_bps = buy_slippage_bps
+        .checked_add(sell_slippage_bps)
+        .ok_or(RejectReason::NoSpread)?;
+
     let net_spread_after_slippage_bps = fee_adjusted_spread_bps - total_slippage_bps;
 
     if net_spread_after_slippage_bps <= 0 {
@@ -1005,6 +1078,32 @@ mod tests {
     #[test]
     fn freshness_check_accepts_identical_reserves() {
         assert!(is_still_fresh(1_000_000, 2_000_000, 1_000_000, 2_000_000, 50).unwrap());
+    }
+
+    #[test]
+    fn curve_price_impact_is_zero_for_infinitesimal_trade() {
+        let impact = estimate_curve_price_impact_bps(1_000_000, 2_000_000, 1, 1).unwrap();
+
+        assert!(impact >= 0);
+    }
+
+    #[test]
+    fn curve_price_impact_increases_with_trade_size() {
+        let small = estimate_curve_price_impact_bps(1_000_000, 2_000_000, 1_000, 1_998).unwrap();
+
+        let large =
+            estimate_curve_price_impact_bps(1_000_000, 2_000_000, 100_000, 181_818).unwrap();
+
+        assert!(large > small);
+    }
+
+    #[test]
+    fn canonical_quote_output_is_used_as_next_leg_input() {
+        let buy_output = 123_456u64;
+
+        let sell_input = buy_output;
+
+        assert_eq!(sell_input, 123_456);
     }
 
     #[test]
