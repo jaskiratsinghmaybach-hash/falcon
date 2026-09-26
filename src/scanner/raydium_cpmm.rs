@@ -11,6 +11,12 @@ const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
 const RAYDIUM_CPMM_PROGRAM: &str = "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C";
 const FEE_DENOMINATOR: u64 = 1_000_000;
 
+// Raydium CPMM PoolStatus bit layout:
+// bit 0 = deposit disabled
+// bit 1 = withdraw disabled
+// bit 2 = swap disabled
+const SWAP_STATUS_BIT: u8 = 1 << 2;
+
 #[derive(BorshDeserialize, Debug, Clone)]
 pub struct PoolState {
     pub amm_config: Pubkey,
@@ -101,6 +107,9 @@ pub struct CpmmQuoteState {
     pub creator_fee_on: u8,
     pub enable_creator_fee: bool,
 
+    pub status: u8,
+    pub open_time: u64,
+
     pub is_token_0_wsol: bool,
 }
 
@@ -113,6 +122,8 @@ pub enum CpmmQuoteError {
     InsufficientInputAfterFees,
     OutputTooLarge,
     Token2022Unsupported,
+    SwapDisabled,
+    PoolNotOpen,
 }
 
 impl std::fmt::Display for CpmmQuoteError {
@@ -221,7 +232,7 @@ fn build_quote_state(
     vault_1_raw: u64,
 ) -> CpmmQuoteState {
     CpmmQuoteState {
-        pool_id: Pubkey::default(), // replaced by callers that have the pool id
+        pool_id: Pubkey::default(),
 
         token_0_vault: pool_state.token_0_vault,
         token_1_vault: pool_state.token_1_vault,
@@ -248,6 +259,9 @@ fn build_quote_state(
 
         creator_fee_on: pool_state.creator_fee_on,
         enable_creator_fee: pool_state.enable_creator_fee,
+
+        status: pool_state.status,
+        open_time: pool_state.open_time,
 
         is_token_0_wsol: pool_state.token_0_mint.to_string() == WSOL_MINT,
     }
@@ -495,17 +509,38 @@ impl CpmmStaticContext {
     }
 }
 
+/// Returns whether Raydium currently considers swaps enabled.
+///
+/// Raydium disables swapping when bit 2 of `status` is set, and it also
+/// rejects swaps before `open_time`.
+pub fn is_swap_open(state: &CpmmQuoteState, unix_timestamp: u64) -> bool {
+    state.status & SWAP_STATUS_BIT == 0 && unix_timestamp >= state.open_time
+}
+
+fn ensure_swap_open(state: &CpmmQuoteState, unix_timestamp: u64) -> Result<(), CpmmQuoteError> {
+    if state.status & SWAP_STATUS_BIT != 0 {
+        return Err(CpmmQuoteError::SwapDisabled);
+    }
+
+    if unix_timestamp < state.open_time {
+        return Err(CpmmQuoteError::PoolNotOpen);
+    }
+
+    Ok(())
+}
+
 /// Exact Raydium CPMM base-input quote.
 ///
 /// This mirrors the on-chain `CurveCalculator::swap_base_input` structure:
 ///
-/// 1. Input transfer fee is applied first.
-/// 2. Trade fee uses ceiling division.
-/// 3. Creator fee uses ceiling division.
-/// 4. Effective reserves are raw vault balances minus accumulated
+/// 1. Input transfer fee is applied before this function on-chain.
+/// 2. If creator fee is on input, trade + creator rates are combined.
+/// 3. The combined fee is ceiling-rounded.
+/// 4. The combined fee is split into creator/trade portions.
+/// 5. Effective reserves are raw vault balances minus accumulated
 ///    protocol/fund/creator fees.
-/// 5. Constant-product output uses floor division.
-/// 6. If creator fee is output-side, it is removed after the CP output.
+/// 6. Constant-product output uses floor division.
+/// 7. If creator fee is output-side, it is removed after the CP output.
 ///
 /// Protocol/fund fees are bookkeeping portions of the trade fee; they are
 /// not an additional deduction from the trader's output.
@@ -534,9 +569,7 @@ pub fn quote_output_amount(
 
     let fees_1 = (state.protocol_fees_token_1 as u128)
         .checked_add(state.fund_fees_token_1 as u128)
-        .ok_or(CpmmQuoteError::ArithmeticOverflow)?;
-
-    let fees_1 = fees_1
+        .ok_or(CpmmQuoteError::ArithmeticOverflow)?
         .checked_add(state.creator_fees_token_1 as u128)
         .ok_or(CpmmQuoteError::ArithmeticOverflow)?;
 
@@ -579,16 +612,20 @@ pub fn quote_output_amount(
 
     let input_u128 = amount_in as u128;
 
-    let trade_fee = ceil_fee(input_u128, state.trade_fee_rate)?;
-
     let input_less_fees = if creator_fee_on_input {
-        let creator_fee = ceil_fee(input_u128, creator_fee_rate)?;
+        let combined_rate = state
+            .trade_fee_rate
+            .checked_add(creator_fee_rate)
+            .ok_or(CpmmQuoteError::ArithmeticOverflow)?;
+
+        let total_fee = ceil_fee(input_u128, combined_rate)?;
 
         input_u128
-            .checked_sub(trade_fee)
-            .and_then(|v| v.checked_sub(creator_fee))
+            .checked_sub(total_fee)
             .ok_or(CpmmQuoteError::InsufficientInputAfterFees)?
     } else {
+        let trade_fee = ceil_fee(input_u128, state.trade_fee_rate)?;
+
         input_u128
             .checked_sub(trade_fee)
             .ok_or(CpmmQuoteError::InsufficientInputAfterFees)?
@@ -676,6 +713,8 @@ mod tests {
             creator_fee_rate,
             creator_fee_on,
             enable_creator_fee,
+            status: 0,
+            open_time: 0,
             is_token_0_wsol: true,
         }
     }
@@ -707,12 +746,38 @@ mod tests {
     }
 
     #[test]
+    fn creator_fee_on_input_uses_combined_fee_rounding() {
+        // Raydium calculates:
+        //
+        // total_fee = ceil(amount * (trade + creator) / 1e6)
+        //
+        // rather than:
+        //
+        // ceil(amount * trade / 1e6)
+        // + ceil(amount * creator / 1e6)
+        //
+        // For amount=2, trade=1, creator=1:
+        // combined = ceil(4 / 1e6) = 1
+        // separate = 1 + 1 = 2
+        //
+        // Therefore the exact Raydium curve input is 1.
+        let s = state(1_000_000, 2_000_000, 1, 1, 0, true);
+
+        let out = quote_output_amount(&s, 2, true).unwrap();
+
+        let expected = 1u128 * 2_000_000u128 / (1_000_000u128 + 1u128);
+
+        assert_eq!(out, expected as u64);
+    }
+
+    #[test]
     fn creator_fee_on_input_is_charged_before_curve() {
         let s = state(1_000_000, 2_000_000, 0, 10_000, 0, true);
 
         let out = quote_output_amount(&s, 1_000, true).unwrap();
 
-        // creator fee = ceil(1000 * 1%) = 10
+        // combined fee = ceil(1000 * 1% / 1e6) = 10
+        // creator fee split = 10
         // curve input = 990
         assert_eq!(
             out,
@@ -727,8 +792,48 @@ mod tests {
         let out = quote_output_amount(&s, 1_000, true);
 
         let raw = 1_000u128 * 2_000_000u128 / (1_000_000u128 + 1_000u128);
+
         let expected = raw - ((raw * 10_000 + 999_999) / 1_000_000);
 
         assert_eq!(out.unwrap(), expected as u64);
+    }
+
+    #[test]
+    fn disabled_swap_is_detected() {
+        let mut s = state(1_000_000, 2_000_000, 0, 0, 0, false);
+
+        s.status = SWAP_STATUS_BIT;
+
+        assert!(!is_swap_open(&s, 1_000));
+        assert_eq!(
+            ensure_swap_open(&s, 1_000),
+            Err(CpmmQuoteError::SwapDisabled)
+        );
+    }
+
+    #[test]
+    fn pool_open_time_is_respected() {
+        let mut s = state(1_000_000, 2_000_000, 0, 0, 0, false);
+
+        s.open_time = 2_000;
+
+        assert!(!is_swap_open(&s, 1_999));
+        assert!(is_swap_open(&s, 2_000));
+        assert_eq!(
+            ensure_swap_open(&s, 1_999),
+            Err(CpmmQuoteError::PoolNotOpen)
+        );
+    }
+
+    #[test]
+    fn token_2022_is_rejected_for_exact_quote() {
+        let mut s = state(1_000_000, 2_000_000, 0, 0, 0, false);
+
+        s.token_0_program = Pubkey::new_from_array([7u8; 32]);
+
+        assert_eq!(
+            quote_output_amount(&s, 1_000, true),
+            Err(CpmmQuoteError::Token2022Unsupported)
+        );
     }
 }
