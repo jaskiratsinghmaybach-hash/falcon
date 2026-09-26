@@ -1,4 +1,4 @@
-use crate::scanner::PriceUpdate;
+use crate::scanner::{raydium_cpmm, PriceUpdate};
 
 // ===========================================================================
 // NUMERIC DOMAIN NOTE (execution-critical path)
@@ -464,23 +464,29 @@ fn clmm_output_a_to_b(
 }
 
 /// Unified output estimator for one swap leg. Dispatches to:
-///   - Orca CLMM math when `pool.clmm_liquidity > 0`  (Whirlpool)
-///   - Constant-product math otherwise                  (Raydium CPMM/AMM)
+///   - Raydium CPMM exact protocol math for `RaydiumCPMM`
+///   - Orca CLMM math when `pool.clmm_liquidity > 0`
+///   - Generic constant-product math for legacy/fallback pools
 ///
-/// `spending_quote` = true  → we're spending SOL/quote to receive base token  (buy leg)
-/// `spending_quote` = false → we're spending base token to receive SOL/quote  (sell leg)
+/// The Raydium CPMM path reads the canonical realtime PoolState/AmmConfig/vault
+/// snapshot maintained by scanner::raydium_cpmm.
 fn estimate_leg_output(
     pool: &crate::scanner::PriceUpdate,
     amount_in: u64,
     spending_quote: bool,
 ) -> Result<u64, MathError> {
+    if pool.dex == "RaydiumCPMM" {
+        let state = raydium_cpmm::current_quote_state().ok_or(MathError::InvalidInput(
+            "Raydium CPMM quote state is not initialized",
+        ))?;
+
+        return raydium_cpmm::quote_output_amount(&state, amount_in, spending_quote)
+            .map_err(|_| MathError::InvalidInput("Raydium CPMM exact quote unavailable"));
+    }
+
     if pool.clmm_liquidity > 0 {
-        // CLMM path (Orca Whirlpool)
-        // spending_quote=true  → spend SOL → b_to_a when SOL is token_b (!is_a_wsol)
-        //                                    a_to_b when SOL is token_a ( is_a_wsol)
-        // spending_quote=false → spend base → a_to_b when base is token_a (!is_a_wsol)
-        //                                     b_to_a when base is token_b ( is_a_wsol)
         let b_to_a = spending_quote ^ pool.clmm_is_a_wsol;
+
         if b_to_a {
             clmm_output_b_to_a(
                 pool.clmm_sqrt_price_q64,
@@ -499,16 +505,15 @@ fn estimate_leg_output(
             )
         }
     } else {
-        // Constant-product path (Raydium CPMM / AMM)
         let (reserve_in, reserve_out) = if spending_quote {
             (pool.quote_reserve_raw, pool.base_reserve_raw)
         } else {
             (pool.base_reserve_raw, pool.quote_reserve_raw)
         };
+
         estimate_output_amount_raw(reserve_in, reserve_out, amount_in)
     }
 }
-
 
 pub fn find_opportunity(
     price_a: &PriceUpdate,
@@ -592,10 +597,11 @@ pub fn find_opportunity(
 
     // Sell leg: spend the base tokens received above on the pricier DEX,
     // receiving SOL/quote back. Same dispatch logic as the buy leg.
-    let expected_output_after_sell_raw = match estimate_leg_output(sell, expected_output_after_buy_raw, false) {
-        Ok(v) => v,
-        Err(_) => return Err(RejectReason::NoSpread),
-    };
+    let expected_output_after_sell_raw =
+        match estimate_leg_output(sell, expected_output_after_buy_raw, false) {
+            Ok(v) => v,
+            Err(_) => return Err(RejectReason::NoSpread),
+        };
 
     let buy_slippage_bps = match estimate_slippage_bps(
         buy.quote_reserve_raw,
@@ -765,8 +771,14 @@ pub fn find_best_opportunity_with_staleness(
     capital_source: crate::config::CapitalSource,
 ) -> Result<Opportunity, RejectReason> {
     let now = std::time::SystemTime::now();
-    let age_a = now.duration_since(price_a.timestamp).unwrap_or_default().as_secs();
-    let age_b = now.duration_since(price_b.timestamp).unwrap_or_default().as_secs();
+    let age_a = now
+        .duration_since(price_a.timestamp)
+        .unwrap_or_default()
+        .as_secs();
+    let age_b = now
+        .duration_since(price_b.timestamp)
+        .unwrap_or_default()
+        .as_secs();
     let max_age = age_a.max(age_b);
     if max_price_age_secs > 0 && max_age > max_price_age_secs {
         return Err(RejectReason::StalePrice {
@@ -944,7 +956,8 @@ mod tests {
         // Recompute leg 1 independently and confirm the Opportunity carries
         // the exact same integer value through to what leg 2 used as input.
         let expected_leg1 =
-            estimate_output_amount_raw(a.quote_reserve_raw, a.base_reserve_raw, 50_000_000).unwrap();
+            estimate_output_amount_raw(a.quote_reserve_raw, a.base_reserve_raw, 50_000_000)
+                .unwrap();
         assert_eq!(opp.expected_output_after_buy_raw, expected_leg1);
 
         let expected_leg2 =

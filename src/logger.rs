@@ -69,4 +69,3 @@ pub fn log_row(
 
     Ok(())
 }
-

@@ -40,11 +40,15 @@ async fn main() -> anyhow::Result<()> {
     executor::ensure_wallet_atas(&exec_client, &config.keypair, &other_token_mint)
         .expect("Failed to ensure wallet ATAs exist");
 
-    let ata_cache = executor::AtaCache::load(&exec_client, &config.keypair.pubkey(), &other_token_mint)
-        .expect("Failed to load ATA cache");
+    let ata_cache =
+        executor::AtaCache::load(&exec_client, &config.keypair.pubkey(), &other_token_mint)
+            .expect("Failed to load ATA cache");
     tracing::info!(
         "ATA cache loaded: WSOL ATA {} (exists: {}), other-token ATA {} (exists: {})",
-        ata_cache.wsol_ata, ata_cache.wsol_exists, ata_cache.other_ata, ata_cache.other_exists
+        ata_cache.wsol_ata,
+        ata_cache.wsol_exists,
+        ata_cache.other_ata,
+        ata_cache.other_exists
     );
 
     tracing::info!("Falcon initialized and ready - starting real-time engine");

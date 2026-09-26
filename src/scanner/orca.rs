@@ -220,7 +220,12 @@ impl OrcaStaticContext {
         self.price_from_whirlpool(client, &whirlpool, pair)
     }
 
-    pub fn price_from_whirlpool(&self, client: &RpcClient, whirlpool: &Whirlpool, pair: &str) -> Result<PriceUpdate> {
+    pub fn price_from_whirlpool(
+        &self,
+        client: &RpcClient,
+        whirlpool: &Whirlpool,
+        pair: &str,
+    ) -> Result<PriceUpdate> {
         let vault_a_balance = client
             .get_token_account_balance(&whirlpool.token_vault_a)
             .context("Failed to fetch token vault A balance")?;
@@ -237,7 +242,14 @@ impl OrcaStaticContext {
             .parse()
             .context("Failed to parse raw amount for vault B")?;
 
-        Ok(self.price_from_whirlpool_and_reserves(whirlpool.sqrt_price, whirlpool.liquidity, whirlpool.fee_rate, vault_a_raw, vault_b_raw, pair))
+        Ok(self.price_from_whirlpool_and_reserves(
+            whirlpool.sqrt_price,
+            whirlpool.liquidity,
+            whirlpool.fee_rate,
+            vault_a_raw,
+            vault_b_raw,
+            pair,
+        ))
     }
 
     /// Hot-path constructor for a plain reserve update (e.g. only a vault
@@ -252,7 +264,14 @@ impl OrcaStaticContext {
         vault_b_raw: u64,
         pair: &str,
     ) -> PriceUpdate {
-        self.price_from_whirlpool_and_reserves(sqrt_price, liquidity, fee_rate, vault_a_raw, vault_b_raw, pair)
+        self.price_from_whirlpool_and_reserves(
+            sqrt_price,
+            liquidity,
+            fee_rate,
+            vault_a_raw,
+            vault_b_raw,
+            pair,
+        )
     }
 
     /// Hot-path constructor: builds a `PriceUpdate` purely from values already
@@ -267,7 +286,8 @@ impl OrcaStaticContext {
         vault_b_raw: u64,
         pair: &str,
     ) -> PriceUpdate {
-        let (base_reserve_raw, quote_reserve_raw, base_decimals, quote_decimals) = if self.is_a_wsol {
+        let (base_reserve_raw, quote_reserve_raw, base_decimals, quote_decimals) = if self.is_a_wsol
+        {
             (vault_b_raw, vault_a_raw, self.decimals_b, self.decimals_a)
         } else {
             (vault_a_raw, vault_b_raw, self.decimals_a, self.decimals_b)
