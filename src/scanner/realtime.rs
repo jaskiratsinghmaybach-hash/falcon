@@ -1,10 +1,13 @@
 use anyhow::{Context, Result};
+use futures_util::StreamExt;
 use solana_account_decoder::UiAccountEncoding;
 use solana_client::rpc_config::RpcAccountInfoConfig;
 use solana_pubsub_client::pubsub_client::PubsubClient;
 use solana_sdk::{commitment_config::CommitmentConfig, pubkey::Pubkey};
 use std::str::FromStr;
 use std::sync::mpsc;
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 /// Raw account bytes pushed directly from the WebSocket notification - no extra
 /// RPC round-trip needed to get the actual data.
@@ -70,6 +73,123 @@ pub fn subscribe_to_account(
     }
 
     Ok(())
+}
+
+/// A cancellable, bounded-lifetime account subscription. The existing blocking
+/// client is appropriate for subscriptions that live for the whole process,
+/// but its own API documents that shutdown can block indefinitely. Tick-array
+/// windows move, so they use the async client and explicitly await its
+/// unsubscribe closure instead.
+pub struct CancellableAccountSubscription {
+    cancel: Option<tokio::sync::oneshot::Sender<()>>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl CancellableAccountSubscription {
+    pub fn cancel_and_join(mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            let _ = cancel.send(());
+        }
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+/// Starts one cancellable WebSocket account subscription. Its owner must call
+/// cancel_and_join before replacing it; this sends accountUnsubscribe, closes
+/// the client, and waits for the worker to end before a new generation begins.
+pub fn spawn_cancellable_account_subscription(
+    ws_url: String,
+    account_id: String,
+    tx: mpsc::Sender<AccountUpdate>,
+) -> CancellableAccountSubscription {
+    let (cancel, mut cancelled) = tokio::sync::oneshot::channel();
+
+    let join = std::thread::spawn(move || {
+        let runtime = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                tracing::error!("Failed to create tick-array subscription runtime: {error}");
+                return;
+            }
+        };
+
+        runtime.block_on(async move {
+            use solana_pubsub_client::nonblocking::pubsub_client::PubsubClient as AsyncPubsubClient;
+
+            let pubkey = match Pubkey::from_str(&account_id) {
+                Ok(pubkey) => pubkey,
+                Err(error) => {
+                    tracing::error!("Invalid tick-array account pubkey {account_id}: {error}");
+                    return;
+                }
+            };
+
+            let config = RpcAccountInfoConfig {
+                commitment: Some(CommitmentConfig::confirmed()),
+                encoding: Some(UiAccountEncoding::Base64),
+                data_slice: None,
+                min_context_slot: None,
+            };
+
+            let client = tokio::select! {
+                _ = &mut cancelled => return,
+                result = AsyncPubsubClient::new(&ws_url) => match result {
+                    Ok(client) => client,
+                    Err(error) => {
+                        tracing::error!("Failed to connect tick-array subscription {account_id}: {error}");
+                        return;
+                    }
+                },
+            };
+
+            let (mut notifications, unsubscribe) = tokio::select! {
+                _ = &mut cancelled => {
+                    return;
+                }
+                result = client.account_subscribe(&pubkey, Some(config)) => match result {
+                    Ok(subscription) => subscription,
+                    Err(error) => {
+                        tracing::error!("Failed to subscribe tick array {account_id}: {error}");
+                        return;
+                    }
+                },
+            };
+
+            loop {
+                tokio::select! {
+                    _ = &mut cancelled => break,
+                    response = notifications.next() => {
+                        let Some(response) = response else { break; };
+                        let data = match response.value.data.decode() {
+                            Some(data) => data,
+                            None => {
+                                tracing::warn!("Failed to decode tick-array account data from WebSocket notification");
+                                continue;
+                            }
+                        };
+                        let owner = Pubkey::from_str(&response.value.owner).unwrap_or_default();
+                        if tx.send(AccountUpdate { data, owner, slot: response.context.slot }).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            drop(notifications);
+            unsubscribe().await;
+            let _ = tokio::time::timeout(Duration::from_secs(5), client.shutdown()).await;
+        });
+    });
+
+    CancellableAccountSubscription {
+        cancel: Some(cancel),
+        join: Some(join),
+    }
 }
 
 /// Decodes an SPL Token account's raw bytes into its `amount` field (u64,

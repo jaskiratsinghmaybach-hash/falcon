@@ -613,7 +613,7 @@ fn build_tick_arrays(
 /// than 3, if any of the 3 required starts is not present in the snapshot -
 /// this is the "coverage" a swap of this size and direction actually needs,
 /// distinct from `build_tick_arrays`'s generic 1-6-count check.
-fn select_tick_arrays_for_direction(
+pub fn select_tick_arrays_for_direction(
     tick_arrays: &[crate::scanner::orca::SlottedTickArray],
     tick_current_index: i32,
     tick_spacing: u16,
@@ -638,7 +638,7 @@ fn select_tick_arrays_for_direction(
         .collect()
 }
 
-fn exact_orca_clmm_quote(amount_in: u64, spending_quote: bool) -> Result<LegQuote, MathError> {
+pub fn exact_orca_clmm_quote(amount_in: u64, spending_quote: bool) -> Result<LegQuote, MathError> {
     let state = crate::scanner::orca::current_orca_quote_state().ok_or(
         MathError::OrcaQuoteUnavailable("no Orca quote state published yet"),
     )?;
@@ -899,52 +899,79 @@ fn estimate_leg_quote(
     })
 }
 
+/// Returns the exact spot price ratio `(quote_units, base_units)` for a pool.
+///
+/// For CPMM / AMM pools (Raydium), spot price = quote_reserve_raw / base_reserve_raw
+/// (lamports of SOL per raw base token).
+///
+/// For Orca Whirlpool (CLMM), spot price is derived from `clmm_sqrt_price_q64`
+/// (Q64.64 fixed point) where `(sqrt_price / 2^64)^2 = raw_b / raw_a`.
+/// - If `clmm_is_a_wsol` is true: token A is WSOL (quote), token B is base token.
+///   Then raw_quote / raw_base = raw_a / raw_b = 2^128 / (sqrt_price^2).
+/// - If `clmm_is_a_wsol` is false: token A is base token, token B is WSOL (quote).
+///   Then raw_quote / raw_base = raw_b / raw_a = (sqrt_price^2) / 2^128.
+///
+/// Both pools trade the exact same pair (with identical token mints and decimals),
+/// so `quote_units / base_units` shares the exact same unit (raw lamports per raw base token).
+pub fn spot_price_ratio(price: &PriceUpdate) -> Result<(ethnum::U256, ethnum::U256), RejectReason> {
+    if price.clmm_sqrt_price_q64 > 0 {
+        let sp = ethnum::U256::from(price.clmm_sqrt_price_q64);
+        let sp_sq = sp * sp;
+        let two_128 = ethnum::U256::from(1u128) << 128;
+        if sp_sq == 0 {
+            return Err(RejectReason::NoSpread);
+        }
+        if price.clmm_is_a_wsol {
+            Ok((two_128, sp_sq))
+        } else {
+            Ok((sp_sq, two_128))
+        }
+    } else {
+        if price.base_reserve_raw == 0 || price.quote_reserve_raw == 0 {
+            return Err(RejectReason::NoSpread);
+        }
+        Ok((
+            ethnum::U256::from(price.quote_reserve_raw),
+            ethnum::U256::from(price.base_reserve_raw),
+        ))
+    }
+}
+
 pub fn find_opportunity(
     price_a: &PriceUpdate,
     price_b: &PriceUpdate,
     trade_size_lamports: u64,
 ) -> Result<Opportunity, RejectReason> {
-    // Orientation: decide which side is cheaper using raw reserves via
-    // cross-multiplication (quote_a/base_a vs quote_b/base_b), never a float
-    // price comparison.
-    //
-    // price = quote_reserve / base_reserve (SOL per base token). Lower price
-    // = cheaper = where we buy.
-    let cross_a = (price_a.quote_reserve_raw as u128) * (price_b.base_reserve_raw as u128);
-    let cross_b = (price_b.quote_reserve_raw as u128) * (price_a.base_reserve_raw as u128);
+    // Orientation: decide which side is cheaper using spot price components via
+    // exact cross-multiplication, never a naive vault balance ratio for CLMM.
+    let (quote_a, base_a) = spot_price_ratio(price_a)?;
+    let (quote_b, base_b) = spot_price_ratio(price_b)?;
+
+    let cross_a = quote_a * base_b;
+    let cross_b = quote_b * base_a;
 
     if cross_a == cross_b {
         return Err(RejectReason::NoSpread);
     }
 
-    let (buy, sell) = if cross_a < cross_b {
-        (price_a, price_b)
+    let (buy, sell, buy_quote, buy_base, sell_quote, sell_base) = if cross_a < cross_b {
+        (price_a, price_b, quote_a, base_a, quote_b, base_b)
     } else {
-        (price_b, price_a)
+        (price_b, price_a, quote_b, base_b, quote_a, base_a)
     };
 
-    if buy.base_reserve_raw == 0
-        || buy.quote_reserve_raw == 0
-        || sell.base_reserve_raw == 0
-        || sell.quote_reserve_raw == 0
-    {
-        return Err(RejectReason::NoSpread);
-    }
-
-    // raw_spread_bps = (sell_price - buy_price) / buy_price, in bps, via
-    // cross-multiplication:
-    // sell_price/buy_price = (sell_quote/sell_base) / (buy_quote/buy_base)
-    //                      = (sell_quote * buy_base) / (sell_base * buy_quote)
-    let sell_over_buy_num = (sell.quote_reserve_raw as u128) * (buy.base_reserve_raw as u128);
-    let sell_over_buy_den = (sell.base_reserve_raw as u128) * (buy.quote_reserve_raw as u128);
+    // raw_spread_bps = (sell_price - buy_price) / buy_price, in bps
+    let sell_over_buy_num = sell_quote * buy_base;
+    let sell_over_buy_den = sell_base * buy_quote;
 
     if sell_over_buy_den == 0 {
         return Err(RejectReason::NoSpread);
     }
 
-    let raw_spread_bps: i128 = ((sell_over_buy_num as i128) * (BPS_DENOMINATOR as i128)
-        / (sell_over_buy_den as i128))
-        - BPS_DENOMINATOR as i128;
+    let raw_spread_bps: i128 = ((sell_over_buy_num * ethnum::U256::from(BPS_DENOMINATOR)
+        / sell_over_buy_den)
+        - ethnum::U256::from(BPS_DENOMINATOR))
+    .as_i128();
 
     const MIN_RAW_SPREAD_BPS: i128 = 1; // 0.01%
 
@@ -1017,8 +1044,8 @@ pub fn find_opportunity(
     }
 
     // --- presentation-only derivations, computed once, for logging ---
-    let buy_price = buy.quote_reserve_raw as f64 / buy.base_reserve_raw as f64;
-    let sell_price = sell.quote_reserve_raw as f64 / sell.base_reserve_raw as f64;
+    let buy_price = buy.price;
+    let sell_price = sell.price;
     let raw_spread_pct = raw_spread_bps as f64 / 100.0;
     let fee_adjusted_spread_pct = fee_adjusted_spread_bps as f64 / 100.0;
     let net_spread_after_slippage_pct = net_spread_after_slippage_bps as f64 / 100.0;
@@ -2679,6 +2706,304 @@ mod tests {
                     .collect();
                 assert_eq!(actual_pdas, expected_pdas.to_vec());
             }
+
+            // --- Area 1: Current-tick parity and divergence regression tests ---
+
+            #[test]
+            fn startup_and_current_tick_identical() {
+                let pool_pubkey = Pubkey::new_unique();
+                let tick_spacing: u16 = 64;
+                let tick = 2816; // In tick array start = 0
+
+                let window = five_array_window(pool_pubkey, tick, tick_spacing);
+                let slotted: Vec<SlottedTickArray> = window
+                    .into_iter()
+                    .map(|array| SlottedTickArray { array, slot: 100 })
+                    .collect();
+
+                let quote_selected = select_tick_arrays_for_direction(
+                    &slotted,
+                    tick,
+                    tick_spacing,
+                    true,
+                )
+                .unwrap();
+                let quote_pdas: Vec<Pubkey> = quote_selected
+                    .iter()
+                    .map(|a| crate::executor::orca::derive_tick_array_pda(&pool_pubkey, a.start_tick_index).unwrap())
+                    .collect();
+
+                let exec_pdas = crate::executor::orca::derive_tick_arrays(
+                    &pool_pubkey,
+                    tick,
+                    tick_spacing,
+                    true,
+                )
+                .unwrap();
+
+                assert_eq!(quote_pdas, exec_pdas.to_vec(), "Identical ticks must produce identical PDAs");
+            }
+
+            #[test]
+            fn startup_vs_realtime_tick_divergence_reproduced_and_fixed() {
+                let pool_pubkey = Pubkey::new_unique();
+                let tick_spacing: u16 = 64;
+                // Array span = 88 * 64 = 5632.
+                // Startup tick in array [0..5631]
+                let startup_tick = 100;
+                // Realtime tick has moved into the next array [5632..11263]
+                let realtime_tick = 6000;
+
+                // 1. REPRODUCE OLD BUG:
+                // If executor used startup_tick, it derives tick arrays starting at 0, -5632, -11264 for a_to_b.
+                let old_buggy_exec_pdas = crate::executor::orca::derive_tick_arrays(
+                    &pool_pubkey,
+                    startup_tick,
+                    tick_spacing,
+                    true,
+                )
+                .unwrap();
+
+                // 2. Analyzer quoted against realtime snapshot at realtime_tick (6000).
+                let window = five_array_window(pool_pubkey, realtime_tick, tick_spacing);
+                let slotted: Vec<SlottedTickArray> = window
+                    .into_iter()
+                    .map(|array| SlottedTickArray { array, slot: 100 })
+                    .collect();
+
+                let quote_selected = select_tick_arrays_for_direction(
+                    &slotted,
+                    realtime_tick,
+                    tick_spacing,
+                    true,
+                )
+                .unwrap();
+                let quote_pdas: Vec<Pubkey> = quote_selected
+                    .iter()
+                    .map(|a| crate::executor::orca::derive_tick_array_pda(&pool_pubkey, a.start_tick_index).unwrap())
+                    .collect();
+
+                // Verify the old mismatch would have caused complete PDA divergence:
+                assert_ne!(
+                    old_buggy_exec_pdas.to_vec(),
+                    quote_pdas,
+                    "Regression check: startup tick derivation must differ from realtime tick derivation when tick array boundary is crossed"
+                );
+
+                // 3. VERIFY FIXED PARITY:
+                // The fixed execution path uses the realtime current tick (6000), NOT startup_tick.
+                let fixed_exec_pdas = crate::executor::orca::derive_tick_arrays(
+                    &pool_pubkey,
+                    realtime_tick,
+                    tick_spacing,
+                    true,
+                )
+                .unwrap();
+
+                assert_eq!(
+                    fixed_exec_pdas.to_vec(),
+                    quote_pdas,
+                    "Fixed execution path must match the validated quote snapshot PDAs exactly"
+                );
+            }
+
+            #[test]
+            fn stale_or_incoherent_execution_state_rejected() {
+                let pool_pubkey = Pubkey::new_unique();
+                let tick_spacing: u16 = 64;
+                let tick = 2816;
+                let sqrt_price = orca_whirlpools_core::tick_index_to_sqrt_price(tick);
+                let wsol = Pubkey::from_str(crate::scanner::orca::WSOL_MINT).unwrap();
+
+                let whirlpool = crate::scanner::orca::Whirlpool {
+                    whirlpools_config: Pubkey::default(),
+                    whirlpool_bump: [0],
+                    tick_spacing,
+                    tick_spacing_seed: tick_spacing.to_le_bytes(),
+                    fee_rate: 3000,
+                    protocol_fee_rate: 0,
+                    liquidity: 10_000_000_000_000,
+                    sqrt_price,
+                    tick_current_index: tick,
+                    protocol_fee_owed_a: 0,
+                    protocol_fee_owed_b: 0,
+                    token_mint_a: wsol,
+                    token_vault_a: Pubkey::new_from_array([1u8; 32]),
+                    fee_growth_global_a: 0,
+                    token_mint_b: Pubkey::new_from_array([2u8; 32]),
+                    token_vault_b: Pubkey::new_from_array([3u8; 32]),
+                    fee_growth_global_b: 0,
+                    reward_last_updated_timestamp: 0,
+                    reward_infos: Default::default(),
+                };
+
+                let window = five_array_window(pool_pubkey, tick, tick_spacing);
+                // Incoherent tick array: slot drifts by 100 slots (max allowed is MAX_SLOT_DRIFT = 2)
+                let incoherent_slotted: Vec<SlottedTickArray> = window
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, array)| SlottedTickArray {
+                        array,
+                        slot: if i == 0 { 200 } else { 100 },
+                    })
+                    .collect();
+
+                let state = OrcaQuoteState {
+                    whirlpool_pubkey: pool_pubkey,
+                    whirlpool,
+                    tick_arrays: incoherent_slotted,
+                    pool_slot: 100,
+                };
+
+                // Coherence status must be Incoherent
+                assert!(matches!(
+                    state.coherence_status(),
+                    crate::scanner::orca::CoherenceStatus::Incoherent { .. }
+                ));
+
+                // Revalidation must fail closed
+                let reval = revalidate_orca_snapshot(&state, true, 100);
+                assert!(matches!(reval, Err(RevalidationError::Incoherent { .. })));
+            }
+        }
+    }
+
+
+    mod clmm_route_price_selection {
+        use super::*;
+
+        fn make_orca_pool(
+            is_a_wsol: bool,
+            sqrt_price_q64: u128,
+            vault_a_raw: u64,
+            vault_b_raw: u64,
+            ui_price: f64,
+        ) -> PriceUpdate {
+            PriceUpdate {
+                dex: "Orca".to_string(),
+                pair: "TEST/SOL".to_string(),
+                base_reserve_raw: if is_a_wsol { vault_b_raw } else { vault_a_raw },
+                quote_reserve_raw: if is_a_wsol { vault_a_raw } else { vault_b_raw },
+                base_decimals: 6,
+                quote_decimals: 9,
+                fee_numerator: 3000,
+                fee_denominator: 1_000_000,
+                price: ui_price,
+                base_liquidity: 10_000.0,
+                quote_liquidity: 10_000.0,
+                fee_pct: 0.3,
+                timestamp: std::time::SystemTime::now(),
+                clmm_sqrt_price_q64: sqrt_price_q64,
+                clmm_liquidity: 100_000_000,
+                clmm_is_a_wsol: is_a_wsol,
+            }
+        }
+
+        fn make_raydium_pool(quote_raw: u64, base_raw: u64) -> PriceUpdate {
+            let quote_ui = quote_raw as f64 / 1e9;
+            let base_ui = base_raw as f64 / 1e6;
+            PriceUpdate {
+                dex: "Raydium".to_string(),
+                pair: "TEST/SOL".to_string(),
+                base_reserve_raw: base_raw,
+                quote_reserve_raw: quote_raw,
+                base_decimals: 6,
+                quote_decimals: 9,
+                fee_numerator: 25,
+                fee_denominator: 10000,
+                price: quote_ui / base_ui,
+                base_liquidity: base_ui,
+                quote_liquidity: quote_ui,
+                fee_pct: 0.25,
+                timestamp: std::time::SystemTime::now(),
+                clmm_sqrt_price_q64: 0,
+                clmm_liquidity: 0,
+                clmm_is_a_wsol: false,
+            }
+        }
+
+        #[test]
+        fn all_four_token_order_and_direction_cases() {
+            // Raydium raw spot price: quote_raw / base_raw = 1_000_000 / 1_000_000 = 1.0 raw.
+            let raydium_normal = make_raydium_pool(1_000_000, 1_000_000);
+            let (quote_r, base_r) = spot_price_ratio(&raydium_normal).unwrap();
+
+            // Case 1: A = WSOL, spending WSOL (Buy leg on Orca)
+            // A = WSOL, so raw price quote/base = 2^128 / sp^2.
+            // If sp = 2 * 2^64, sp^2 = 4 * 2^128, price = 1/4 = 0.25 raw (Orca cheaper than Raydium 1.0).
+            let sp_high = 2u128 << 64; // price = 0.25
+            let orca_cheap = make_orca_pool(true, sp_high, 1_000_000, 1_000_000, 0.25);
+            let (quote_o, base_o) = spot_price_ratio(&orca_cheap).unwrap();
+            assert!(quote_o * base_r < quote_r * base_o, "Case 1: Orca should be cheaper buy leg (spending WSOL)");
+
+            // Case 2: A = WSOL, spending base (Sell leg on Orca)
+            // If sp = 2^63 (0.5), sp^2 = 0.25 * 2^128, price = 4.0 raw (Orca more expensive than Raydium 1.0).
+            let sp_low = 1u128 << 63; // price = 4.0
+            let orca_expensive = make_orca_pool(true, sp_low, 1_000_000, 1_000_000, 4.0);
+            let (quote_oe, base_oe) = spot_price_ratio(&orca_expensive).unwrap();
+            assert!(quote_r * base_oe < quote_oe * base_r, "Case 2: Orca should be more expensive sell leg (spending base)");
+
+            // Case 3: B = WSOL, spending WSOL (Buy leg on Orca)
+            // B = WSOL, so raw price quote/base = sp^2 / 2^128.
+            // If sp = 2^63 (0.5), sp^2 = 0.25 * 2^128, price = 0.25 raw (Orca cheaper than Raydium 1.0).
+            let orca_b_cheap = make_orca_pool(false, sp_low, 1_000_000, 1_000_000, 0.25);
+            let (quote_obc, base_obc) = spot_price_ratio(&orca_b_cheap).unwrap();
+            assert!(quote_obc * base_r < quote_r * base_obc, "Case 3: Orca should be cheaper buy leg (spending WSOL)");
+
+            // Case 4: B = WSOL, spending base (Sell leg on Orca)
+            // B = WSOL, so raw price quote/base = sp^2 / 2^128.
+            // If sp = 2 * 2^64, sp^2 = 4 * 2^128, price = 4.0 raw (Orca more expensive than Raydium 1.0).
+            let orca_b_expensive = make_orca_pool(false, sp_high, 1_000_000, 1_000_000, 4.0);
+            let (quote_obe, base_obe) = spot_price_ratio(&orca_b_expensive).unwrap();
+            assert!(quote_r * base_obe < quote_obe * base_r, "Case 4: Orca should be more expensive sell leg (spending base)");
+        }
+
+        #[test]
+        fn misleading_vault_reserves_do_not_fool_route_orientation() {
+            // Raydium raw spot price: 1.0 (quote = 1_000_000, base = 1_000_000).
+            let raydium = make_raydium_pool(1_000_000, 1_000_000);
+            let (q_ray, b_ray) = spot_price_ratio(&raydium).unwrap();
+
+            // Scenario 1:
+            // Orca vault balances suggest quote/base is 0.00001 (tiny, looks like a cheap buy).
+            // But actual sqrt_price corresponds to price = 4.0 raw (more expensive than Raydium at 1.0).
+            // Raydium should be BUY leg, Orca should be SELL leg (NOT buy on Orca!).
+            let orca_sp = 2u128 << 64; // For B=WSOL, price = (2)^2 = 4.0 raw
+            let orca_misleading_cheap_reserves = make_orca_pool(
+                false, // B is WSOL
+                orca_sp,
+                10_000_000, // base vault is huge (10M)
+                100,        // quote vault is tiny (100) -> vault ratio = 0.00001!
+                4.0,
+            );
+
+            let (q_orca, b_orca) = spot_price_ratio(&orca_misleading_cheap_reserves).unwrap();
+
+            // Sqrt price shows Orca is 4.0, Raydium is 1.0.
+            // Therefore Raydium is cheaper: q_ray * b_orca < q_orca * b_ray.
+            assert!(
+                q_ray * b_orca < q_orca * b_ray,
+                "Raydium must be recognized as cheaper buy leg despite Orca's misleading vault reserves"
+            );
+
+            // Scenario 2:
+            // Orca vault balances suggest quote/base is 100,000 (huge, looks like an expensive sell).
+            // But actual sqrt_price corresponds to price = 0.25 raw (cheaper than Raydium at 1.0).
+            // Orca must be recognized as BUY leg.
+            let orca_sp_low = 1u128 << 63; // For B=WSOL, price = 0.25 raw
+            let orca_misleading_expensive_reserves = make_orca_pool(
+                false, // B is WSOL
+                orca_sp_low,
+                100,        // base vault tiny
+                10_000_000, // quote vault huge -> vault ratio = 100,000!
+                0.25,
+            );
+
+            let (q_orca2, b_orca2) = spot_price_ratio(&orca_misleading_expensive_reserves).unwrap();
+            assert!(
+                q_orca2 * b_ray < q_ray * b_orca2,
+                "Orca must be recognized as cheaper buy leg despite Orca's misleading vault reserves"
+            );
         }
     }
 }

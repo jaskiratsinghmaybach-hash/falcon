@@ -413,6 +413,7 @@ fn build_leg_instruction(
     input_mint: &Pubkey,
     amount_in: u64,
     minimum_amount_out: u64,
+    orca_current_tick: Option<i32>,
 ) -> Result<Instruction> {
     let wsol_mint = Pubkey::from_str(WSOL_MINT)?;
 
@@ -490,6 +491,9 @@ fn build_leg_instruction(
 
         "Orca" => {
             let info = &orca_ctx.info;
+            let current_tick = orca_current_tick.ok_or_else(|| {
+                anyhow::anyhow!("Executor fail closed: live Orca current tick missing")
+            })?;
 
             let (token_owner_account_a, token_owner_account_b) = if info.token_mint_a == wsol_mint {
                 (wsol_ata, other_ata)
@@ -510,7 +514,7 @@ fn build_leg_instruction(
 
             orca::build_swap_instruction(
                 &accounts,
-                info.tick_current_index,
+                current_tick,
                 info.tick_spacing,
                 amount_in,
                 minimum_amount_out,
@@ -538,6 +542,7 @@ pub fn simulate_opportunity(
     other_token_decimals: u32,
     cached_blockhash: Option<solana_sdk::hash::Hash>,
     ata_cache: &AtaCache,
+    orca_state: Option<&crate::scanner::orca::OrcaQuoteState>,
 ) -> Result<()> {
     let wallet = payer.pubkey();
 
@@ -597,6 +602,47 @@ pub fn simulate_opportunity(
     )
     .context("Failed to compute buy-leg minimum_out")?;
 
+    let orca_is_involved = opportunity.buy_dex == "Orca" || opportunity.sell_dex == "Orca";
+    let orca_current_tick = if orca_is_involved {
+        let state = orca_state.ok_or_else(|| {
+            anyhow::anyhow!("Executor fail closed: live Orca state missing for opportunity involving Orca")
+        })?;
+
+        if state.whirlpool_pubkey != orca_ctx.pool_id {
+            anyhow::bail!(
+                "Executor fail closed: Orca state pool {} does not match context pool {}",
+                state.whirlpool_pubkey,
+                orca_ctx.pool_id
+            );
+        }
+
+        if let crate::scanner::orca::CoherenceStatus::Incoherent { worst_drift } =
+            state.coherence_status()
+        {
+            anyhow::bail!(
+                "Executor fail closed: Orca state incoherent with worst slot drift {}",
+                worst_drift
+            );
+        }
+
+        let orca_is_buy = opportunity.buy_dex == "Orca";
+        let a_to_b = analyzer::orca_leg_a_to_b(state, orca_is_buy);
+
+        let _ = analyzer::select_tick_arrays_for_direction(
+            &state.tick_arrays,
+            state.whirlpool.tick_current_index,
+            state.whirlpool.tick_spacing,
+            a_to_b,
+        )
+        .map_err(|e| {
+            anyhow::anyhow!("Executor fail closed: required tick arrays missing: {e}")
+        })?;
+
+        Some(state.whirlpool.tick_current_index)
+    } else {
+        None
+    };
+
     let buy_ix = build_leg_instruction(
         &opportunity.buy_dex,
         raydium_ctx,
@@ -607,6 +653,7 @@ pub fn simulate_opportunity(
         &wsol_mint,
         amount_in_lamports,
         buy_minimum_out_raw,
+        orca_current_tick,
     )?;
 
     instructions.push(buy_ix);
@@ -645,6 +692,7 @@ pub fn simulate_opportunity(
         other_token_mint,
         other_token_amount_raw,
         sell_minimum_out_lamports,
+        orca_current_tick,
     )?;
 
     instructions.push(sell_ix);
