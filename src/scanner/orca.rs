@@ -1,13 +1,16 @@
 use anyhow::{Context, Result};
 use borsh::BorshDeserialize;
-use orca_whirlpools_core::{TickArrayFacade, TickFacade, TICK_ARRAY_SIZE};
+use orca_whirlpools_core::{
+    TickArrayFacade, TickFacade, WhirlpoolFacade, WhirlpoolRewardInfoFacade, TICK_ARRAY_SIZE,
+};
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
 use std::str::FromStr;
+use std::sync::{OnceLock, RwLock};
 
 use super::PriceUpdate;
 
-const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
+pub const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
 const ORCA_WHIRLPOOL_PROGRAM: &str = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc";
 
 // ===========================================================================
@@ -128,7 +131,9 @@ fn decode_tick(bytes: &[u8]) -> Result<TickFacade> {
 pub enum TickArrayError {
     #[error("tick array account too short: got {got} bytes, need at least {need}")]
     TooShort { got: usize, need: usize },
-    #[error("tick array account not owned by Orca Whirlpool program (expected {expected}, got {got})")]
+    #[error(
+        "tick array account not owned by Orca Whirlpool program (expected {expected}, got {got})"
+    )]
     WrongOwner { expected: Pubkey, got: Pubkey },
     #[error("tick array belongs to whirlpool {found}, expected {expected}")]
     WrongWhirlpool { expected: Pubkey, found: Pubkey },
@@ -194,13 +199,11 @@ pub fn decode_tick_array(data: &[u8]) -> Result<DecodedTickArray, TickArrayError
     );
 
     let mut ticks: [TickFacade; TICK_ARRAY_SIZE] = [TickFacade::default(); TICK_ARRAY_SIZE];
-    for i in 0..TICK_ARRAY_SIZE {
+    for (i, tick_slot) in ticks.iter_mut().enumerate() {
         let start = 4 + i * TICK_LEN;
         let end = start + TICK_LEN;
-        ticks[i] = decode_tick(&body[start..end]).map_err(|source| TickArrayError::TickDecode {
-            index: i,
-            source,
-        })?;
+        *tick_slot = decode_tick(&body[start..end])
+            .map_err(|source| TickArrayError::TickDecode { index: i, source })?;
     }
 
     let whirlpool_start = 4 + TICK_ARRAY_SIZE * TICK_LEN;
@@ -243,10 +246,7 @@ pub fn validate_tick_array(
 
     let ticks_in_array = TICK_ARRAY_SIZE as i32 * tick_spacing as i32;
     if ticks_in_array != 0 && decoded.start_tick_index.rem_euclid(ticks_in_array) != 0 {
-        let expected = decoded
-            .start_tick_index
-            .div_euclid(ticks_in_array)
-            * ticks_in_array;
+        let expected = decoded.start_tick_index.div_euclid(ticks_in_array) * ticks_in_array;
         return Err(TickArrayError::InvalidStartTick {
             got: decoded.start_tick_index,
             expected,
@@ -285,7 +285,7 @@ pub fn load_tick_array(
     Ok(decoded)
 }
 
-#[derive(BorshDeserialize, Debug)]
+#[derive(BorshDeserialize, Debug, Clone)]
 pub struct WhirlpoolRewardInfo {
     pub mint: Pubkey,
     pub vault: Pubkey,
@@ -294,7 +294,7 @@ pub struct WhirlpoolRewardInfo {
     pub growth_global_x64: u128,
 }
 
-#[derive(BorshDeserialize, Debug)]
+#[derive(BorshDeserialize, Debug, Clone)]
 pub struct Whirlpool {
     pub whirlpools_config: Pubkey,
     pub whirlpool_bump: [u8; 1],
@@ -315,6 +315,215 @@ pub struct Whirlpool {
     pub fee_growth_global_b: u128,
     pub reward_last_updated_timestamp: u64,
     pub reward_infos: [WhirlpoolRewardInfo; 3],
+}
+
+impl Whirlpool {
+    /// Converts the decoded on-chain account into the in-memory
+    /// `WhirlpoolFacade` consumed by `orca_whirlpools_core::swap_quote_by_input_token`.
+    ///
+    /// Field mapping is exact and 1:1 - `WhirlpoolFacade` is the crate's own
+    /// in-memory mirror of this exact on-chain struct (same field order,
+    /// same names apart from `tick_spacing_seed` -> `fee_tier_index_seed`,
+    /// which is the crate's name for the identical bytes).
+    pub fn to_facade(&self) -> WhirlpoolFacade {
+        WhirlpoolFacade {
+            fee_tier_index_seed: self.tick_spacing_seed,
+            tick_spacing: self.tick_spacing,
+            fee_rate: self.fee_rate,
+            protocol_fee_rate: self.protocol_fee_rate,
+            liquidity: self.liquidity,
+            sqrt_price: self.sqrt_price,
+            tick_current_index: self.tick_current_index,
+            fee_growth_global_a: self.fee_growth_global_a,
+            fee_growth_global_b: self.fee_growth_global_b,
+            reward_last_updated_timestamp: self.reward_last_updated_timestamp,
+            reward_infos: [
+                WhirlpoolRewardInfoFacade {
+                    emissions_per_second_x64: self.reward_infos[0].emissions_per_second_x64,
+                    growth_global_x64: self.reward_infos[0].growth_global_x64,
+                },
+                WhirlpoolRewardInfoFacade {
+                    emissions_per_second_x64: self.reward_infos[1].emissions_per_second_x64,
+                    growth_global_x64: self.reward_infos[1].growth_global_x64,
+                },
+                WhirlpoolRewardInfoFacade {
+                    emissions_per_second_x64: self.reward_infos[2].emissions_per_second_x64,
+                    growth_global_x64: self.reward_infos[2].growth_global_x64,
+                },
+            ],
+        }
+    }
+}
+
+// ===========================================================================
+// EXACT CLMM QUOTE STATE (Phase 4)
+// ===========================================================================
+// Canonical hot-path snapshot the analyzer reads to build exact Orca quotes
+// via `orca_whirlpools_core::swap_quote_by_input_token`. Mirrors the
+// established `raydium_cpmm::CURRENT_QUOTE_STATE` / `publish_quote_state` /
+// `current_quote_state` pattern exactly, rather than smuggling tick-array
+// data through the generic `PriceUpdate` struct.
+//
+// `tick_arrays` holds WHATEVER arrays are currently loaded/valid for this
+// pool - it is explicitly allowed to be fewer than what a given swap might
+// need (see `MissingNeighbor` in TickArrayError); the analyzer's quote call
+// must treat "not enough arrays for this swap size" as a hard quote failure,
+// never silently quote against a truncated/incomplete tick range.
+// ===========================================================================
+
+/// One coherent Orca CLMM quoting snapshot: the pool state plus every
+/// tick array currently held for it, all sourced from the SAME state-slot
+/// as far as the realtime loop can guarantee (see `scanner::realtime` /
+/// the coherent-snapshot handling added alongside this in Phase 4).
+#[derive(Debug, Clone)]
+pub struct OrcaQuoteState {
+    pub whirlpool_pubkey: Pubkey,
+    pub whirlpool: Whirlpool,
+    /// Currently loaded/valid tick arrays for this pool, ordered by
+    /// ascending `start_tick_index`. NOT guaranteed to be exactly 3, 5, or
+    /// any fixed count - callers must size their `TickArrays` conversion
+    /// off `.len()`, not assume a fixed arity. Each entry carries its own
+    /// slot (`SlottedTickArray`) rather than assuming it shares the pool's.
+    pub tick_arrays: Vec<SlottedTickArray>,
+    /// The slot the Whirlpool POOL account push (not the tick arrays) was
+    /// read at, per the WebSocket notification's own `context.slot` - the
+    /// actual RPC-reported slot, not a placeholder. This is the anchor
+    /// `coherence_status` below compares every tick array's slot against.
+    pub pool_slot: u64,
+}
+
+/// A tick array paired with the slot its OWN push was read at. Tick arrays
+/// and the pool account arrive as separate WebSocket pushes and can (and
+/// routinely will) be current as of different slots - representing that
+/// explicitly, rather than assuming one slot for the whole snapshot, is
+/// what makes `coherence_status` below a real check instead of a fiction.
+#[derive(Debug, Clone)]
+pub struct SlottedTickArray {
+    pub array: DecodedTickArray,
+    pub slot: u64,
+}
+
+/// How far apart (in slots) a tick array's own push is allowed to be from
+/// the pool account's push before the snapshot is treated as incoherent.
+/// Solana produces a new slot roughly every 400ms; a handful of slots of
+/// drift between a pool push and a tick-array push is normal and expected
+/// under independent WebSocket subscriptions arriving via separate
+/// notifications, not a sign of a stale/broken state. This is deliberately
+/// a small, conservative window - the Phase 4 spec's explicit example is
+/// "do not combine old pool state + new vault state + old tick state
+/// without detecting the inconsistency", and a wide tolerance here would
+/// let exactly that kind of mismatch through undetected.
+pub const MAX_COHERENT_SLOT_DRIFT: u64 = 5;
+
+/// Result of checking whether every tick array in a snapshot is within
+/// `MAX_COHERENT_SLOT_DRIFT` of the pool's own slot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CoherenceStatus {
+    /// Every tick array's slot is within tolerance of `pool_slot`.
+    Coherent,
+    /// At least one tick array's slot differs from `pool_slot` by more than
+    /// `MAX_COHERENT_SLOT_DRIFT`. Carries the worst (largest) drift found,
+    /// for logging/diagnostics.
+    Incoherent { worst_drift: u64 },
+}
+
+impl OrcaQuoteState {
+    /// Checks state-slot coherence across the pool account and every tick
+    /// array in this snapshot (Phase 4: "a quote must represent a coherent
+    /// state snapshot"). Does NOT look at slots outside this struct (e.g.
+    /// the vault balances used for the generic-approximation price feed) -
+    /// this specifically governs the exact-quote path's own inputs.
+    pub fn coherence_status(&self) -> CoherenceStatus {
+        let mut worst_drift = 0u64;
+        for slotted in &self.tick_arrays {
+            let drift = self.pool_slot.abs_diff(slotted.slot);
+            worst_drift = worst_drift.max(drift);
+        }
+
+        if worst_drift > MAX_COHERENT_SLOT_DRIFT {
+            CoherenceStatus::Incoherent { worst_drift }
+        } else {
+            CoherenceStatus::Coherent
+        }
+    }
+}
+
+static CURRENT_ORCA_QUOTE_STATE: OnceLock<RwLock<Option<OrcaQuoteState>>> = OnceLock::new();
+
+fn orca_quote_state_store() -> &'static RwLock<Option<OrcaQuoteState>> {
+    CURRENT_ORCA_QUOTE_STATE.get_or_init(|| RwLock::new(None))
+}
+
+/// Publishes the newest coherent Whirlpool + tick-array snapshot.
+///
+/// Mirrors `raydium_cpmm::publish_quote_state`. Falcon currently monitors
+/// one configured Orca Whirlpool pool at a time, so a single canonical
+/// snapshot (rather than a per-pool map) matches the existing architecture.
+///
+/// Deliberately does NOT reject an incoherent snapshot here - publishing is
+/// "here is the latest data we have", not a correctness gate. The coherence
+/// check is enforced at READ time (`exact_orca_clmm_quote`, right before a
+/// quote is actually produced), which is where "never silently quote using
+/// stale or incomplete tick state" actually needs to bite.
+pub fn publish_orca_quote_state(state: OrcaQuoteState) {
+    if let Ok(mut guard) = orca_quote_state_store().write() {
+        *guard = Some(state);
+    }
+}
+
+pub fn current_orca_quote_state() -> Option<OrcaQuoteState> {
+    orca_quote_state_store()
+        .read()
+        .ok()
+        .and_then(|guard| guard.clone())
+}
+
+// ===========================================================================
+// TICK-ARRAY SUBSCRIPTION SET (Phase 4 stage 3)
+// ===========================================================================
+// The realtime loop needs to know, up front, which tick-array PDAs to
+// WebSocket-subscribe to for a given (whirlpool, tick_current_index,
+// tick_spacing). The executor's legacy swap instruction can only ever
+// submit 3 tick arrays on-chain, and which 3 depends on trade DIRECTION
+// (`executor::orca::derive_tick_arrays`'s `a_to_b` parameter) - a buy and a
+// sell from the same current tick use different, only-partially-overlapping
+// sets of 3.
+//
+// Since the realtime loop does not know ahead of time which direction a
+// future opportunity will trade, it subscribes to the UNION of both
+// direction-specific 3-array sets: the array containing the current tick,
+// plus the 2 arrays below it, plus the 2 arrays above it - 5 arrays total
+// (the current-tick array is shared by both directions' sets, so 3 + 3 - 1
+// = 5, not 6). At quote time and at execution time, each side independently
+// re-derives its own direction-specific 3-of-5 via
+// `executor::orca::derive_tick_arrays` using the SAME tick_current_index and
+// tick_spacing, so quote and execution are guaranteed to select the same 3
+// arrays for a given trade direction without this module needing to predict
+// direction in advance.
+// ===========================================================================
+
+/// The 5 tick-array PDAs the realtime loop subscribes to for a pool at the
+/// given current tick / tick spacing: 2 below, the current array, 2 above.
+/// Covers both possible direction-specific 3-array sets
+/// `executor::orca::derive_tick_arrays` can select.
+pub fn subscription_tick_array_pdas(
+    whirlpool: &Pubkey,
+    tick_current_index: i32,
+    tick_spacing: u16,
+) -> Result<[Pubkey; 5]> {
+    let ticks_in_array = TICK_ARRAY_SIZE as i32 * tick_spacing as i32;
+    let start = crate::executor::orca::tick_array_start_index(tick_current_index, tick_spacing);
+
+    let mut pdas = Vec::with_capacity(5);
+    for offset in [-2, -1, 0, 1, 2] {
+        pdas.push(crate::executor::orca::derive_tick_array_pda(
+            whirlpool,
+            start + offset * ticks_in_array,
+        )?);
+    }
+
+    pdas.try_into()
+        .map_err(|_| anyhow::anyhow!("subscription_tick_array_pdas: expected exactly 5 PDAs"))
 }
 
 #[derive(Debug, Clone)]
@@ -780,10 +989,7 @@ mod tick_array_tests {
         let decoded = decode_tick_array(&data).unwrap();
 
         let result = validate_tick_array(&decoded, &other_pool, 64);
-        assert!(matches!(
-            result,
-            Err(TickArrayError::WrongWhirlpool { .. })
-        ));
+        assert!(matches!(result, Err(TickArrayError::WrongWhirlpool { .. })));
     }
 
     #[test]

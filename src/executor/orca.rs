@@ -9,7 +9,7 @@ use super::TOKEN_PROGRAM_ID;
 
 pub const ORCA_WHIRLPOOL_PROGRAM: &str = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc";
 
-const TICK_ARRAY_SIZE: i32 = 88;
+pub const TICK_ARRAY_SIZE: i32 = 88;
 
 const SWAP_DISCRIMINATOR: [u8; 8] = [0xf8, 0xc6, 0x9e, 0x91, 0xe1, 0x75, 0x87, 0xc8];
 
@@ -29,12 +29,21 @@ fn program_id() -> Result<Pubkey> {
     Pubkey::from_str(ORCA_WHIRLPOOL_PROGRAM).context("Invalid Whirlpool program ID")
 }
 
-fn tick_array_start_index(tick_index: i32, tick_spacing: u16) -> i32 {
+/// Rounds a tick index down to the start index of its containing tick
+/// array. Public: the realtime scanner needs this same rounding to know
+/// which tick-array accounts to subscribe to, and must use the identical
+/// rule the executor uses or the two can disagree about which array a
+/// given tick falls in.
+pub fn tick_array_start_index(tick_index: i32, tick_spacing: u16) -> i32 {
     let ticks_in_array = TICK_ARRAY_SIZE * tick_spacing as i32;
     tick_index.div_euclid(ticks_in_array) * ticks_in_array
 }
 
-fn derive_tick_array_pda(whirlpool: &Pubkey, start_tick_index: i32) -> Result<Pubkey> {
+/// Derives a tick array PDA for a given start tick index. Public for the
+/// same reason as `tick_array_start_index` - the scanner must derive the
+/// exact same PDAs the executor will submit on-chain, or a quote/execution
+/// mismatch (the kind Phase 4 exists to eliminate) becomes possible again.
+pub fn derive_tick_array_pda(whirlpool: &Pubkey, start_tick_index: i32) -> Result<Pubkey> {
     let start_str = start_tick_index.to_string();
     let (pda, _) = Pubkey::find_program_address(
         &[b"tick_array", whirlpool.as_ref(), start_str.as_bytes()],
@@ -48,7 +57,16 @@ fn derive_oracle_pda(whirlpool: &Pubkey) -> Result<Pubkey> {
     Ok(pda)
 }
 
-fn derive_tick_arrays(
+/// Derives the exact 3 tick array PDAs the legacy Orca `swap` instruction
+/// will submit for a trade in direction `a_to_b`, starting from the array
+/// containing `tick_current_index`. This is a hard on-chain constraint of
+/// that instruction (see `SwapAccounts` / `build_swap_instruction` below) -
+/// not a Falcon design choice - so the quote engine must use these exact 3
+/// arrays (for the trade's actual direction) or it can price liquidity the
+/// submitted transaction can never reach. Public so the scanner's tick-array
+/// subscription logic and the analyzer's quote-time array selection both
+/// derive from this single source of truth instead of duplicating the rule.
+pub fn derive_tick_arrays(
     whirlpool: &Pubkey,
     tick_current_index: i32,
     tick_spacing: u16,

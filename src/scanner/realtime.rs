@@ -11,6 +11,12 @@ use std::sync::mpsc;
 pub struct AccountUpdate {
     pub data: Vec<u8>,
     pub owner: Pubkey,
+    /// The RPC/account slot this push's `context.slot` reported - i.e. the
+    /// slot this account's state was current as of. Used for state-slot
+    /// coherence checks (Phase 4): combining data from two pushes with
+    /// different slots without detecting the gap is exactly the "old pool
+    /// state + new vault state" inconsistency the phase spec warns against.
+    pub slot: u64,
 }
 
 /// Subscribes to a single account over WebSocket and streams raw decoded bytes
@@ -36,6 +42,7 @@ pub fn subscribe_to_account(
     loop {
         match receiver.recv() {
             Ok(response) => {
+                let slot = response.context.slot;
                 let ui_account = response.value;
 
                 let data_bytes = match ui_account.data.decode() {
@@ -51,6 +58,7 @@ pub fn subscribe_to_account(
                 let update = AccountUpdate {
                     data: data_bytes,
                     owner,
+                    slot,
                 };
 
                 if tx.send(update).is_err() {

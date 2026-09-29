@@ -349,6 +349,12 @@ fn simulate_with_blockhash(
             .context("Failed to fetch recent blockhash")?,
     };
 
+    // Program of each instruction, in submission order. Message compilation
+    // preserves instruction order, so the index inside a chain-reported
+    // `InstructionError` indexes this list. Needed to know WHICH program's
+    // error code we are looking at (codes collide across programs).
+    let instruction_programs: Vec<Pubkey> = instructions.iter().map(|ix| ix.program_id).collect();
+
     let message = Message::new(&instructions, Some(&payer.pubkey()));
 
     let mut tx = Transaction::new_unsigned(message);
@@ -360,9 +366,12 @@ fn simulate_with_blockhash(
         tx.message.instructions.len()
     );
 
-    let sim = client
-        .simulate_transaction(&tx)
-        .context("Failed to simulate transaction")?;
+    // Transport failure is a failed simulation (typed as `rpc_error`).
+    let sim = client.simulate_transaction(&tx).map_err(|e| {
+        anyhow::Error::new(crate::failure::SimulationFailure::Rpc(format!(
+            "Failed to simulate transaction: {e}"
+        )))
+    })?;
 
     if let Some(logs) = &sim.value.logs {
         for (index, log) in logs.iter().enumerate() {
@@ -372,13 +381,19 @@ fn simulate_with_blockhash(
 
     tracing::info!("Compute units consumed: {:?}", sim.value.units_consumed);
 
-    if let Some(err) = &sim.value.err {
+    // Simulation truth gate: success requires the RPC call to have succeeded
+    // (we are past it) AND `value.err == None`. Any chain-reported error is a
+    // failed simulation, returned as a typed, classifiable failure.
+    if let Err(failure) =
+        crate::failure::simulation_outcome(sim.value.err.clone(), &instruction_programs)
+    {
         tracing::error!(
-            "SIMULATION FAILED: transaction returned a Solana execution error: {:?}",
-            err
+            failure_class = %failure.class(),
+            "SIMULATION FAILED: {}",
+            failure
         );
 
-        bail!("transaction simulation failed: {:?}", err);
+        return Err(failure.into());
     }
 
     tracing::info!("SIMULATION SUCCESS: transaction executed successfully with no error");
@@ -598,12 +613,16 @@ pub fn simulate_opportunity(
 
     instructions.insert(
         0,
-        solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(350_000),
+        solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(
+            crate::config::COMPUTE_UNIT_LIMIT,
+        ),
     );
 
     instructions.insert(
         1,
-        solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_price(25_000),
+        solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_price(
+            crate::config::COMPUTE_UNIT_PRICE_MICRO_LAMPORTS,
+        ),
     );
 
     let base_sell_minimum_out = analyzer::calculate_minimum_out_raw(

@@ -1,6 +1,7 @@
 mod analyzer;
 mod config;
 mod executor;
+mod failure;
 mod logger;
 mod scanner;
 

@@ -32,16 +32,71 @@ pub enum CapitalSource {
     Pool,
 }
 
+// ===========================================================================
+// TRANSACTION COST MODEL (single source of truth)
+// ===========================================================================
+// The analyzer prices an opportunity's fixed costs and the executor builds the
+// transaction that actually pays them. Both MUST read the same numbers, or the
+// analyzer approves/rejects trades based on a cost the chain never charges
+// (that is exactly what the old hardcoded 100_000-lamport "Jito tip" did: it
+// charged ~15x the real cost and rejected profitable trades).
+//
+// Falcon submits ONE atomic transaction (buy leg + sell leg), signed by ONE
+// key, with a compute-unit limit and compute-unit price. There is no Jito
+// bundle and no tip. Real cost of that transaction:
+//
+//   base fee     = LAMPORTS_PER_SIGNATURE * signatures
+//   priority fee = ceil(compute_unit_limit * compute_unit_price_micro / 1_000_000)
+//
+// Jito tips and flash loans are deferred future optimizations; nothing here
+// models them.
+// ===========================================================================
+
+/// Solana's fixed base fee per transaction signature.
+pub const LAMPORTS_PER_SIGNATURE: u64 = 5_000;
+
+/// Signatures on Falcon's atomic transaction (fee payer only).
+pub const TX_SIGNATURES: u64 = 1;
+
+/// Compute-unit limit requested by the executor's atomic transaction.
+pub const COMPUTE_UNIT_LIMIT: u32 = 350_000;
+
+/// Compute-unit price (micro-lamports per CU) requested by the executor.
+/// Must equal what the executor passes to `set_compute_unit_price`.
+pub const COMPUTE_UNIT_PRICE_MICRO_LAMPORTS: u64 = 25_000;
+
+/// Priority fee in lamports, rounded UP (the runtime rounds up, so rounding
+/// down here would under-price the transaction). `None` on overflow.
+pub fn priority_fee_lamports(
+    compute_unit_limit: u32,
+    compute_unit_price_micro_lamports: u64,
+) -> Option<u64> {
+    let product =
+        (compute_unit_limit as u128).checked_mul(compute_unit_price_micro_lamports as u128)?;
+    let lamports = product.checked_add(999_999)? / 1_000_000;
+    u64::try_from(lamports).ok()
+}
+
+/// Total fixed lamport cost of one Falcon atomic transaction: base signature
+/// fee plus the priority fee. `None` on overflow.
+pub fn fixed_tx_cost_lamports(
+    signatures: u64,
+    compute_unit_limit: u32,
+    compute_unit_price_micro_lamports: u64,
+) -> Option<u64> {
+    let base = LAMPORTS_PER_SIGNATURE.checked_mul(signatures)?;
+    let priority = priority_fee_lamports(compute_unit_limit, compute_unit_price_micro_lamports)?;
+    base.checked_add(priority)
+}
+
 pub struct Config {
     pub helius_rpc_url: String,
     pub helius_ws_url: String,
-    pub jito_block_engine_url: String,
     pub keypair: Keypair,
     pub pair: String,
     pub raydium_pool_id: String,
     pub orca_pool_id: String,
     pub decoder: DecoderType,
-    pub priority_fee_micro_lamports: u64,
     pub max_price_age_secs: u64,
     pub capital_source: CapitalSource,
 }
@@ -55,9 +110,6 @@ impl Config {
 
         let helius_ws_url =
             std::env::var("HELIUS_WS_URL").context("HELIUS_WS_URL not set in environment")?;
-
-        let jito_block_engine_url = std::env::var("JITO_BLOCK_ENGINE_URL")
-            .context("JITO_BLOCK_ENGINE_URL not set in environment")?;
 
         let private_key_str = std::env::var("WALLET_PRIVATE_KEY")
             .context("WALLET_PRIVATE_KEY not set in environment")?;
@@ -84,10 +136,21 @@ impl Config {
             other => anyhow::bail!("Invalid DECODER '{other}' in .env: must be CPMM or AMM"),
         };
 
-        let priority_fee_micro_lamports: u64 = std::env::var("PRIORITY_FEE_MICRO_LAMPORTS")
-            .unwrap_or_else(|_| "25000".to_string())
-            .parse()
-            .unwrap_or(25_000);
+        // The executor prices its transaction from the compile-time cost model
+        // (COMPUTE_UNIT_PRICE_MICRO_LAMPORTS) so the analyzer and executor can
+        // never disagree about cost - there is no Config field for it. An env
+        // override that silently did nothing would be worse than none, so if
+        // one is present and differs from the model, say so loudly instead of
+        // pretending it applies.
+        if let Ok(v) = std::env::var("PRIORITY_FEE_MICRO_LAMPORTS") {
+            if v.trim().parse::<u64>().ok() != Some(COMPUTE_UNIT_PRICE_MICRO_LAMPORTS) {
+                tracing::warn!(
+                    "PRIORITY_FEE_MICRO_LAMPORTS={} in .env is IGNORED: the priority fee is fixed at {} micro-lamports/CU by config::COMPUTE_UNIT_PRICE_MICRO_LAMPORTS so analyzer cost and executor cost stay identical.",
+                    v,
+                    COMPUTE_UNIT_PRICE_MICRO_LAMPORTS
+                );
+            }
+        }
 
         let max_price_age_secs: u64 = std::env::var("MAX_PRICE_AGE_SECS")
             .unwrap_or_else(|_| "0".to_string())
@@ -147,15 +210,64 @@ impl Config {
         Ok(Self {
             helius_rpc_url,
             helius_ws_url,
-            jito_block_engine_url,
             keypair,
             pair,
             raydium_pool_id,
             orca_pool_id,
             decoder,
-            priority_fee_micro_lamports,
             max_price_age_secs,
             capital_source,
         })
+    }
+}
+
+#[cfg(test)]
+mod cost_model_tests {
+    use super::*;
+
+    #[test]
+    fn priority_fee_matches_hand_computation() {
+        // 350_000 CU * 25_000 micro-lamports/CU = 8_750_000_000 micro-lamports
+        // = 8_750 lamports exactly.
+        assert_eq!(priority_fee_lamports(350_000, 25_000), Some(8_750));
+    }
+
+    #[test]
+    fn priority_fee_rounds_up_never_down() {
+        // 1 CU * 1 micro-lamport = 0.000001 lamport -> must round UP to 1.
+        assert_eq!(priority_fee_lamports(1, 1), Some(1));
+        // 1_000_001 micro-lamports -> 2 lamports, not 1.
+        assert_eq!(priority_fee_lamports(1_000_001, 1), Some(2));
+        // Exactly divisible does not gain an extra lamport.
+        assert_eq!(priority_fee_lamports(1_000_000, 1), Some(1));
+    }
+
+    #[test]
+    fn zero_priority_price_costs_nothing_extra() {
+        assert_eq!(priority_fee_lamports(350_000, 0), Some(0));
+        assert_eq!(fixed_tx_cost_lamports(1, 350_000, 0), Some(5_000));
+    }
+
+    #[test]
+    fn fixed_cost_is_base_plus_priority_with_no_tip() {
+        assert_eq!(
+            fixed_tx_cost_lamports(
+                TX_SIGNATURES,
+                COMPUTE_UNIT_LIMIT,
+                COMPUTE_UNIT_PRICE_MICRO_LAMPORTS
+            ),
+            Some(13_750)
+        );
+    }
+
+    #[test]
+    fn fixed_cost_scales_with_signature_count() {
+        assert_eq!(fixed_tx_cost_lamports(2, 350_000, 25_000), Some(18_750));
+    }
+
+    #[test]
+    fn cost_model_overflow_is_none_not_wraparound() {
+        assert_eq!(priority_fee_lamports(u32::MAX, u64::MAX), None);
+        assert_eq!(fixed_tx_cost_lamports(u64::MAX, 0, 0), None);
     }
 }
