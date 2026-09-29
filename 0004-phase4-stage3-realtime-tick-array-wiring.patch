@@ -1,0 +1,462 @@
+diff --git a/src/analyzer/mod.rs b/src/analyzer/mod.rs
+index 56168f0..010ac88 100644
+--- a/src/analyzer/mod.rs
++++ b/src/analyzer/mod.rs
+@@ -537,12 +537,17 @@ struct LegQuote {
+ /// Builds the `TickArrays` value `swap_quote_by_input_token` expects from
+ /// however many tick arrays are currently loaded for the pool.
+ ///
+-/// Deliberately does NOT pad or guess: if fewer than 1 array is available,
+-/// or more than 6 (which core cannot represent), this is a hard error -
+-/// exactly the Phase 4 "never silently quote using stale or incomplete
+-/// tick state" / "insufficient tick-array coverage" requirement. A caller
+-/// seeing this error should trigger a re-fetch/re-subscribe of the missing
+-/// neighboring array(s), not retry the same quote.
++/// Capped at 3, NOT the 6 `orca_whirlpools_core` can technically represent.
++/// This is deliberate: the executor (`executor::orca::build_swap_instruction`)
++/// builds Orca's legacy `swap` instruction, which has a hard on-chain limit
++/// of exactly 3 tick array accounts (`tick_array_0`, `tick_array_1`,
++/// `tick_array_2`) - there is no `remaining_accounts` mechanism available to
++/// it the way there is for `swap_v2`. A quote computed against 4-6 arrays
++/// would price liquidity the actual submitted transaction can never reach,
++/// silently overstating the achievable output - exactly the quote/execution
++/// mismatch this phase exists to eliminate. If a swap genuinely needs more
++/// than 3 arrays' worth of tick range, that is a real, hard quote failure
++/// here, not a case to relax the cap for.
+ fn build_tick_arrays(
+     arrays: &[crate::scanner::orca::DecodedTickArray],
+ ) -> Result<orca_whirlpools_core::TickArrays, MathError> {
+@@ -551,9 +556,6 @@ fn build_tick_arrays(
+         [a] => Ok([*a].into()),
+         [a, b] => Ok([*a, *b].into()),
+         [a, b, c] => Ok([*a, *b, *c].into()),
+-        [a, b, c, d] => Ok([*a, *b, *c, *d].into()),
+-        [a, b, c, d, e] => Ok([*a, *b, *c, *d, *e].into()),
+-        [a, b, c, d, e, f] => Ok([*a, *b, *c, *d, *e, *f].into()),
+         _ => Err(MathError::OrcaInsufficientTickCoverage),
+     }
+ }
+@@ -1604,12 +1606,16 @@ mod tests {
+         }
+ 
+         #[test]
+-        fn build_tick_arrays_rejects_more_than_six() {
++        fn build_tick_arrays_rejects_more_than_three() {
++            // The cap is 3, not 6 - see build_tick_arrays's doc comment: the
++            // executor's legacy swap instruction can only ever submit 3
++            // tick array accounts on-chain, so a quote computed against more
++            // than 3 would price liquidity the real transaction can't reach.
+             let pool_pubkey = Pubkey::new_from_array([8u8; 32]);
+             let mut arrays = Vec::new();
+-            for i in 0..7 {
++            for i in 0..4 {
+                 arrays.push(DecodedTickArray {
+-                    start_tick_index: (i as i32 - 3) * ARRAY_SPAN,
++                    start_tick_index: (i as i32 - 2) * ARRAY_SPAN,
+                     whirlpool: pool_pubkey,
+                     ticks: [TickFacade::default(); TICK_ARRAY_SIZE],
+                 });
+diff --git a/src/executor/orca.rs b/src/executor/orca.rs
+index 7ff4b23..cb60a06 100644
+--- a/src/executor/orca.rs
++++ b/src/executor/orca.rs
+@@ -9,7 +9,7 @@ use super::TOKEN_PROGRAM_ID;
+ 
+ pub const ORCA_WHIRLPOOL_PROGRAM: &str = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc";
+ 
+-const TICK_ARRAY_SIZE: i32 = 88;
++pub const TICK_ARRAY_SIZE: i32 = 88;
+ 
+ const SWAP_DISCRIMINATOR: [u8; 8] = [0xf8, 0xc6, 0x9e, 0x91, 0xe1, 0x75, 0x87, 0xc8];
+ 
+@@ -29,12 +29,21 @@ fn program_id() -> Result<Pubkey> {
+     Pubkey::from_str(ORCA_WHIRLPOOL_PROGRAM).context("Invalid Whirlpool program ID")
+ }
+ 
+-fn tick_array_start_index(tick_index: i32, tick_spacing: u16) -> i32 {
++/// Rounds a tick index down to the start index of its containing tick
++/// array. Public: the realtime scanner needs this same rounding to know
++/// which tick-array accounts to subscribe to, and must use the identical
++/// rule the executor uses or the two can disagree about which array a
++/// given tick falls in.
++pub fn tick_array_start_index(tick_index: i32, tick_spacing: u16) -> i32 {
+     let ticks_in_array = TICK_ARRAY_SIZE * tick_spacing as i32;
+     tick_index.div_euclid(ticks_in_array) * ticks_in_array
+ }
+ 
+-fn derive_tick_array_pda(whirlpool: &Pubkey, start_tick_index: i32) -> Result<Pubkey> {
++/// Derives a tick array PDA for a given start tick index. Public for the
++/// same reason as `tick_array_start_index` - the scanner must derive the
++/// exact same PDAs the executor will submit on-chain, or a quote/execution
++/// mismatch (the kind Phase 4 exists to eliminate) becomes possible again.
++pub fn derive_tick_array_pda(whirlpool: &Pubkey, start_tick_index: i32) -> Result<Pubkey> {
+     let start_str = start_tick_index.to_string();
+     let (pda, _) = Pubkey::find_program_address(
+         &[b"tick_array", whirlpool.as_ref(), start_str.as_bytes()],
+@@ -48,7 +57,16 @@ fn derive_oracle_pda(whirlpool: &Pubkey) -> Result<Pubkey> {
+     Ok(pda)
+ }
+ 
+-fn derive_tick_arrays(
++/// Derives the exact 3 tick array PDAs the legacy Orca `swap` instruction
++/// will submit for a trade in direction `a_to_b`, starting from the array
++/// containing `tick_current_index`. This is a hard on-chain constraint of
++/// that instruction (see `SwapAccounts` / `build_swap_instruction` below) -
++/// not a Falcon design choice - so the quote engine must use these exact 3
++/// arrays (for the trade's actual direction) or it can price liquidity the
++/// submitted transaction can never reach. Public so the scanner's tick-array
++/// subscription logic and the analyzer's quote-time array selection both
++/// derive from this single source of truth instead of duplicating the rule.
++pub fn derive_tick_arrays(
+     whirlpool: &Pubkey,
+     tick_current_index: i32,
+     tick_spacing: u16,
+diff --git a/src/scanner/mod.rs b/src/scanner/mod.rs
+index 9ef2145..4485256 100644
+--- a/src/scanner/mod.rs
++++ b/src/scanner/mod.rs
+@@ -55,6 +55,17 @@ enum AccountRole {
+     OrcaPoolState,
+     OrcaVaultA,
+     OrcaVaultB,
++    /// One of the 5 tick-array accounts in the current subscription
++    /// window (see `orca::subscription_tick_array_pdas`), identified by
++    /// its position in that fixed-order array (0..5), NOT by its on-chain
++    /// start_tick_index - the window shifts as price moves, so the same
++    /// index can refer to a different account over the life of the
++    /// process. `role_generation` disambiguates a push against a since-
++    /// superseded window from one that matches the current window.
++    OrcaTickArray {
++        index: usize,
++        generation: u64,
++    },
+ }
+ 
+ struct RealtimeEvent {
+@@ -121,6 +132,43 @@ fn publish_cpmm_snapshot(
+     }
+ }
+ 
++/// Publishes the exact-quote OrcaQuoteState (Phase 4 stage 3) whenever
++/// either the pool state or any tick array in the subscription window has
++/// been decoded. Mirrors publish_cpmm_snapshot's "publish whatever we have,
++/// as soon as we have the pool state" shape, but tick_arrays is built from
++/// whichever of the 5 subscribed slots have actually been decoded so far -
++/// this can be fewer than 5 (or even 0) early in the process's life, before
++/// every subscription has pushed its first update. exact_orca_clmm_quote
++/// (analyzer::mod.rs) is responsible for treating too few arrays as a hard
++/// quote failure, not this function - this function publishes whatever is
++/// currently known, honestly, without waiting for full coverage.
++fn publish_orca_exact_snapshot(
++    whirlpool_pubkey: Option<Pubkey>,
++    whirlpool: &Option<orca::Whirlpool>,
++    tick_arrays: &[Option<orca::DecodedTickArray>; 5],
++) {
++    let (Some(pool_pubkey), Some(wp)) = (whirlpool_pubkey, whirlpool.as_ref()) else {
++        return;
++    };
++
++    let loaded_arrays: Vec<orca::DecodedTickArray> =
++        tick_arrays.iter().filter_map(|a| a.clone()).collect();
++
++    orca::publish_orca_quote_state(orca::OrcaQuoteState {
++        whirlpool_pubkey: pool_pubkey,
++        whirlpool: wp.clone(),
++        tick_arrays: loaded_arrays.clone(),
++        slot: None,
++    });
++
++    tracing::debug!(
++        "Orca exact-quote snapshot published: tick_current_index={}, tick_spacing={}, tick_arrays_loaded={}/5",
++        wp.tick_current_index,
++        wp.tick_spacing,
++        loaded_arrays.len()
++    );
++}
++
+ #[allow(clippy::too_many_arguments)]
+ pub async fn run_realtime_loop(
+     ws_url: &str,
+@@ -223,10 +271,87 @@ pub async fn run_realtime_loop(
+             ws_url.to_string(),
+             ctx.token_vault_b.to_string(),
+             AccountRole::OrcaVaultB,
+-            tx,
++            tx.clone(),
+         );
+     }
+ 
++    // Tick-array subscription window (Phase 4 stage 3): fetch the pool's
++    // CURRENT tick_current_index/tick_spacing once up front, derive the
++    // 5-array subscription window around it (orca::subscription_tick_array_pdas),
++    // and subscribe to those 5 accounts.
++    //
++    // KNOWN LIMITATION, stated plainly rather than silently: this window is
++    // fixed for the life of the process. It is NOT re-derived if price
++    // later moves far enough to leave it (a Whirlpool position boundary
++    // crossing into a 4th/5th array beyond what's subscribed). When that
++    // happens, exact_orca_clmm_quote will correctly fail closed with
++    // OrcaInsufficientTickCoverage or return quotes anchored to stale tick
++    // data - Falcon will emit warnings (see the staleness check in the main
++    // loop below) but will NOT automatically re-subscribe to a new window.
++    // Live re-subscription requires an unsubscribe/cleanup path that
++    // realtime::subscribe_to_account does not currently have (each
++    // subscription thread runs for the life of the process with no
++    // cancellation signal) - building that safely is separate follow-up
++    // work, not folded into this stage.
++    let mut orca_tick_window_bounds: Option<(i32, i32)> = None;
++    let orca_tick_array_generation: u64 = 0;
++
++    if let Ok(pool_pubkey) = orca_pool_id.parse::<Pubkey>() {
++        if let Ok(account) = client.get_account(&pool_pubkey) {
++            if let Ok(wp) = orca::decode_whirlpool(&account.data) {
++                match orca::subscription_tick_array_pdas(
++                    &pool_pubkey,
++                    wp.tick_current_index,
++                    wp.tick_spacing,
++                ) {
++                    Ok(window) => {
++                        tracing::info!(
++                            "Orca tick-array subscription window derived at tick {} (spacing {}): {:?}",
++                            wp.tick_current_index,
++                            wp.tick_spacing,
++                            window
++                        );
++                        for (i, pda) in window.iter().enumerate() {
++                            spawn_subscriber(
++                                ws_url.to_string(),
++                                pda.to_string(),
++                                AccountRole::OrcaTickArray {
++                                    index: i,
++                                    generation: orca_tick_array_generation,
++                                },
++                                tx.clone(),
++                            );
++                        }
++
++                        // Bounds of the ticks the 5-array window actually
++                        // covers, used by the staleness check below to warn
++                        // (not re-subscribe - see the KNOWN LIMITATION note
++                        // above) once live price drifts outside what's
++                        // subscribed.
++                        let ticks_in_array =
++                            crate::executor::orca::TICK_ARRAY_SIZE * wp.tick_spacing as i32;
++                        let window_start = crate::executor::orca::tick_array_start_index(
++                            wp.tick_current_index,
++                            wp.tick_spacing,
++                        );
++                        orca_tick_window_bounds = Some((
++                            window_start - 2 * ticks_in_array,
++                            window_start + 3 * ticks_in_array - 1,
++                        ));
++                    }
++                    Err(e) => {
++                        tracing::warn!(
++                            "Failed to derive Orca tick-array subscription window: {} - exact Orca CLMM quoting will be unavailable",
++                            e
++                        );
++                    }
++                }
++            }
++        }
++    }
++
++    drop(tx);
++
+     tracing::info!(
+         "Real-time WebSocket subscriptions started for {} (Raydium mode: {:?})",
+         pair,
+@@ -247,6 +372,9 @@ pub async fn run_realtime_loop(
+     let mut orca_sqrt_price: u128 = 0;
+     let mut orca_liquidity: u128 = 0;
+     let mut orca_fee_rate: u16 = 0;
++    let mut orca_whirlpool_decoded: Option<orca::Whirlpool> = None;
++    let mut orca_tick_arrays: [Option<orca::DecodedTickArray>; 5] = Default::default();
++    let orca_pool_pubkey: Option<Pubkey> = orca_pool_id.parse().ok();
+ 
+     match decoder {
+         DecoderType::Cpmm => {
+@@ -454,6 +582,29 @@ pub async fn run_realtime_loop(
+                     orca_liquidity = whirlpool.liquidity;
+                     orca_fee_rate = whirlpool.fee_rate;
+ 
++                    // Staleness check for the KNOWN LIMITATION documented
++                    // where orca_tick_window_bounds is derived: the 5-array
++                    // subscription window is fixed for the process's life
++                    // and is never re-derived. If live price has drifted
++                    // outside the bounds it covered at startup,
++                    // exact_orca_clmm_quote will start failing closed
++                    // (OrcaInsufficientTickCoverage) or quoting against
++                    // stale tick data for any array still nominally in
++                    // range but no longer adjacent to the live tick. Warn
++                    // loudly rather than let that happen silently.
++                    if let Some((lo, hi)) = orca_tick_window_bounds {
++                        if whirlpool.tick_current_index < lo || whirlpool.tick_current_index > hi {
++                            tracing::warn!(
++                                "Orca current tick {} has drifted outside the subscribed tick-array window [{}, {}] - exact CLMM quoting for this pool is now unreliable (stale or insufficient tick-array coverage). Restart the process to re-derive the subscription window at the current price.",
++                                whirlpool.tick_current_index,
++                                lo,
++                                hi
++                            );
++                        }
++                    }
++
++                    orca_whirlpool_decoded = Some(whirlpool.clone());
++
+                     if let Some(ctx) = &orca_ctx {
+                         last_orca = Some(ctx.price_from_whirlpool_and_reserves(
+                             orca_sqrt_price,
+@@ -464,6 +615,12 @@ pub async fn run_realtime_loop(
+                             pair,
+                         ));
+                     }
++
++                    publish_orca_exact_snapshot(
++                        orca_pool_pubkey,
++                        &orca_whirlpool_decoded,
++                        &orca_tick_arrays,
++                    );
+                 }
+ 
+                 Err(e) => {
+@@ -516,6 +673,80 @@ pub async fn run_realtime_loop(
+                     }
+                 }
+             }
++
++            AccountRole::OrcaTickArray { index, generation } => {
++                if generation != orca_tick_array_generation {
++                    // Push arrived for a subscription window that has
++                    // since been superseded (see the KNOWN LIMITATION note
++                    // where the window is derived: today generation never
++                    // actually advances past 0, so this branch is
++                    // unreachable in practice, but the check is kept as a
++                    // hard guard against ever silently blending two
++                    // different windows' arrays into one OrcaQuoteState if
++                    // dynamic re-subscription is added later without
++                    // updating this check).
++                    tracing::warn!(
++                        "Ignoring Orca tick-array push for stale subscription generation {} (current: {})",
++                        generation,
++                        orca_tick_array_generation
++                    );
++                } else {
++                    match orca::decode_tick_array(&event.update.data) {
++                        Ok(decoded) => {
++                            let expected_whirlpool = orca_pool_pubkey;
++                            let whirlpool_ok = expected_whirlpool
++                                .map(|p| p == decoded.whirlpool)
++                                .unwrap_or(false);
++
++                            if !whirlpool_ok {
++                                tracing::warn!(
++                                    "Orca tick-array push at window slot {} belongs to whirlpool {}, expected {:?} - discarding",
++                                    index,
++                                    decoded.whirlpool,
++                                    expected_whirlpool
++                                );
++                            } else if let Some(wp) = &orca_whirlpool_decoded {
++                                if let Err(e) = orca::validate_tick_array(
++                                    &decoded,
++                                    &decoded.whirlpool,
++                                    wp.tick_spacing,
++                                ) {
++                                    tracing::warn!(
++                                        "Orca tick-array push at window slot {} failed validation: {}",
++                                        index,
++                                        e
++                                    );
++                                } else {
++                                    orca_tick_arrays[index] = Some(decoded);
++                                    publish_orca_exact_snapshot(
++                                        orca_pool_pubkey,
++                                        &orca_whirlpool_decoded,
++                                        &orca_tick_arrays,
++                                    );
++                                }
++                            } else {
++                                // Pool state not decoded yet (e.g. a tick
++                                // array push arrived before the first
++                                // whirlpool push) - store it unvalidated-
++                                // against-tick-spacing for now; it will be
++                                // covered by publish_orca_exact_snapshot's
++                                // next call once the whirlpool push does
++                                // arrive, and by then any genuinely wrong
++                                // array would already have been caught by
++                                // the whirlpool-ownership check above.
++                                orca_tick_arrays[index] = Some(decoded);
++                            }
++                        }
++                        Err(e) => {
++                            tracing::warn!(
++                                "Failed to decode Orca tick-array push at window slot {}: {}",
++                                index,
++                                e
++                            );
++                        }
++                    }
++                }
++            }
+         }
+ 
+         if let (Some(r), Some(o)) = (&last_raydium, &last_orca) {
+diff --git a/src/scanner/orca.rs b/src/scanner/orca.rs
+index 3b0c67c..8e12a76 100644
+--- a/src/scanner/orca.rs
++++ b/src/scanner/orca.rs
+@@ -414,6 +414,54 @@ pub fn current_orca_quote_state() -> Option<OrcaQuoteState> {
+         .and_then(|guard| guard.clone())
+ }
+ 
++// ===========================================================================
++// TICK-ARRAY SUBSCRIPTION SET (Phase 4 stage 3)
++// ===========================================================================
++// The realtime loop needs to know, up front, which tick-array PDAs to
++// WebSocket-subscribe to for a given (whirlpool, tick_current_index,
++// tick_spacing). The executor's legacy swap instruction can only ever
++// submit 3 tick arrays on-chain, and which 3 depends on trade DIRECTION
++// (`executor::orca::derive_tick_arrays`'s `a_to_b` parameter) - a buy and a
++// sell from the same current tick use different, only-partially-overlapping
++// sets of 3.
++//
++// Since the realtime loop does not know ahead of time which direction a
++// future opportunity will trade, it subscribes to the UNION of both
++// direction-specific 3-array sets: the array containing the current tick,
++// plus the 2 arrays below it, plus the 2 arrays above it - 5 arrays total
++// (the current-tick array is shared by both directions' sets, so 3 + 3 - 1
++// = 5, not 6). At quote time and at execution time, each side independently
++// re-derives its own direction-specific 3-of-5 via
++// `executor::orca::derive_tick_arrays` using the SAME tick_current_index and
++// tick_spacing, so quote and execution are guaranteed to select the same 3
++// arrays for a given trade direction without this module needing to predict
++// direction in advance.
++// ===========================================================================
++
++/// The 5 tick-array PDAs the realtime loop subscribes to for a pool at the
++/// given current tick / tick spacing: 2 below, the current array, 2 above.
++/// Covers both possible direction-specific 3-array sets
++/// `executor::orca::derive_tick_arrays` can select.
++pub fn subscription_tick_array_pdas(
++    whirlpool: &Pubkey,
++    tick_current_index: i32,
++    tick_spacing: u16,
++) -> Result<[Pubkey; 5]> {
++    let ticks_in_array = TICK_ARRAY_SIZE as i32 * tick_spacing as i32;
++    let start = crate::executor::orca::tick_array_start_index(tick_current_index, tick_spacing);
++
++    let mut pdas = Vec::with_capacity(5);
++    for offset in [-2, -1, 0, 1, 2] {
++        pdas.push(crate::executor::orca::derive_tick_array_pda(
++            whirlpool,
++            start + offset * ticks_in_array,
++        )?);
++    }
++
++    pdas.try_into()
++        .map_err(|_| anyhow::anyhow!("subscription_tick_array_pdas: expected exactly 5 PDAs"))
++}
++
+ #[derive(Debug, Clone)]
+ pub struct WhirlpoolInfo {
+     pub tick_current_index: i32,
+     

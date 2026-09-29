@@ -1,0 +1,233 @@
+diff --git a/src/analyzer/mod.rs b/src/analyzer/mod.rs
+index 23f1087..56168f0 100644
+--- a/src/analyzer/mod.rs
++++ b/src/analyzer/mod.rs
+@@ -1212,6 +1212,29 @@ mod tests {
+         /// a single loaded array - see `test_whirlpool`'s doc comment.
+         const CURRENT_TICK: i32 = (TICK_ARRAY_SIZE as i32 / 2) * TICK_SPACING as i32;
+ 
++        /// `CURRENT_ORCA_QUOTE_STATE` (in `scanner::orca`) is ONE process-
++        /// global slot, not keyed per pool - `current_orca_quote_state()`
++        /// returns whatever was most recently published by ANY caller,
++        /// regardless of which pool_pubkey that state belongs to. Every
++        /// test in this module that publishes a state and then reads it
++        /// back via `exact_orca_clmm_quote` is therefore racing every other
++        /// such test under the default parallel test runner - a test can
++        /// publish its own state and read back a DIFFERENT test's state
++        /// that landed in the gap between the two calls.
++        ///
++        /// This lock serializes every publish-then-read test in this module
++        /// against every other one, so each test's publish() and its
++        /// subsequent read are guaranteed uninterrupted by another thread.
++        /// It does not fix the global's lack of per-caller isolation in
++        /// production (there, one realtime-loop writer and one analyzer
++        /// reader make this far less exposed) - it only makes the test
++        /// suite deterministic. A real fix would thread an explicit
++        /// `OrcaQuoteState` parameter through `exact_orca_clmm_quote`
++        /// instead of reading a global, removing the shared-state
++        /// requirement entirely; that is a larger refactor left for a
++        /// later stage rather than folded into this test-flakiness fix.
++        static ORCA_STATE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
++
+         fn zero_reward_infos() -> [WhirlpoolRewardInfo; 3] {
+             [
+                 WhirlpoolRewardInfo {
+@@ -1337,6 +1360,26 @@ mod tests {
+             });
+         }
+ 
++        /// Publishes the given state and immediately calls
++        /// `exact_orca_clmm_quote`, holding `ORCA_STATE_TEST_LOCK` for the
++        /// whole publish-then-read critical section. Every test in this
++        /// module that needs "publish this state, then read it back through
++        /// the real quote path" MUST go through this helper rather than
++        /// calling `publish()` and `exact_orca_clmm_quote()` separately -
++        /// see `ORCA_STATE_TEST_LOCK`'s doc comment for why the two calls
++        /// are otherwise racy against every other test in this module.
++        fn publish_and_quote(
++            whirlpool: Whirlpool,
++            pool_pubkey: Pubkey,
++            tick_arrays: Vec<DecodedTickArray>,
++            amount_in: u64,
++            spending_quote: bool,
++        ) -> Result<LegQuote, MathError> {
++            let _guard = ORCA_STATE_TEST_LOCK.lock().unwrap();
++            publish(whirlpool, pool_pubkey, tick_arrays);
++            exact_orca_clmm_quote(amount_in, spending_quote)
++        }
++
+         fn clmm_pool(is_a_wsol: bool) -> PriceUpdate {
+             // Only clmm_liquidity/clmm_is_a_wsol matter for routing into
+             // exact_orca_clmm_quote - the exact math itself reads from the
+@@ -1354,9 +1397,15 @@ mod tests {
+         fn exact_input_quote_within_single_array_is_nonzero_and_below_naive_output() {
+             let pool_pubkey = Pubkey::new_from_array([99u8; 32]);
+             let whirlpool = test_whirlpool(pool_pubkey, 10_000_000_000_000, true);
+-            publish(whirlpool, pool_pubkey, flat_single_array(pool_pubkey));
++            let quote = publish_and_quote(
++                whirlpool,
++                pool_pubkey,
++                flat_single_array(pool_pubkey),
++                1_000_000,
++                true,
++            )
++            .unwrap();
+ 
+-            let quote = exact_orca_clmm_quote(1_000_000, true).unwrap();
+             assert!(quote.amount_out_raw > 0);
+             assert_eq!(quote.amount_in_raw, 1_000_000);
+             // A 0.3% protocol fee is always charged on the input side, so
+@@ -1374,10 +1423,14 @@ mod tests {
+         fn quote_handles_token_a_as_input_when_a_is_wsol() {
+             let pool_pubkey = Pubkey::new_from_array([1u8; 32]);
+             let whirlpool = test_whirlpool(pool_pubkey, 10_000_000_000_000, true); // A = WSOL
+-            publish(whirlpool, pool_pubkey, flat_single_array(pool_pubkey));
+-
+-            // spending_quote = true means spending WSOL = spending token A here.
+-            let result = exact_orca_clmm_quote(500_000, true);
++                                                                                   // spending_quote = true means spending WSOL = spending token A here.
++            let result = publish_and_quote(
++                whirlpool,
++                pool_pubkey,
++                flat_single_array(pool_pubkey),
++                500_000,
++                true,
++            );
+             assert!(
+                 result.is_ok(),
+                 "token-A-input quote should succeed: {result:?}"
+@@ -1390,10 +1443,14 @@ mod tests {
+         fn quote_handles_token_b_as_input_when_b_is_wsol() {
+             let pool_pubkey = Pubkey::new_from_array([2u8; 32]);
+             let whirlpool = test_whirlpool(pool_pubkey, 10_000_000_000_000, false); // B = WSOL
+-            publish(whirlpool, pool_pubkey, flat_single_array(pool_pubkey));
+-
+-            // spending_quote = true means spending WSOL = spending token B here.
+-            let result = exact_orca_clmm_quote(500_000, true);
++                                                                                    // spending_quote = true means spending WSOL = spending token B here.
++            let result = publish_and_quote(
++                whirlpool,
++                pool_pubkey,
++                flat_single_array(pool_pubkey),
++                500_000,
++                true,
++            );
+             assert!(
+                 result.is_ok(),
+                 "token-B-input quote should succeed: {result:?}"
+@@ -1412,21 +1469,25 @@ mod tests {
+             // accounted for - so this test checks direction handling
+             // succeeds cleanly in both cases, not that magnitudes match.
+             let pool_a = Pubkey::new_from_array([3u8; 32]);
+-            publish(
++            let out_a_is_wsol = publish_and_quote(
+                 test_whirlpool(pool_a, 10_000_000_000_000, true),
+                 pool_a,
+                 flat_single_array(pool_a),
+-            );
+-            let out_a_is_wsol = exact_orca_clmm_quote(1_000_000, false).unwrap();
++                1_000_000,
++                false,
++            )
++            .unwrap();
+             assert!(out_a_is_wsol.amount_out_raw > 0);
+ 
+             let pool_b = Pubkey::new_from_array([4u8; 32]);
+-            publish(
++            let out_b_is_wsol = publish_and_quote(
+                 test_whirlpool(pool_b, 10_000_000_000_000, false),
+                 pool_b,
+                 flat_single_array(pool_b),
+-            );
+-            let out_b_is_wsol = exact_orca_clmm_quote(1_000_000, false).unwrap();
++                1_000_000,
++                false,
++            )
++            .unwrap();
+             assert!(out_b_is_wsol.amount_out_raw > 0);
+         }
+ 
+@@ -1442,12 +1503,21 @@ mod tests {
+             // the middle array is CURRENT_TICK itself; pick slot 49 => a
+             // tick index comfortably reachable above the current price).
+             let arrays = three_arrays_with_one_boundary(pool_pubkey, 49, -20_000_000);
+-            publish(whirlpool, pool_pubkey, arrays);
+ 
+-            // A large buy (spending quote/WSOL) should push price up through
+-            // the boundary tick.
+-            let small = exact_orca_clmm_quote(1_000, true).unwrap();
+-            let large = exact_orca_clmm_quote(5_000_000, true).unwrap();
++            // Both reads must happen against the SAME published state and
++            // without another test's publish() landing in between, so both
++            // calls stay inside one locked critical section rather than
++            // going through publish_and_quote (which only covers a single
++            // read per publish).
++            let (small, large) = {
++                let _guard = ORCA_STATE_TEST_LOCK.lock().unwrap();
++                publish(whirlpool, pool_pubkey, arrays);
++                // A large buy (spending quote/WSOL) should push price up
++                // through the boundary tick.
++                let small = exact_orca_clmm_quote(1_000, true).unwrap();
++                let large = exact_orca_clmm_quote(5_000_000, true).unwrap();
++                (small, large)
++            };
+ 
+             // Sanity: larger input still yields more output than a tiny
+             // input, and both succeed - i.e. tick-crossing didn't break the
+@@ -1478,9 +1548,7 @@ mod tests {
+                 fee_growth_outside_b: 0,
+                 reward_growths_outside: [0, 0, 0],
+             };
+-            publish(whirlpool, pool_pubkey, arrays);
+-
+-            let result = exact_orca_clmm_quote(500_000, true);
++            let result = publish_and_quote(whirlpool, pool_pubkey, arrays, 500_000, true);
+             assert!(
+                 result.is_ok(),
+                 "multi-tick-crossing quote should still resolve: {result:?}"
+@@ -1490,7 +1558,43 @@ mod tests {
+         // --- Test 6: insufficient tick-array coverage ---
+ 
+         #[test]
+-        fn quote_fails_cleanly_when_no_tick_arrays_are_loaded() {
++        fn empty_tick_arrays_is_rejected_by_build_tick_arrays() {
++            // Exercises the exact same code path exact_orca_clmm_quote takes
++            // when state.tick_arrays.is_empty() - checked directly against
++            // the pure function rather than through the shared
++            // CURRENT_ORCA_QUOTE_STATE global, which other tests in this
++            // binary write to concurrently under the default (parallel)
++            // test runner. A publish-then-immediately-read against a
++            // process-global is not safe to assert on across threads: another
++            // test can publish its own (valid, non-empty) state in the gap
++            // between this test's publish() and its read, making the
++            // assertion flaky rather than deterministic. See
++            // `quote_fails_cleanly_when_no_tick_arrays_are_loaded_serial`
++            // below for an end-to-end version of this same check, run with
++            // explicit serialization.
++            let result = build_tick_arrays(&[]);
++            assert!(matches!(
++                result,
++                Err(MathError::OrcaInsufficientTickCoverage)
++            ));
++        }
++
++        /// End-to-end version of the empty-coverage check, going through
++        /// `exact_orca_clmm_quote` and the real `OrcaQuoteState` global -
++        /// this catches a regression in the `state.tick_arrays.is_empty()`
++        /// short-circuit itself (the check that runs BEFORE
++        /// `build_tick_arrays` is ever called), which the pure
++        /// `build_tick_arrays` test above cannot see.
++        ///
++        /// This test takes `ORCA_STATE_TEST_LOCK` for its entire body,
++        /// serializing it against every other test in this module that also
++        /// takes the lock, so no other thread can publish a competing state
++        /// to `CURRENT_ORCA_QUOTE_STATE` between this test's publish() and
++        /// its read.
++        #[test]
++        fn quote_fails_cleanly_when_no_tick_arrays_are_loaded_serial() {
++            let _guard = ORCA_STATE_TEST_LOCK.lock().unwrap();
++
+             let pool_pubkey = Pubkey::new_from_array([7u8; 32]);
+             let whirlpool = test_whirlpool(pool_pubkey, 10_000_000_000_000, true);
+             publish(whirlpool, pool_pubkey, vec![]); // no arrays at all
+             

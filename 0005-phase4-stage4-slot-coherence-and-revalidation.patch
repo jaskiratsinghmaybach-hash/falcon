@@ -1,0 +1,771 @@
+diff --git a/src/analyzer/mod.rs b/src/analyzer/mod.rs
+index 010ac88..8630700 100644
+--- a/src/analyzer/mod.rs
++++ b/src/analyzer/mod.rs
+@@ -118,6 +118,8 @@ pub enum MathError {
+     OrcaQuoteFailed(&'static str),
+     #[error("Orca tick array coverage insufficient for this swap size (needed more arrays than currently loaded)")]
+     OrcaInsufficientTickCoverage,
++    #[error("Orca quote state incoherent: tick array(s) drifted {worst_drift} slots from pool account (max allowed: {})", crate::scanner::orca::MAX_COHERENT_SLOT_DRIFT)]
++    OrcaStateIncoherent { worst_drift: u64 },
+ }
+ 
+ /// How many base-token raw units you receive for spending `input_quote_raw`
+@@ -585,10 +587,23 @@ fn exact_orca_clmm_quote(amount_in: u64, spending_quote: bool) -> Result<LegQuot
+         ));
+     }
+ 
++    // State-slot coherence gate (Phase 4): refuse to quote against a
++    // snapshot where the tick arrays are stale relative to the pool
++    // account, rather than silently combining old tick state with new pool
++    // state (or vice versa). See OrcaQuoteState::coherence_status and
++    // MAX_COHERENT_SLOT_DRIFT for what "stale" means here.
++    if let crate::scanner::orca::CoherenceStatus::Incoherent { worst_drift } =
++        state.coherence_status()
++    {
++        return Err(MathError::OrcaStateIncoherent { worst_drift });
++    }
++
+     let is_a_wsol = state.whirlpool.token_mint_a.to_string() == crate::scanner::orca::WSOL_MINT;
+     let specified_token_a = spending_quote == is_a_wsol;
+ 
+-    let tick_arrays = build_tick_arrays(&state.tick_arrays)?;
++    let arrays_only: Vec<crate::scanner::orca::DecodedTickArray> =
++        state.tick_arrays.iter().map(|s| s.array.clone()).collect();
++    let tick_arrays = build_tick_arrays(&arrays_only)?;
+     let whirlpool_facade = state.whirlpool.to_facade();
+ 
+     let timestamp = std::time::SystemTime::now()
+@@ -627,6 +642,138 @@ fn exact_orca_clmm_quote(amount_in: u64, spending_quote: bool) -> Result<LegQuot
+     })
+ }
+ 
++// ===========================================================================
++// PRE-SIMULATION REVALIDATION (Phase 4)
++// ===========================================================================
++// Runs immediately before an approved opportunity is simulated. The
++// opportunity was priced from a snapshot some time ago; by the time we're
++// about to spend an RPC simulation on it, the world may have moved. This
++// is a pure decision function over an already-captured snapshot (no RPC,
++// no globals besides what the caller passes in), so every branch is
++// unit-testable. It never "repairs" anything: any failure means the
++// opportunity is discarded and must be re-quoted from fresh state.
++// ===========================================================================
++
++/// Maximum number of slots the Orca snapshot may lag behind the newest slot
++/// the realtime loop has observed on ANY subscribed account before the
++/// opportunity is considered stale. ~400ms per slot, so this is roughly two
++/// seconds: long enough to survive normal WebSocket notification jitter,
++/// short enough that a wedged subscription can't feed simulations.
++pub const MAX_SNAPSHOT_LAG_SLOTS: u64 = 5;
++
++/// Why an approved opportunity was refused at the pre-simulation gate.
++#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
++pub enum RevalidationError {
++    #[error("no Orca quote snapshot available")]
++    NoSnapshot,
++    #[error("Orca snapshot incoherent: worst tick-array slot drift {worst_drift}")]
++    Incoherent { worst_drift: u64 },
++    #[error("Orca snapshot is {lag} slots behind newest observed slot {newest_slot} (max {max})")]
++    SnapshotTooOld {
++        lag: u64,
++        newest_slot: u64,
++        max: u64,
++    },
++    #[error(
++        "tick array containing current tick (start {expected_start}) is missing from the snapshot"
++    )]
++    CurrentTickArrayMissing { expected_start: i32 },
++    #[error("tick array required by the executor for this direction (start {start}) is not in the snapshot")]
++    ExecutionArrayMissing { start: i32 },
++}
++
++/// Validates an Orca snapshot for a trade in direction `a_to_b`.
++///
++/// `newest_observed_slot` is the highest `context.slot` the realtime loop
++/// has seen on any subscribed account. Pass the same value the caller would
++/// use to decide "how fresh is fresh".
++pub fn revalidate_orca_snapshot(
++    state: &crate::scanner::orca::OrcaQuoteState,
++    a_to_b: bool,
++    newest_observed_slot: u64,
++) -> Result<(), RevalidationError> {
++    use crate::executor::orca::{tick_array_start_index, TICK_ARRAY_SIZE};
++
++    // 1. Coherence across pool + tick arrays.
++    if let crate::scanner::orca::CoherenceStatus::Incoherent { worst_drift } =
++        state.coherence_status()
++    {
++        return Err(RevalidationError::Incoherent { worst_drift });
++    }
++
++    // 2. Age of the snapshot itself. The oldest component decides.
++    let oldest_slot = state
++        .tick_arrays
++        .iter()
++        .map(|s| s.slot)
++        .chain(std::iter::once(state.pool_slot))
++        .min()
++        .unwrap_or(state.pool_slot);
++    let lag = newest_observed_slot.saturating_sub(oldest_slot);
++    if lag > MAX_SNAPSHOT_LAG_SLOTS {
++        return Err(RevalidationError::SnapshotTooOld {
++            lag,
++            newest_slot: newest_observed_slot,
++            max: MAX_SNAPSHOT_LAG_SLOTS,
++        });
++    }
++
++    let spacing = state.whirlpool.tick_spacing;
++    let ticks_in_array = TICK_ARRAY_SIZE * spacing as i32;
++    let current_start = tick_array_start_index(state.whirlpool.tick_current_index, spacing);
++
++    let have = |start: i32| {
++        state
++            .tick_arrays
++            .iter()
++            .any(|s| s.array.start_tick_index == start)
++    };
++
++    // 3. The on-chain legacy swap requires tick_array_0 to contain the
++    //    pool's CURRENT price at execution time. If the pool has since moved
++    //    into a neighbouring array and we never loaded it, the quote and the
++    //    transaction would disagree.
++    if !have(current_start) {
++        return Err(RevalidationError::CurrentTickArrayMissing {
++            expected_start: current_start,
++        });
++    }
++
++    // 4. Every array the executor will submit for this direction must be in
++    //    the snapshot the quote used - same rule, same source of truth
++    //    (executor::orca::derive_tick_arrays uses offsets [0,-1,-2] / [0,1,2]).
++    let offsets: [i32; 3] = if a_to_b { [0, -1, -2] } else { [0, 1, 2] };
++    for off in offsets {
++        let start = current_start + off * ticks_in_array;
++        if !have(start) {
++            return Err(RevalidationError::ExecutionArrayMissing { start });
++        }
++    }
++
++    Ok(())
++}
++
++/// Direction of the Orca leg, derived exactly the way the executor derives
++/// it (`a_to_b = token_mint_a == input_mint`), from the snapshot's own token
++/// A mint. `orca_is_buy_leg` is true when Orca is where we BUY the base token
++/// (so the input is WSOL) and false when Orca is where we SELL it (input is
++/// the base token). One rule, evaluated against the same pool state the quote
++/// used, so the gate and the executor cannot silently disagree.
++pub fn orca_leg_a_to_b(
++    state: &crate::scanner::orca::OrcaQuoteState,
++    orca_is_buy_leg: bool,
++) -> bool {
++    let token_a_is_wsol =
++        state.whirlpool.token_mint_a.to_string() == crate::scanner::orca::WSOL_MINT;
++    // Input is WSOL on a buy, base on a sell. a_to_b means "input is token A".
++    // Buy:  a_to_b iff A is WSOL.   Sell: a_to_b iff A is NOT WSOL (A is base).
++    if orca_is_buy_leg {
++        token_a_is_wsol
++    } else {
++        !token_a_is_wsol
++    }
++}
++
+ fn estimate_leg_quote(
+     pool: &crate::scanner::PriceUpdate,
+     amount_in: u64,
+@@ -1354,11 +1501,34 @@ mod tests {
+         }
+ 
+         fn publish(whirlpool: Whirlpool, pool_pubkey: Pubkey, tick_arrays: Vec<DecodedTickArray>) {
++            // Existing tests don't care about slot coherence, so every
++            // array shares the pool's slot (drift = 0, always coherent).
++            publish_with_slots(whirlpool, pool_pubkey, 100, tick_arrays, |_| 100);
++        }
++
++        /// Publishes a state where the pool sits at `pool_slot` and each
++        /// tick array's slot is chosen by `slot_for_array(index)`. Used by
++        /// the coherence tests to build deliberately-incoherent snapshots.
++        fn publish_with_slots(
++            whirlpool: Whirlpool,
++            pool_pubkey: Pubkey,
++            pool_slot: u64,
++            tick_arrays: Vec<DecodedTickArray>,
++            slot_for_array: impl Fn(usize) -> u64,
++        ) {
++            let slotted = tick_arrays
++                .into_iter()
++                .enumerate()
++                .map(|(i, array)| crate::scanner::orca::SlottedTickArray {
++                    array,
++                    slot: slot_for_array(i),
++                })
++                .collect();
+             publish_orca_quote_state(OrcaQuoteState {
+                 whirlpool_pubkey: pool_pubkey,
+                 whirlpool,
+-                tick_arrays,
+-                slot: Some(1),
++                tick_arrays: slotted,
++                pool_slot,
+             });
+         }
+ 
+@@ -1627,7 +1797,265 @@ mod tests {
+             ));
+         }
+ 
+-        // --- Test 9: stale/no state published yet ---
++        // --- Tests 9/10: stale state and coherent snapshot validation ---
++
++        #[test]
++        fn coherent_snapshot_within_slot_tolerance_quotes_successfully() {
++            let pool_pubkey = Pubkey::new_from_array([11u8; 32]);
++            let whirlpool = test_whirlpool(pool_pubkey, 10_000_000_000_000, true);
++            let max = crate::scanner::orca::MAX_COHERENT_SLOT_DRIFT;
++
++            let result = {
++                let _guard = ORCA_STATE_TEST_LOCK.lock().unwrap();
++                // Array is exactly at the tolerance boundary - still coherent.
++                publish_with_slots(
++                    whirlpool,
++                    pool_pubkey,
++                    1_000,
++                    flat_single_array(pool_pubkey),
++                    |_| 1_000 - max,
++                );
++                exact_orca_clmm_quote(500_000, true)
++            };
++            assert!(
++                result.is_ok(),
++                "drift == max must still be coherent: {result:?}"
++            );
++        }
++
++        #[test]
++        fn stale_tick_array_beyond_tolerance_is_rejected() {
++            let pool_pubkey = Pubkey::new_from_array([12u8; 32]);
++            let whirlpool = test_whirlpool(pool_pubkey, 10_000_000_000_000, true);
++            let max = crate::scanner::orca::MAX_COHERENT_SLOT_DRIFT;
++
++            let result = {
++                let _guard = ORCA_STATE_TEST_LOCK.lock().unwrap();
++                // One slot past tolerance: old tick state against newer pool state.
++                publish_with_slots(
++                    whirlpool,
++                    pool_pubkey,
++                    1_000,
++                    flat_single_array(pool_pubkey),
++                    |_| 1_000 - max - 1,
++                );
++                exact_orca_clmm_quote(500_000, true)
++            };
++            assert!(matches!(
++                result,
++                Err(MathError::OrcaStateIncoherent { worst_drift }) if worst_drift == max + 1
++            ));
++        }
++
++        #[test]
++        fn tick_array_newer_than_pool_beyond_tolerance_is_also_rejected() {
++            // Drift is symmetric: a tick array NEWER than the pool account is
++            // just as inconsistent as one that is older.
++            let pool_pubkey = Pubkey::new_from_array([13u8; 32]);
++            let whirlpool = test_whirlpool(pool_pubkey, 10_000_000_000_000, true);
++            let max = crate::scanner::orca::MAX_COHERENT_SLOT_DRIFT;
++
++            let result = {
++                let _guard = ORCA_STATE_TEST_LOCK.lock().unwrap();
++                publish_with_slots(
++                    whirlpool,
++                    pool_pubkey,
++                    1_000,
++                    flat_single_array(pool_pubkey),
++                    |_| 1_000 + max + 1,
++                );
++                exact_orca_clmm_quote(500_000, true)
++            };
++            assert!(matches!(result, Err(MathError::OrcaStateIncoherent { .. })));
++        }
++
++        #[test]
++        fn one_stale_array_among_several_fails_the_whole_snapshot() {
++            let pool_pubkey = Pubkey::new_from_array([14u8; 32]);
++            let whirlpool = test_whirlpool(pool_pubkey, 200_000_000, true);
++            let max = crate::scanner::orca::MAX_COHERENT_SLOT_DRIFT;
++
++            let result = {
++                let _guard = ORCA_STATE_TEST_LOCK.lock().unwrap();
++                publish_with_slots(
++                    whirlpool,
++                    pool_pubkey,
++                    1_000,
++                    three_arrays_with_one_boundary(pool_pubkey, 50, -30_000_000),
++                    // Two fresh arrays, one stale: the worst one decides.
++                    |i| if i == 2 { 1_000 - max - 10 } else { 1_000 },
++                );
++                exact_orca_clmm_quote(500_000, true)
++            };
++            assert!(matches!(
++                result,
++                Err(MathError::OrcaStateIncoherent { worst_drift }) if worst_drift == max + 10
++            ));
++        }
++
++        #[test]
++        fn coherence_status_is_pure_and_reports_worst_drift() {
++            // Direct check of OrcaQuoteState::coherence_status, no global involved.
++            use crate::scanner::orca::{CoherenceStatus, SlottedTickArray};
++            let pool_pubkey = Pubkey::new_from_array([15u8; 32]);
++            let mk = |slot: u64| SlottedTickArray {
++                array: flat_single_array(pool_pubkey).remove(0),
++                slot,
++            };
++            let state = OrcaQuoteState {
++                whirlpool_pubkey: pool_pubkey,
++                whirlpool: test_whirlpool(pool_pubkey, 1, true),
++                tick_arrays: vec![mk(500), mk(497), mk(480)],
++                pool_slot: 500,
++            };
++            assert_eq!(
++                state.coherence_status(),
++                CoherenceStatus::Incoherent { worst_drift: 20 }
++            );
++
++            let ok = OrcaQuoteState {
++                tick_arrays: vec![mk(500), mk(498)],
++                ..state
++            };
++            assert_eq!(ok.coherence_status(), CoherenceStatus::Coherent);
++        }
++
++        // --- Pre-simulation revalidation (pure function, no global) ---
++
++        /// Builds a snapshot whose tick arrays sit at the given offsets (in
++        /// units of one array) from the array containing CURRENT_TICK.
++        fn snapshot_with_offsets(
++            offsets: &[i32],
++            pool_slot: u64,
++            array_slot: u64,
++        ) -> OrcaQuoteState {
++            let pool_pubkey = Pubkey::new_from_array([21u8; 32]);
++            let current_start =
++                crate::executor::orca::tick_array_start_index(CURRENT_TICK, TICK_SPACING);
++            OrcaQuoteState {
++                whirlpool_pubkey: pool_pubkey,
++                whirlpool: test_whirlpool(pool_pubkey, 1_000_000, true),
++                tick_arrays: offsets
++                    .iter()
++                    .map(|off| crate::scanner::orca::SlottedTickArray {
++                        array: DecodedTickArray {
++                            start_tick_index: current_start + off * ARRAY_SPAN,
++                            whirlpool: pool_pubkey,
++                            ticks: [TickFacade::default(); TICK_ARRAY_SIZE],
++                        },
++                        slot: array_slot,
++                    })
++                    .collect(),
++                pool_slot,
++            }
++        }
++
++        #[test]
++        fn revalidation_accepts_full_window_in_both_directions() {
++            let s = snapshot_with_offsets(&[-2, -1, 0, 1, 2], 1_000, 1_000);
++            assert_eq!(revalidate_orca_snapshot(&s, true, 1_000), Ok(()));
++            assert_eq!(revalidate_orca_snapshot(&s, false, 1_000), Ok(()));
++        }
++
++        #[test]
++        fn revalidation_accepts_exactly_the_three_arrays_for_one_direction() {
++            // a_to_b needs [0,-1,-2]; b_to_a needs [0,1,2].
++            let down = snapshot_with_offsets(&[-2, -1, 0], 1_000, 1_000);
++            assert_eq!(revalidate_orca_snapshot(&down, true, 1_000), Ok(()));
++            assert!(matches!(
++                revalidate_orca_snapshot(&down, false, 1_000),
++                Err(RevalidationError::ExecutionArrayMissing { .. })
++            ));
++        }
++
++        #[test]
++        fn revalidation_rejects_missing_current_tick_array() {
++            // Neighbours present, but the array holding the current tick is not.
++            let s = snapshot_with_offsets(&[-2, -1, 1, 2], 1_000, 1_000);
++            assert!(matches!(
++                revalidate_orca_snapshot(&s, true, 1_000),
++                Err(RevalidationError::CurrentTickArrayMissing { .. })
++            ));
++        }
++
++        #[test]
++        fn revalidation_rejects_missing_execution_array() {
++            // Current array present but only one below - a_to_b needs two.
++            let s = snapshot_with_offsets(&[-1, 0, 1, 2], 1_000, 1_000);
++            let err = revalidate_orca_snapshot(&s, true, 1_000).unwrap_err();
++            let current_start =
++                crate::executor::orca::tick_array_start_index(CURRENT_TICK, TICK_SPACING);
++            assert_eq!(
++                err,
++                RevalidationError::ExecutionArrayMissing {
++                    start: current_start - 2 * ARRAY_SPAN
++                }
++            );
++        }
++
++        #[test]
++        fn revalidation_rejects_incoherent_snapshot() {
++            let s = snapshot_with_offsets(&[-2, -1, 0, 1, 2], 1_000, 900);
++            assert!(matches!(
++                revalidate_orca_snapshot(&s, true, 1_000),
++                Err(RevalidationError::Incoherent { worst_drift: 100 })
++            ));
++        }
++
++        #[test]
++        fn revalidation_rejects_snapshot_too_old_even_if_internally_coherent() {
++            // Pool and arrays agree with each other (drift 0) but the whole
++            // snapshot is far behind the newest observed slot.
++            let max = MAX_SNAPSHOT_LAG_SLOTS;
++            let s = snapshot_with_offsets(&[-2, -1, 0, 1, 2], 1_000, 1_000);
++            assert!(matches!(
++                revalidate_orca_snapshot(&s, true, 1_000 + max + 1),
++                Err(RevalidationError::SnapshotTooOld { lag, .. }) if lag == max + 1
++            ));
++            // Exactly at the limit is still acceptable.
++            assert_eq!(revalidate_orca_snapshot(&s, true, 1_000 + max), Ok(()));
++        }
++
++        #[test]
++        fn revalidation_uses_oldest_component_for_lag() {
++            // Pool is fresh, arrays are a few slots behind but still coherent:
++            // the OLDEST component must drive the lag calculation.
++            let max = MAX_SNAPSHOT_LAG_SLOTS;
++            let coherent_gap = crate::scanner::orca::MAX_COHERENT_SLOT_DRIFT;
++            let s = snapshot_with_offsets(&[-2, -1, 0, 1, 2], 1_000, 1_000 - coherent_gap);
++            let newest = 1_000 - coherent_gap + max + 1;
++            assert!(matches!(
++                revalidate_orca_snapshot(&s, true, newest),
++                Err(RevalidationError::SnapshotTooOld { .. })
++            ));
++        }
++
++        #[test]
++        fn revalidation_handles_newest_slot_older_than_snapshot() {
++            // saturating_sub: a caller passing a stale "newest" value must not
++            // underflow/panic.
++            let s = snapshot_with_offsets(&[-2, -1, 0, 1, 2], 1_000, 1_000);
++            assert_eq!(revalidate_orca_snapshot(&s, true, 10), Ok(()));
++        }
++
++        // --- Direction derivation for the pre-simulation gate ---
++
++        #[test]
++        fn orca_leg_direction_matches_executor_rule_for_all_four_cases() {
++            let a_wsol = snapshot_with_offsets(&[0], 1, 1); // token A == WSOL
++            assert!(orca_leg_a_to_b(&a_wsol, true)); // buy: spend WSOL(A) -> a_to_b
++            assert!(!orca_leg_a_to_b(&a_wsol, false)); // sell: spend base(B) -> b_to_a
++
++            let pool_pubkey = Pubkey::new_from_array([22u8; 32]);
++            let b_wsol = OrcaQuoteState {
++                whirlpool: test_whirlpool(pool_pubkey, 1_000_000, false), // token B == WSOL
++                ..snapshot_with_offsets(&[0], 1, 1)
++            };
++            assert!(!orca_leg_a_to_b(&b_wsol, true)); // buy: spend WSOL(B) -> b_to_a
++            assert!(orca_leg_a_to_b(&b_wsol, false)); // sell: spend base(A) -> a_to_b
++        }
++
++        // --- Test 9 (legacy): stale/no state published yet ---
+ 
+         #[test]
+         fn quote_fails_when_no_orca_state_ever_published_for_a_fresh_process() {
+diff --git a/src/scanner/mod.rs b/src/scanner/mod.rs
+index 4485256..e29d1ea 100644
+--- a/src/scanner/mod.rs
++++ b/src/scanner/mod.rs
+@@ -142,30 +142,40 @@ fn publish_cpmm_snapshot(
+ /// (analyzer::mod.rs) is responsible for treating too few arrays as a hard
+ /// quote failure, not this function - this function publishes whatever is
+ /// currently known, honestly, without waiting for full coverage.
++///
++/// `pool_slot` and each tick array's own slot come from the WebSocket
++/// notification's real `context.slot` (threaded through via
++/// `realtime::AccountUpdate::slot`) - not a placeholder - so
++/// `OrcaQuoteState::coherence_status` downstream is checking real drift,
++/// not a fiction.
+ fn publish_orca_exact_snapshot(
+     whirlpool_pubkey: Option<Pubkey>,
+-    whirlpool: &Option<orca::Whirlpool>,
+-    tick_arrays: &[Option<orca::DecodedTickArray>; 5],
++    whirlpool: &Option<(orca::Whirlpool, u64)>,
++    tick_arrays: &[Option<(orca::DecodedTickArray, u64)>; 5],
+ ) {
+-    let (Some(pool_pubkey), Some(wp)) = (whirlpool_pubkey, whirlpool.as_ref()) else {
++    let (Some(pool_pubkey), Some((wp, pool_slot))) = (whirlpool_pubkey, whirlpool.as_ref()) else {
+         return;
+     };
+ 
+-    let loaded_arrays: Vec<orca::DecodedTickArray> =
+-        tick_arrays.iter().filter_map(|a| a.clone()).collect();
++    let loaded_arrays: Vec<orca::SlottedTickArray> = tick_arrays
++        .iter()
++        .filter_map(|a| a.clone())
++        .map(|(array, slot)| orca::SlottedTickArray { array, slot })
++        .collect();
+ 
+     orca::publish_orca_quote_state(orca::OrcaQuoteState {
+         whirlpool_pubkey: pool_pubkey,
+         whirlpool: wp.clone(),
+         tick_arrays: loaded_arrays.clone(),
+-        slot: None,
++        pool_slot: *pool_slot,
+     });
+ 
+     tracing::debug!(
+-        "Orca exact-quote snapshot published: tick_current_index={}, tick_spacing={}, tick_arrays_loaded={}/5",
++        "Orca exact-quote snapshot published: tick_current_index={}, tick_spacing={}, tick_arrays_loaded={}/5, pool_slot={}",
+         wp.tick_current_index,
+         wp.tick_spacing,
+-        loaded_arrays.len()
++        loaded_arrays.len(),
++        pool_slot
+     );
+ }
+ 
+@@ -372,8 +382,8 @@ pub async fn run_realtime_loop(
+     let mut orca_sqrt_price: u128 = 0;
+     let mut orca_liquidity: u128 = 0;
+     let mut orca_fee_rate: u16 = 0;
+-    let mut orca_whirlpool_decoded: Option<orca::Whirlpool> = None;
+-    let mut orca_tick_arrays: [Option<orca::DecodedTickArray>; 5] = Default::default();
++    let mut orca_whirlpool_decoded: Option<(orca::Whirlpool, u64)> = None;
++    let mut orca_tick_arrays: [Option<(orca::DecodedTickArray, u64)>; 5] = Default::default();
+     let orca_pool_pubkey: Option<Pubkey> = orca_pool_id.parse().ok();
+ 
+     match decoder {
+@@ -468,7 +478,13 @@ pub async fn run_realtime_loop(
+         last_orca = Some(p);
+     }
+ 
++    // Highest `context.slot` seen on ANY subscribed account so far. Used by
++    // the pre-simulation gate to judge how far behind the Orca snapshot is.
++    let mut newest_observed_slot: u64 = 0;
++
+     for event in rx {
++        newest_observed_slot = newest_observed_slot.max(event.update.slot);
++
+         tracing::info!(
+             "WebSocket event received: {:?} ({} bytes)",
+             event.role,
+@@ -603,7 +619,7 @@ pub async fn run_realtime_loop(
+                         }
+                     }
+ 
+-                    orca_whirlpool_decoded = Some(whirlpool.clone());
++                    orca_whirlpool_decoded = Some((whirlpool.clone(), event.update.slot));
+ 
+                     if let Some(ctx) = &orca_ctx {
+                         last_orca = Some(ctx.price_from_whirlpool_and_reserves(
+@@ -705,7 +721,7 @@ pub async fn run_realtime_loop(
+                                     decoded.whirlpool,
+                                     expected_whirlpool
+                                 );
+-                            } else if let Some(wp) = &orca_whirlpool_decoded {
++                            } else if let Some((wp, _pool_slot)) = &orca_whirlpool_decoded {
+                                 if let Err(e) = orca::validate_tick_array(
+                                     &decoded,
+                                     &decoded.whirlpool,
+@@ -717,7 +733,7 @@ pub async fn run_realtime_loop(
+                                         e
+                                     );
+                                 } else {
+-                                    orca_tick_arrays[index] = Some(decoded);
++                                    orca_tick_arrays[index] = Some((decoded, event.update.slot));
+                                     publish_orca_exact_snapshot(
+                                         orca_pool_pubkey,
+                                         &orca_whirlpool_decoded,
+@@ -734,7 +750,7 @@ pub async fn run_realtime_loop(
+                                 // arrive, and by then any genuinely wrong
+                                 // array would already have been caught by
+                                 // the whirlpool-ownership check above.
+-                                orca_tick_arrays[index] = Some(decoded);
++                                orca_tick_arrays[index] = Some((decoded, event.update.slot));
+                             }
+                         }
+                         Err(e) => {
+@@ -785,6 +801,47 @@ pub async fn run_realtime_loop(
+ 
+                     let cached_hash = exec_ctx.blockhash_cache.read().ok().map(|guard| *guard);
+ 
++                    // Pre-simulation revalidation (Phase 4). The opportunity
++                    // was priced from a snapshot; before spending a
++                    // simulation on it, confirm that snapshot is still
++                    // coherent, fresh, and covers exactly the tick arrays
++                    // the executor will submit. Any failure discards the
++                    // opportunity - it is never "repaired" here, it must be
++                    // re-quoted from fresh state on a later push.
++                    let orca_is_buy_leg = opp.buy_dex == "Orca";
++                    let revalidation = match orca::current_orca_quote_state() {
++                        Some(state) => analyzer::revalidate_orca_snapshot(
++                            &state,
++                            analyzer::orca_leg_a_to_b(&state, orca_is_buy_leg),
++                            newest_observed_slot,
++                        ),
++                        None => Err(analyzer::RevalidationError::NoSnapshot),
++                    };
++
++                    if let Err(reason) = revalidation {
++                        tracing::warn!(
++                            "Discarding opportunity before simulation - pre-simulation revalidation failed: {}",
++                            reason
++                        );
++                        let _ = crate::logger::log_row(
++                            pair,
++                            r.price,
++                            o.price,
++                            r.base_liquidity,
++                            r.quote_liquidity,
++                            o.base_liquidity,
++                            o.quote_liquidity,
++                            &opp.buy_dex,
++                            &opp.sell_dex,
++                            opp.raw_spread_pct,
++                            opp.fee_adjusted_spread_pct,
++                            opp.net_spread_after_slippage_pct,
++                            opp.net_profit_pct,
++                            &format!("DISCARDED_REVALIDATION: {}", reason),
++                        );
++                        continue;
++                    }
++
+                     match executor::simulate_opportunity(
+                         &exec_ctx.client,
+                         &exec_ctx.payer,
+diff --git a/src/scanner/orca.rs b/src/scanner/orca.rs
+index 8e12a76..156feec 100644
+--- a/src/scanner/orca.rs
++++ b/src/scanner/orca.rs
+@@ -382,12 +382,70 @@ pub struct OrcaQuoteState {
+     /// Currently loaded/valid tick arrays for this pool, ordered by
+     /// ascending `start_tick_index`. NOT guaranteed to be exactly 3, 5, or
+     /// any fixed count - callers must size their `TickArrays` conversion
+-    /// off `.len()`, not assume a fixed arity.
+-    pub tick_arrays: Vec<DecodedTickArray>,
+-    /// The RPC/account slot this snapshot was assembled from, when known.
+-    /// Used by the analyzer's pre-simulation revalidation to detect a
+-    /// stale snapshot (state/slot awareness - Phase 4 item 5).
+-    pub slot: Option<u64>,
++    /// off `.len()`, not assume a fixed arity. Each entry carries its own
++    /// slot (`SlottedTickArray`) rather than assuming it shares the pool's.
++    pub tick_arrays: Vec<SlottedTickArray>,
++    /// The slot the Whirlpool POOL account push (not the tick arrays) was
++    /// read at, per the WebSocket notification's own `context.slot` - the
++    /// actual RPC-reported slot, not a placeholder. This is the anchor
++    /// `coherence_status` below compares every tick array's slot against.
++    pub pool_slot: u64,
++}
++
++/// A tick array paired with the slot its OWN push was read at. Tick arrays
++/// and the pool account arrive as separate WebSocket pushes and can (and
++/// routinely will) be current as of different slots - representing that
++/// explicitly, rather than assuming one slot for the whole snapshot, is
++/// what makes `coherence_status` below a real check instead of a fiction.
++#[derive(Debug, Clone)]
++pub struct SlottedTickArray {
++    pub array: DecodedTickArray,
++    pub slot: u64,
++}
++
++/// How far apart (in slots) a tick array's own push is allowed to be from
++/// the pool account's push before the snapshot is treated as incoherent.
++/// Solana produces a new slot roughly every 400ms; a handful of slots of
++/// drift between a pool push and a tick-array push is normal and expected
++/// under independent WebSocket subscriptions arriving via separate
++/// notifications, not a sign of a stale/broken state. This is deliberately
++/// a small, conservative window - the Phase 4 spec's explicit example is
++/// "do not combine old pool state + new vault state + old tick state
++/// without detecting the inconsistency", and a wide tolerance here would
++/// let exactly that kind of mismatch through undetected.
++pub const MAX_COHERENT_SLOT_DRIFT: u64 = 5;
++
++/// Result of checking whether every tick array in a snapshot is within
++/// `MAX_COHERENT_SLOT_DRIFT` of the pool's own slot.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum CoherenceStatus {
++    /// Every tick array's slot is within tolerance of `pool_slot`.
++    Coherent,
++    /// At least one tick array's slot differs from `pool_slot` by more than
++    /// `MAX_COHERENT_SLOT_DRIFT`. Carries the worst (largest) drift found,
++    /// for logging/diagnostics.
++    Incoherent { worst_drift: u64 },
++}
++
++impl OrcaQuoteState {
++    /// Checks state-slot coherence across the pool account and every tick
++    /// array in this snapshot (Phase 4: "a quote must represent a coherent
++    /// state snapshot"). Does NOT look at slots outside this struct (e.g.
++    /// the vault balances used for the generic-approximation price feed) -
++    /// this specifically governs the exact-quote path's own inputs.
++    pub fn coherence_status(&self) -> CoherenceStatus {
++        let mut worst_drift = 0u64;
++        for slotted in &self.tick_arrays {
++            let drift = self.pool_slot.abs_diff(slotted.slot);
++            worst_drift = worst_drift.max(drift);
++        }
++
++        if worst_drift > MAX_COHERENT_SLOT_DRIFT {
++            CoherenceStatus::Incoherent { worst_drift }
++        } else {
++            CoherenceStatus::Coherent
++        }
++    }
+ }
+ 
+ static CURRENT_ORCA_QUOTE_STATE: OnceLock<RwLock<Option<OrcaQuoteState>>> = OnceLock::new();
+@@ -401,6 +459,12 @@ fn orca_quote_state_store() -> &'static RwLock<Option<OrcaQuoteState>> {
+ /// Mirrors `raydium_cpmm::publish_quote_state`. Falcon currently monitors
+ /// one configured Orca Whirlpool pool at a time, so a single canonical
+ /// snapshot (rather than a per-pool map) matches the existing architecture.
++///
++/// Deliberately does NOT reject an incoherent snapshot here - publishing is
++/// "here is the latest data we have", not a correctness gate. The coherence
++/// check is enforced at READ time (`exact_orca_clmm_quote`, right before a
++/// quote is actually produced), which is where "never silently quote using
++/// stale or incomplete tick state" actually needs to bite.
+ pub fn publish_orca_quote_state(state: OrcaQuoteState) {
+     if let Ok(mut guard) = orca_quote_state_store().write() {
+         *guard = Some(state);
+diff --git a/src/scanner/realtime.rs b/src/scanner/realtime.rs
+index 415b90c..3f3905b 100644
+--- a/src/scanner/realtime.rs
++++ b/src/scanner/realtime.rs
+@@ -11,6 +11,12 @@ use std::sync::mpsc;
+ pub struct AccountUpdate {
+     pub data: Vec<u8>,
+     pub owner: Pubkey,
++    /// The RPC/account slot this push's `context.slot` reported - i.e. the
++    /// slot this account's state was current as of. Used for state-slot
++    /// coherence checks (Phase 4): combining data from two pushes with
++    /// different slots without detecting the gap is exactly the "old pool
++    /// state + new vault state" inconsistency the phase spec warns against.
++    pub slot: u64,
+ }
+ 
+ /// Subscribes to a single account over WebSocket and streams raw decoded bytes
+@@ -36,6 +42,7 @@ pub fn subscribe_to_account(
+     loop {
+         match receiver.recv() {
+             Ok(response) => {
++                let slot = response.context.slot;
+                 let ui_account = response.value;
+ 
+                 let data_bytes = match ui_account.data.decode() {
+@@ -51,6 +58,7 @@ pub fn subscribe_to_account(
+                 let update = AccountUpdate {
+                     data: data_bytes,
+                     owner,
++                    slot,
+                 };
+ 
+                 if tx.send(update).is_err() {
+                 

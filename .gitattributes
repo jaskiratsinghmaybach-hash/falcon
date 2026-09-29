@@ -1,0 +1,5 @@
+# executor/mod.rs uses CRLF line endings (pre-existing convention in this
+# repo, before Phase 4 work began). Declaring it explicitly stops
+# `git diff --check` and `git apply` from treating every CRLF line as
+# trailing whitespace, and stops tooling from silently normalizing it to LF.
+src/executor/mod.rs text eol=crlf

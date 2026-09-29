@@ -1,0 +1,2938 @@
+diff --git a/.gitattributes b/.gitattributes
+new file mode 100644
+index 0000000..368e2d8
+--- /dev/null
++++ b/.gitattributes
+@@ -0,0 +1,5 @@
++# executor/mod.rs uses CRLF line endings (pre-existing convention in this
++# repo, before Phase 4 work began). Declaring it explicitly stops
++# `git diff --check` and `git apply` from treating every CRLF line as
++# trailing whitespace, and stops tooling from silently normalizing it to LF.
++src/executor/mod.rs text eol=crlf
+diff --git a/src/analyzer/mod.rs b/src/analyzer/mod.rs
+index 8630700..ec68284 100644
+--- a/src/analyzer/mod.rs
++++ b/src/analyzer/mod.rs
+@@ -43,7 +43,7 @@ pub struct Opportunity {
+     /// Exact raw lamports the sell leg is expected to produce.
+     pub expected_output_after_sell_raw: u64,
+     /// Net profit in lamports (final SOL back minus SOL spent minus fixed
+-    /// tx/tip costs). Signed because a losing trade has a real negative
++    /// tx fees). Signed because a losing trade has a real negative
+     /// value, not just "not approved". THIS is the authoritative
+     /// approve/reject quantity - see find_opportunity's final check.
+     pub net_profit_lamports: i128,
+@@ -79,6 +79,9 @@ pub enum RejectReason {
+         age_secs: u64,
+         max_age_secs: u64,
+     },
++    /// The cost model's arithmetic failed. This is NOT a market outcome, so it
++    /// must not be reported as "no spread".
++    ArithmeticFailure,
+ }
+ 
+ impl RejectReason {
+@@ -93,6 +96,7 @@ impl RejectReason {
+                 net_profit_lamports,
+             } => *net_profit_lamports as f64 / 1_000_000_000.0,
+             RejectReason::StalePrice { age_secs, .. } => *age_secs as f64,
++            RejectReason::ArithmeticFailure => 0.0,
+         }
+     }
+ }
+@@ -120,6 +124,12 @@ pub enum MathError {
+     OrcaInsufficientTickCoverage,
+     #[error("Orca quote state incoherent: tick array(s) drifted {worst_drift} slots from pool account (max allowed: {})", crate::scanner::orca::MAX_COHERENT_SLOT_DRIFT)]
+     OrcaStateIncoherent { worst_drift: u64 },
++    #[error("Raydium CPMM quote state is not initialized")]
++    CpmmQuoteStateUnavailable,
++    /// Raydium CPMM's own typed quote error, preserved (it used to be
++    /// discarded into a generic string) so failures can be classified.
++    #[error("Raydium CPMM exact quote failed: {0:?}")]
++    CpmmQuote(raydium_cpmm::CpmmQuoteError),
+ }
+ 
+ /// How many base-token raw units you receive for spending `input_quote_raw`
+@@ -303,18 +313,32 @@ fn estimate_curve_price_impact_bps(
+     Ok((BPS_DENOMINATOR as i128) - execution_over_spot_bps as i128)
+ }
+ 
+-/// Fixed per-transaction costs (base fee + tip), in lamports. Kept as a
+-/// function (not a bare constant) so the Jito-aware version can replace this
+-/// later without touching call sites - per the roadmap, tip sizing becomes
+-/// profit-aware at the Jito-bundle stage, not before.
++/// Fixed lamport cost of Falcon's single atomic transaction: the base
++/// signature fee plus the priority fee the executor actually requests. Read
++/// from `config`'s cost model - the same constants the executor passes to
++/// `set_compute_unit_limit` / `set_compute_unit_price` - so the analyzer
++/// prices exactly what the chain will charge. There is no Jito tip: Jito is
++/// not part of the current execution path.
+ fn fixed_cost_lamports() -> Result<i128, MathError> {
+-    const BASE_TX_FEE_LAMPORTS: i128 = 5_000; // 0.000005 SOL
+-    const JITO_TIP_LAMPORTS: i128 = 100_000; // 0.0001 SOL (placeholder - see roadmap)
+-    const NUM_TRANSACTIONS: i128 = 2;
++    fixed_cost_from(
++        crate::config::TX_SIGNATURES,
++        crate::config::COMPUTE_UNIT_LIMIT,
++        crate::config::COMPUTE_UNIT_PRICE_MICRO_LAMPORTS,
++    )
++}
+ 
+-    (BASE_TX_FEE_LAMPORTS + JITO_TIP_LAMPORTS)
+-        .checked_mul(NUM_TRANSACTIONS)
+-        .ok_or(MathError::Overflow("fixed_cost_lamports"))
++fn fixed_cost_from(
++    signatures: u64,
++    compute_unit_limit: u32,
++    compute_unit_price_micro_lamports: u64,
++) -> Result<i128, MathError> {
++    crate::config::fixed_tx_cost_lamports(
++        signatures,
++        compute_unit_limit,
++        compute_unit_price_micro_lamports,
++    )
++    .map(i128::from)
++    .ok_or(MathError::Overflow("fixed_cost_lamports"))
+ }
+ 
+ /// Picks a trade size that's reasonable relative to the thinner pool's depth
+@@ -358,7 +382,7 @@ pub fn calculate_minimum_out_raw(
+     // Ceiling division so the reduction is never understated (never makes
+     // minimum_out weaker/looser than the stated tolerance): ceil(a/b) =
+     // (a + b - 1) / b for positive integers.
+-    let reduction = (raw_reduction + BPS_DENOMINATOR - 1) / BPS_DENOMINATOR;
++    let reduction = raw_reduction.div_ceil(BPS_DENOMINATOR);
+ 
+     let minimum_out = expected.saturating_sub(reduction);
+ 
+@@ -780,12 +804,11 @@ fn estimate_leg_quote(
+     spending_quote: bool,
+ ) -> Result<LegQuote, MathError> {
+     if pool.dex == "RaydiumCPMM" {
+-        let state = raydium_cpmm::current_quote_state().ok_or(MathError::InvalidInput(
+-            "Raydium CPMM quote state is not initialized",
+-        ))?;
++        let state =
++            raydium_cpmm::current_quote_state().ok_or(MathError::CpmmQuoteStateUnavailable)?;
+ 
+         let quote = raydium_cpmm::quote_base_input(&state, amount_in, spending_quote)
+-            .map_err(|_| MathError::InvalidInput("Raydium CPMM exact quote unavailable"))?;
++            .map_err(MathError::CpmmQuote)?;
+ 
+         let impact = estimate_curve_price_impact_bps(
+             quote.effective_reserve_in_raw,
+@@ -927,7 +950,7 @@ pub fn find_opportunity(
+     // --- authoritative decision: actual integer lamport PnL, not a percentage ---
+     let fixed_cost = match fixed_cost_lamports() {
+         Ok(v) => v,
+-        Err(_) => return Err(RejectReason::NoSpread),
++        Err(_) => return Err(RejectReason::ArithmeticFailure),
+     };
+ 
+     let net_profit_lamports =
+@@ -1271,6 +1294,96 @@ mod tests {
+         assert!(result.is_err(), "expected rejection for unprofitable trade");
+     }
+ 
++    // --- fixed transaction cost (no Jito placeholder) ---
++
++    #[test]
++    fn fixed_cost_is_the_real_atomic_tx_cost_not_the_old_jito_placeholder() {
++        // 1 signature (5_000) + 350_000 CU * 25_000 micro-lamports (8_750) = 13_750.
++        // The removed placeholder charged (5_000 + 100_000) * 2 = 210_000.
++        assert_eq!(fixed_cost_lamports().unwrap(), 13_750);
++        assert_ne!(fixed_cost_lamports().unwrap(), 210_000);
++    }
++
++    #[test]
++    fn analyzer_and_executor_cost_constants_are_the_same_source() {
++        // The analyzer prices from config; the executor passes the same
++        // config constants to set_compute_unit_limit/price. Recomputing the
++        // cost from those exact constants must equal what the analyzer uses.
++        let from_shared = crate::config::fixed_tx_cost_lamports(
++            crate::config::TX_SIGNATURES,
++            crate::config::COMPUTE_UNIT_LIMIT,
++            crate::config::COMPUTE_UNIT_PRICE_MICRO_LAMPORTS,
++        )
++        .unwrap();
++        assert_eq!(fixed_cost_lamports().unwrap(), i128::from(from_shared));
++    }
++
++    #[test]
++    fn net_profit_lamports_subtracts_exactly_the_fixed_cost() {
++        // Same market, two different trade sizes can't isolate the cost, so
++        // recompute: profit == sell_output - trade_size - fixed_cost, exactly.
++        let a = pu("A", 1_000_000_000_000, 1_000_000_000_000, 1, 1_000_000);
++        let b = pu("B", 1_000_000_000_000, 1_100_000_000_000, 1, 1_000_000);
++        let opp = find_opportunity(&a, &b, 50_000_000).unwrap();
++        assert_eq!(
++            opp.net_profit_lamports,
++            opp.expected_output_after_sell_raw as i128
++                - opp.trade_size_lamports as i128
++                - fixed_cost_lamports().unwrap()
++        );
++    }
++
++    #[test]
++    fn trade_profitable_only_after_removing_the_fake_tip_is_now_approved() {
++        // Find a tiny trade whose gross gain sits between the real cost
++        // (13_750) and the old placeholder cost (210_000): the old code
++        // rejected it, the real cost model must approve it.
++        let a = pu("A", 1_000_000_000_000, 1_000_000_000_000, 1, 1_000_000);
++        let b = pu("B", 1_000_000_000_000, 1_100_000_000_000, 1, 1_000_000);
++
++        let mut found = false;
++        for size in [
++            100_000u64, 200_000, 400_000, 800_000, 1_600_000, 3_200_000, 6_400_000,
++        ] {
++            if let Ok(opp) = find_opportunity(&a, &b, size) {
++                let gross =
++                    opp.expected_output_after_sell_raw as i128 - opp.trade_size_lamports as i128;
++                if gross > 13_750 && gross <= 210_000 {
++                    assert!(opp.net_profit_lamports > 0);
++                    found = true;
++                    break;
++                }
++            }
++        }
++        assert!(
++            found,
++            "expected at least one size with real cost < gross gain <= old placeholder cost"
++        );
++    }
++
++    #[test]
++    fn fixed_cost_overflow_is_an_error_not_a_wrapped_value() {
++        assert!(matches!(
++            fixed_cost_from(u64::MAX, 0, 0),
++            Err(MathError::Overflow(_))
++        ));
++        assert!(matches!(
++            fixed_cost_from(1, u32::MAX, u64::MAX),
++            Err(MathError::Overflow(_))
++        ));
++        // Sanity: the same function with real inputs still succeeds.
++        assert_eq!(fixed_cost_from(1, 350_000, 25_000).unwrap(), 13_750);
++    }
++
++    #[test]
++    fn arithmetic_failure_reject_reason_is_distinct_from_no_spread() {
++        assert_ne!(
++            format!("{:?}", RejectReason::ArithmeticFailure),
++            format!("{:?}", RejectReason::NoSpread)
++        );
++        assert_eq!(RejectReason::ArithmeticFailure.as_display_pct(), 0.0);
++    }
++
+     // 14. rounding direction
+     #[test]
+     fn output_amount_floors_never_overstates() {
+@@ -1419,7 +1532,7 @@ mod tests {
+         /// both the a-to-b and b-to-a directions; a current tick sitting
+         /// exactly on an array's start boundary leaves zero room to walk
+         /// downward and is rejected as an invalid tick array sequence.
+-        fn test_whirlpool(pool_pubkey: Pubkey, liquidity: u128, is_a_wsol: bool) -> Whirlpool {
++        fn test_whirlpool(_pool_pubkey: Pubkey, liquidity: u128, is_a_wsol: bool) -> Whirlpool {
+             let sqrt_price = tick_index_to_sqrt_price(CURRENT_TICK);
+             let wsol = Pubkey::from_str(WSOL_MINT).unwrap();
+             let other = Pubkey::new_from_array([42u8; 32]);
+@@ -1785,7 +1898,7 @@ mod tests {
+             let mut arrays = Vec::new();
+             for i in 0..4 {
+                 arrays.push(DecodedTickArray {
+-                    start_tick_index: (i as i32 - 2) * ARRAY_SPAN,
++                    start_tick_index: (i - 2) * ARRAY_SPAN,
+                     whirlpool: pool_pubkey,
+                     ticks: [TickFacade::default(); TICK_ARRAY_SIZE],
+                 });
+@@ -2072,14 +2185,20 @@ mod tests {
+ 
+         #[test]
+         fn specified_token_a_matches_falcon_convention_table() {
++            // specified_token_a == (spending_quote == is_a_wsol), per Falcon's
++            // stated convention. Check the formula itself, for all 4 cases,
++            // rather than asserting on disconnected literals.
++            let specified_token_a =
++                |spending_quote: bool, is_a_wsol: bool| spending_quote == is_a_wsol;
++
+             // if token A is WSOL: spending quote => specified_token_a = true
+-            assert!(true == (true /* spending_quote */ == true/* is_a_wsol */));
++            assert!(specified_token_a(true, true));
+             // if token A is WSOL: spending base => specified_token_a = false
+-            assert!(false == (false == true));
++            assert!(!specified_token_a(false, true));
+             // if token B is WSOL: spending quote => specified_token_a = false
+-            assert!(false == (true == false));
++            assert!(!specified_token_a(true, false));
+             // if token B is WSOL: spending base => specified_token_a = true
+-            assert!(true == (false == false));
++            assert!(specified_token_a(false, false));
+         }
+     }
+ }
+diff --git a/src/config.rs b/src/config.rs
+index da4bc66..4718f9c 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -32,16 +32,71 @@ pub enum CapitalSource {
+     Pool,
+ }
+ 
++// ===========================================================================
++// TRANSACTION COST MODEL (single source of truth)
++// ===========================================================================
++// The analyzer prices an opportunity's fixed costs and the executor builds the
++// transaction that actually pays them. Both MUST read the same numbers, or the
++// analyzer approves/rejects trades based on a cost the chain never charges
++// (that is exactly what the old hardcoded 100_000-lamport "Jito tip" did: it
++// charged ~15x the real cost and rejected profitable trades).
++//
++// Falcon submits ONE atomic transaction (buy leg + sell leg), signed by ONE
++// key, with a compute-unit limit and compute-unit price. There is no Jito
++// bundle and no tip. Real cost of that transaction:
++//
++//   base fee     = LAMPORTS_PER_SIGNATURE * signatures
++//   priority fee = ceil(compute_unit_limit * compute_unit_price_micro / 1_000_000)
++//
++// Jito tips and flash loans are deferred future optimizations; nothing here
++// models them.
++// ===========================================================================
++
++/// Solana's fixed base fee per transaction signature.
++pub const LAMPORTS_PER_SIGNATURE: u64 = 5_000;
++
++/// Signatures on Falcon's atomic transaction (fee payer only).
++pub const TX_SIGNATURES: u64 = 1;
++
++/// Compute-unit limit requested by the executor's atomic transaction.
++pub const COMPUTE_UNIT_LIMIT: u32 = 350_000;
++
++/// Compute-unit price (micro-lamports per CU) requested by the executor.
++/// Must equal what the executor passes to `set_compute_unit_price`.
++pub const COMPUTE_UNIT_PRICE_MICRO_LAMPORTS: u64 = 25_000;
++
++/// Priority fee in lamports, rounded UP (the runtime rounds up, so rounding
++/// down here would under-price the transaction). `None` on overflow.
++pub fn priority_fee_lamports(
++    compute_unit_limit: u32,
++    compute_unit_price_micro_lamports: u64,
++) -> Option<u64> {
++    let product =
++        (compute_unit_limit as u128).checked_mul(compute_unit_price_micro_lamports as u128)?;
++    let lamports = product.checked_add(999_999)? / 1_000_000;
++    u64::try_from(lamports).ok()
++}
++
++/// Total fixed lamport cost of one Falcon atomic transaction: base signature
++/// fee plus the priority fee. `None` on overflow.
++pub fn fixed_tx_cost_lamports(
++    signatures: u64,
++    compute_unit_limit: u32,
++    compute_unit_price_micro_lamports: u64,
++) -> Option<u64> {
++    let base = LAMPORTS_PER_SIGNATURE.checked_mul(signatures)?;
++    let priority = priority_fee_lamports(compute_unit_limit, compute_unit_price_micro_lamports)?;
++    base.checked_add(priority)
++}
++
+ pub struct Config {
+     pub helius_rpc_url: String,
+     pub helius_ws_url: String,
+-    pub jito_block_engine_url: String,
+     pub keypair: Keypair,
+     pub pair: String,
+     pub raydium_pool_id: String,
+     pub orca_pool_id: String,
+     pub decoder: DecoderType,
+-    pub priority_fee_micro_lamports: u64,
+     pub max_price_age_secs: u64,
+     pub capital_source: CapitalSource,
+ }
+@@ -56,9 +111,6 @@ impl Config {
+         let helius_ws_url =
+             std::env::var("HELIUS_WS_URL").context("HELIUS_WS_URL not set in environment")?;
+ 
+-        let jito_block_engine_url = std::env::var("JITO_BLOCK_ENGINE_URL")
+-            .context("JITO_BLOCK_ENGINE_URL not set in environment")?;
+-
+         let private_key_str = std::env::var("WALLET_PRIVATE_KEY")
+             .context("WALLET_PRIVATE_KEY not set in environment")?;
+ 
+@@ -84,10 +136,21 @@ impl Config {
+             other => anyhow::bail!("Invalid DECODER '{other}' in .env: must be CPMM or AMM"),
+         };
+ 
+-        let priority_fee_micro_lamports: u64 = std::env::var("PRIORITY_FEE_MICRO_LAMPORTS")
+-            .unwrap_or_else(|_| "25000".to_string())
+-            .parse()
+-            .unwrap_or(25_000);
++        // The executor prices its transaction from the compile-time cost model
++        // (COMPUTE_UNIT_PRICE_MICRO_LAMPORTS) so the analyzer and executor can
++        // never disagree about cost - there is no Config field for it. An env
++        // override that silently did nothing would be worse than none, so if
++        // one is present and differs from the model, say so loudly instead of
++        // pretending it applies.
++        if let Ok(v) = std::env::var("PRIORITY_FEE_MICRO_LAMPORTS") {
++            if v.trim().parse::<u64>().ok() != Some(COMPUTE_UNIT_PRICE_MICRO_LAMPORTS) {
++                tracing::warn!(
++                    "PRIORITY_FEE_MICRO_LAMPORTS={} in .env is IGNORED: the priority fee is fixed at {} micro-lamports/CU by config::COMPUTE_UNIT_PRICE_MICRO_LAMPORTS so analyzer cost and executor cost stay identical.",
++                    v,
++                    COMPUTE_UNIT_PRICE_MICRO_LAMPORTS
++                );
++            }
++        }
+ 
+         let max_price_age_secs: u64 = std::env::var("MAX_PRICE_AGE_SECS")
+             .unwrap_or_else(|_| "0".to_string())
+@@ -147,15 +210,64 @@ impl Config {
+         Ok(Self {
+             helius_rpc_url,
+             helius_ws_url,
+-            jito_block_engine_url,
+             keypair,
+             pair,
+             raydium_pool_id,
+             orca_pool_id,
+             decoder,
+-            priority_fee_micro_lamports,
+             max_price_age_secs,
+             capital_source,
+         })
+     }
+ }
++
++#[cfg(test)]
++mod cost_model_tests {
++    use super::*;
++
++    #[test]
++    fn priority_fee_matches_hand_computation() {
++        // 350_000 CU * 25_000 micro-lamports/CU = 8_750_000_000 micro-lamports
++        // = 8_750 lamports exactly.
++        assert_eq!(priority_fee_lamports(350_000, 25_000), Some(8_750));
++    }
++
++    #[test]
++    fn priority_fee_rounds_up_never_down() {
++        // 1 CU * 1 micro-lamport = 0.000001 lamport -> must round UP to 1.
++        assert_eq!(priority_fee_lamports(1, 1), Some(1));
++        // 1_000_001 micro-lamports -> 2 lamports, not 1.
++        assert_eq!(priority_fee_lamports(1_000_001, 1), Some(2));
++        // Exactly divisible does not gain an extra lamport.
++        assert_eq!(priority_fee_lamports(1_000_000, 1), Some(1));
++    }
++
++    #[test]
++    fn zero_priority_price_costs_nothing_extra() {
++        assert_eq!(priority_fee_lamports(350_000, 0), Some(0));
++        assert_eq!(fixed_tx_cost_lamports(1, 350_000, 0), Some(5_000));
++    }
++
++    #[test]
++    fn fixed_cost_is_base_plus_priority_with_no_tip() {
++        assert_eq!(
++            fixed_tx_cost_lamports(
++                TX_SIGNATURES,
++                COMPUTE_UNIT_LIMIT,
++                COMPUTE_UNIT_PRICE_MICRO_LAMPORTS
++            ),
++            Some(13_750)
++        );
++    }
++
++    #[test]
++    fn fixed_cost_scales_with_signature_count() {
++        assert_eq!(fixed_tx_cost_lamports(2, 350_000, 25_000), Some(18_750));
++    }
++
++    #[test]
++    fn cost_model_overflow_is_none_not_wraparound() {
++        assert_eq!(priority_fee_lamports(u32::MAX, u64::MAX), None);
++        assert_eq!(fixed_tx_cost_lamports(u64::MAX, 0, 0), None);
++    }
++}
+diff --git a/src/executor/mod.rs b/src/executor/mod.rs
+index d74cb25..b148c07 100644
+--- a/src/executor/mod.rs
++++ b/src/executor/mod.rs
+@@ -1,734 +1,753 @@
+-pub mod orca;
+-pub mod raydium;
+-pub mod raydium_cpmm;
+-
+-use anyhow::{bail, Context, Result};
+-use solana_client::rpc_client::RpcClient;
+-use solana_sdk::{
+-    instruction::Instruction,
+-    message::Message,
+-    pubkey::Pubkey,
+-    signature::{Keypair, Signer},
+-    system_instruction,
+-    transaction::Transaction,
+-};
+-use spl_associated_token_account::{
+-    get_associated_token_address, instruction::create_associated_token_account,
+-};
+-use std::str::FromStr;
+-
+-use crate::analyzer::{self, Opportunity};
+-use crate::scanner::orca::WhirlpoolInfo;
+-
+-pub const TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+-pub const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
+-
+-/// Known accounts for a specific Raydium pool. Loaded once per run from live chain state.
+-pub enum RaydiumPoolContext {
+-    Amm {
+-        pool_id: Pubkey,
+-        amm_authority: Pubkey,
+-        coin_vault: Pubkey,
+-        pc_vault: Pubkey,
+-    },
+-    Cpmm {
+-        pool_info: crate::scanner::raydium_cpmm::CpmmPoolInfo,
+-    },
+-}
+-
+-impl RaydiumPoolContext {
+-    pub fn load_amm(client: &RpcClient, pool_id: &str) -> Result<Self> {
+-        let pool_pubkey = Pubkey::from_str(pool_id).context("Invalid Raydium pool pubkey")?;
+-
+-        let vaults = crate::scanner::raydium::fetch_pool_vaults(client, pool_id)?;
+-
+-        let amm_program = Pubkey::from_str("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8")?;
+-
+-        let (amm_authority, _) = Pubkey::find_program_address(&[b"amm authority"], &amm_program);
+-
+-        Ok(Self::Amm {
+-            pool_id: pool_pubkey,
+-            amm_authority,
+-            coin_vault: vaults.coin_vault,
+-            pc_vault: vaults.pc_vault,
+-        })
+-    }
+-
+-    pub fn load_cpmm(client: &RpcClient, pool_id: &str) -> Result<Self> {
+-        let pool_info = crate::scanner::raydium_cpmm::fetch_pool_info(client, pool_id)?;
+-
+-        Ok(Self::Cpmm { pool_info })
+-    }
+-
+-    pub fn load(
+-        client: &RpcClient,
+-        pool_id: &str,
+-        decoder: crate::config::DecoderType,
+-    ) -> Result<Self> {
+-        match decoder {
+-            crate::config::DecoderType::Amm => Self::load_amm(client, pool_id),
+-            crate::config::DecoderType::Cpmm => Self::load_cpmm(client, pool_id),
+-        }
+-    }
+-}
+-
+-/// Known accounts for a specific Orca pool. Loaded once per run from live chain state.
+-pub struct OrcaPoolContext {
+-    pub pool_id: Pubkey,
+-    pub info: WhirlpoolInfo,
+-}
+-
+-impl OrcaPoolContext {
+-    /// Loads the Whirlpool's static account layout once at startup.
+-    pub fn load(client: &RpcClient, pool_id: &str) -> Result<Self> {
+-        let pool_pubkey = Pubkey::from_str(pool_id).context("Invalid Orca Whirlpool pubkey")?;
+-
+-        let info = crate::scanner::orca::fetch_pool_info(client, pool_id)?;
+-
+-        Ok(Self {
+-            pool_id: pool_pubkey,
+-            info,
+-        })
+-    }
+-}
+-
+-/// Cached ATA pubkeys + existence, computed once at startup.
+-#[derive(Debug, Clone, Copy)]
+-pub struct AtaCache {
+-    pub wsol_ata: Pubkey,
+-    pub wsol_exists: bool,
+-    pub other_ata: Pubkey,
+-    pub other_exists: bool,
+-}
+-
+-impl AtaCache {
+-    /// One-time RPC check at startup.
+-    pub fn load(client: &RpcClient, wallet: &Pubkey, other_token_mint: &Pubkey) -> Result<Self> {
+-        let (wsol_ata, wsol_exists, other_ata, other_exists) =
+-            check_wallet_atas(client, wallet, other_token_mint)?;
+-
+-        Ok(Self {
+-            wsol_ata,
+-            wsol_exists,
+-            other_ata,
+-            other_exists,
+-        })
+-    }
+-}
+-
+-pub fn simulate_cpmm_swap(
+-    client: &RpcClient,
+-    payer: &Keypair,
+-    pool_info: &crate::scanner::raydium_cpmm::CpmmPoolInfo,
+-    input_mint: &Pubkey,
+-    amount_in: u64,
+-    minimum_amount_out: u64,
+-) -> Result<()> {
+-    let wallet = payer.pubkey();
+-    let wsol_mint = Pubkey::from_str(WSOL_MINT)?;
+-
+-    let output_mint = if pool_info.token_0_mint == *input_mint {
+-        pool_info.token_1_mint
+-    } else {
+-        pool_info.token_0_mint
+-    };
+-
+-    let non_sol_mint = if pool_info.token_0_mint == wsol_mint {
+-        pool_info.token_1_mint
+-    } else {
+-        pool_info.token_0_mint
+-    };
+-
+-    let (wsol_ata, wsol_exists, other_ata, other_exists) =
+-        check_wallet_atas(client, &wallet, &non_sol_mint)?;
+-
+-    let (input_token_account, output_token_account) = if *input_mint == wsol_mint {
+-        (wsol_ata, other_ata)
+-    } else {
+-        (other_ata, wsol_ata)
+-    };
+-
+-    let (input_vault, output_vault) = if pool_info.token_0_mint == *input_mint {
+-        (pool_info.token_0_vault, pool_info.token_1_vault)
+-    } else {
+-        (pool_info.token_1_vault, pool_info.token_0_vault)
+-    };
+-
+-    let (input_token_program, output_token_program) = if pool_info.token_0_mint == *input_mint {
+-        (pool_info.token_0_program, pool_info.token_1_program)
+-    } else {
+-        (pool_info.token_1_program, pool_info.token_0_program)
+-    };
+-
+-    let mut instructions = vec![];
+-    let token_program = Pubkey::from_str(TOKEN_PROGRAM_ID)?;
+-
+-    if !wsol_exists {
+-        instructions.push(create_associated_token_account(
+-            &wallet,
+-            &wallet,
+-            &wsol_mint,
+-            &token_program,
+-        ));
+-    }
+-
+-    if !other_exists {
+-        instructions.push(create_associated_token_account(
+-            &wallet,
+-            &wallet,
+-            &non_sol_mint,
+-            &token_program,
+-        ));
+-    }
+-
+-    if *input_mint == wsol_mint {
+-        instructions.push(system_instruction::transfer(&wallet, &wsol_ata, amount_in));
+-
+-        instructions.push(spl_token::instruction::sync_native(
+-            &token_program,
+-            &wsol_ata,
+-        )?);
+-    }
+-
+-    let accounts = raydium_cpmm::SwapAccounts {
+-        payer: wallet,
+-        amm_config: pool_info.amm_config,
+-        pool_state: pool_info.pool_state,
+-        input_token_account,
+-        output_token_account,
+-        input_vault,
+-        output_vault,
+-        input_token_program,
+-        output_token_program,
+-        input_token_mint: *input_mint,
+-        output_token_mint: output_mint,
+-        observation_state: pool_info.observation_key,
+-    };
+-
+-    instructions.push(raydium_cpmm::build_swap_instruction(
+-        &accounts,
+-        amount_in,
+-        minimum_amount_out,
+-    )?);
+-
+-    simulate(client, payer, instructions)
+-}
+-
+-pub fn simulate_orca_swap(
+-    client: &RpcClient,
+-    payer: &Keypair,
+-    whirlpool: &Pubkey,
+-    pool: &crate::scanner::orca::WhirlpoolInfo,
+-    input_mint: &Pubkey,
+-    amount_in: u64,
+-    minimum_amount_out: u64,
+-) -> Result<()> {
+-    let wallet = payer.pubkey();
+-    let token_program = Pubkey::from_str(TOKEN_PROGRAM_ID)?;
+-    let wsol_mint = Pubkey::from_str(WSOL_MINT)?;
+-
+-    let non_sol_mint = if pool.token_mint_a == wsol_mint {
+-        pool.token_mint_b
+-    } else {
+-        pool.token_mint_a
+-    };
+-
+-    let (wsol_ata, wsol_exists, other_ata, other_exists) =
+-        check_wallet_atas(client, &wallet, &non_sol_mint)?;
+-
+-    let (token_owner_account_a, token_owner_account_b) = if pool.token_mint_a == wsol_mint {
+-        (wsol_ata, other_ata)
+-    } else {
+-        (other_ata, wsol_ata)
+-    };
+-
+-    let a_to_b = pool.token_mint_a == *input_mint;
+-
+-    let mut instructions = vec![];
+-
+-    if !wsol_exists {
+-        instructions.push(create_associated_token_account(
+-            &wallet,
+-            &wallet,
+-            &wsol_mint,
+-            &token_program,
+-        ));
+-    }
+-
+-    if !other_exists {
+-        instructions.push(create_associated_token_account(
+-            &wallet,
+-            &wallet,
+-            &non_sol_mint,
+-            &token_program,
+-        ));
+-    }
+-
+-    if *input_mint == wsol_mint {
+-        instructions.push(system_instruction::transfer(&wallet, &wsol_ata, amount_in));
+-
+-        instructions.push(spl_token::instruction::sync_native(
+-            &token_program,
+-            &wsol_ata,
+-        )?);
+-    }
+-
+-    let accounts = orca::SwapAccounts {
+-        whirlpool: *whirlpool,
+-        token_owner_account_a,
+-        token_vault_a: pool.token_vault_a,
+-        token_owner_account_b,
+-        token_vault_b: pool.token_vault_b,
+-        token_authority: wallet,
+-    };
+-
+-    instructions.push(orca::build_swap_instruction(
+-        &accounts,
+-        pool.tick_current_index,
+-        pool.tick_spacing,
+-        amount_in,
+-        minimum_amount_out,
+-        a_to_b,
+-    )?);
+-
+-    simulate(client, payer, instructions)
+-}
+-
+-pub fn check_wallet_atas(
+-    client: &RpcClient,
+-    wallet: &Pubkey,
+-    other_token_mint: &Pubkey,
+-) -> Result<(Pubkey, bool, Pubkey, bool)> {
+-    let wsol_mint = Pubkey::from_str(WSOL_MINT).context("Invalid WSOL mint")?;
+-
+-    let wsol_ata = get_associated_token_address(wallet, &wsol_mint);
+-
+-    let other_ata = get_associated_token_address(wallet, other_token_mint);
+-
+-    let wsol_exists = client.get_account(&wsol_ata).is_ok();
+-
+-    let other_exists = client.get_account(&other_ata).is_ok();
+-
+-    tracing::info!("WSOL ATA: {} (exists: {})", wsol_ata, wsol_exists);
+-
+-    tracing::info!("Other token ATA: {} (exists: {})", other_ata, other_exists);
+-
+-    Ok((wsol_ata, wsol_exists, other_ata, other_exists))
+-}
+-
+-fn simulate(client: &RpcClient, payer: &Keypair, instructions: Vec<Instruction>) -> Result<()> {
+-    simulate_with_blockhash(client, payer, instructions, None)
+-}
+-
+-/// Simulate a transaction and enforce simulation truth.
+-///
+-/// IMPORTANT:
+-/// `RpcClient::simulate_transaction()` can return successfully at the RPC
+-/// transport level while the simulated transaction itself contains a
+-/// Solana program error in `sim.value.err`.
+-///
+-/// That program error is NOT a successful simulation.
+-///
+-/// Therefore:
+-///
+-///     RPC request success
+-///         !=
+-///     transaction simulation success
+-///
+-/// This function treats `sim.value.err` as a hard failure.
+-fn simulate_with_blockhash(
+-    client: &RpcClient,
+-    payer: &Keypair,
+-    instructions: Vec<Instruction>,
+-    cached_blockhash: Option<solana_sdk::hash::Hash>,
+-) -> Result<()> {
+-    let recent_blockhash = match cached_blockhash {
+-        Some(h) => h,
+-        None => client
+-            .get_latest_blockhash()
+-            .context("Failed to fetch recent blockhash")?,
+-    };
+-
+-    let message = Message::new(&instructions, Some(&payer.pubkey()));
+-
+-    let mut tx = Transaction::new_unsigned(message);
+-
+-    tx.sign(&[payer], recent_blockhash);
+-
+-    tracing::info!(
+-        "Simulating transaction with {} instructions...",
+-        tx.message.instructions.len()
+-    );
+-
+-    let sim = client
+-        .simulate_transaction(&tx)
+-        .context("Failed to simulate transaction")?;
+-
+-    if let Some(logs) = &sim.value.logs {
+-        for (index, log) in logs.iter().enumerate() {
+-            tracing::info!("LOG[{}]: {}", index, log);
+-        }
+-    }
+-
+-    tracing::info!("Compute units consumed: {:?}", sim.value.units_consumed);
+-
+-    if let Some(err) = &sim.value.err {
+-        tracing::error!(
+-            "SIMULATION FAILED: transaction returned a Solana execution error: {:?}",
+-            err
+-        );
+-
+-        bail!("transaction simulation failed: {:?}", err);
+-    }
+-
+-    tracing::info!("SIMULATION SUCCESS: transaction executed successfully with no error");
+-
+-    Ok(())
+-}
+-
+-/// Builds a single swap instruction for the named DEX, spending `input_mint`
+-/// for the other token. Direction-agnostic.
+-fn build_leg_instruction(
+-    dex_name: &str,
+-    raydium_ctx: &RaydiumPoolContext,
+-    orca_ctx: &OrcaPoolContext,
+-    wallet: Pubkey,
+-    wsol_ata: Pubkey,
+-    other_ata: Pubkey,
+-    input_mint: &Pubkey,
+-    amount_in: u64,
+-    minimum_amount_out: u64,
+-) -> Result<Instruction> {
+-    let wsol_mint = Pubkey::from_str(WSOL_MINT)?;
+-
+-    match dex_name {
+-        "Raydium" | "RaydiumCPMM" => match raydium_ctx {
+-            RaydiumPoolContext::Amm {
+-                pool_id,
+-                amm_authority,
+-                coin_vault,
+-                pc_vault,
+-            } => {
+-                let (user_source, user_destination) = if *input_mint == wsol_mint {
+-                    (wsol_ata, other_ata)
+-                } else {
+-                    (other_ata, wsol_ata)
+-                };
+-
+-                let accounts = raydium::SwapAccounts {
+-                    amm_pool: *pool_id,
+-                    amm_authority: *amm_authority,
+-                    pool_coin_token_account: *coin_vault,
+-                    pool_pc_token_account: *pc_vault,
+-                    user_source,
+-                    user_destination,
+-                    user_owner: wallet,
+-                };
+-
+-                raydium::build_swap_instruction(&accounts, amount_in, minimum_amount_out)
+-            }
+-
+-            RaydiumPoolContext::Cpmm { pool_info } => {
+-                let output_mint = if pool_info.token_0_mint == *input_mint {
+-                    pool_info.token_1_mint
+-                } else {
+-                    pool_info.token_0_mint
+-                };
+-
+-                let (input_token_account, output_token_account) = if *input_mint == wsol_mint {
+-                    (wsol_ata, other_ata)
+-                } else {
+-                    (other_ata, wsol_ata)
+-                };
+-
+-                let (input_vault, output_vault) = if pool_info.token_0_mint == *input_mint {
+-                    (pool_info.token_0_vault, pool_info.token_1_vault)
+-                } else {
+-                    (pool_info.token_1_vault, pool_info.token_0_vault)
+-                };
+-
+-                let (input_token_program, output_token_program) =
+-                    if pool_info.token_0_mint == *input_mint {
+-                        (pool_info.token_0_program, pool_info.token_1_program)
+-                    } else {
+-                        (pool_info.token_1_program, pool_info.token_0_program)
+-                    };
+-
+-                let accounts = raydium_cpmm::SwapAccounts {
+-                    payer: wallet,
+-                    amm_config: pool_info.amm_config,
+-                    pool_state: pool_info.pool_state,
+-                    input_token_account,
+-                    output_token_account,
+-                    input_vault,
+-                    output_vault,
+-                    input_token_program,
+-                    output_token_program,
+-                    input_token_mint: *input_mint,
+-                    output_token_mint: output_mint,
+-                    observation_state: pool_info.observation_key,
+-                };
+-
+-                raydium_cpmm::build_swap_instruction(&accounts, amount_in, minimum_amount_out)
+-            }
+-        },
+-
+-        "Orca" => {
+-            let info = &orca_ctx.info;
+-
+-            let (token_owner_account_a, token_owner_account_b) = if info.token_mint_a == wsol_mint {
+-                (wsol_ata, other_ata)
+-            } else {
+-                (other_ata, wsol_ata)
+-            };
+-
+-            let a_to_b = info.token_mint_a == *input_mint;
+-
+-            let accounts = orca::SwapAccounts {
+-                whirlpool: orca_ctx.pool_id,
+-                token_owner_account_a,
+-                token_vault_a: info.token_vault_a,
+-                token_owner_account_b,
+-                token_vault_b: info.token_vault_b,
+-                token_authority: wallet,
+-            };
+-
+-            orca::build_swap_instruction(
+-                &accounts,
+-                info.tick_current_index,
+-                info.tick_spacing,
+-                amount_in,
+-                minimum_amount_out,
+-                a_to_b,
+-            )
+-        }
+-
+-        other => bail!("Unknown DEX: {other}"),
+-    }
+-}
+-
+-/// Builds and simulates the full atomic arbitrage transaction.
+-///
+-/// Never sends anything - simulation only.
+-///
+-/// The analyzer's expected buy output is used directly as the sell input.
+-#[allow(clippy::too_many_arguments)]
+-pub fn simulate_opportunity(
+-    client: &RpcClient,
+-    payer: &Keypair,
+-    opportunity: &Opportunity,
+-    raydium_ctx: &RaydiumPoolContext,
+-    orca_ctx: &OrcaPoolContext,
+-    other_token_mint: &Pubkey,
+-    other_token_decimals: u32,
+-    cached_blockhash: Option<solana_sdk::hash::Hash>,
+-    ata_cache: &AtaCache,
+-) -> Result<()> {
+-    let wallet = payer.pubkey();
+-
+-    let token_program = Pubkey::from_str(TOKEN_PROGRAM_ID)?;
+-
+-    let wsol_mint = Pubkey::from_str(WSOL_MINT)?;
+-
+-    let AtaCache {
+-        wsol_ata,
+-        wsol_exists,
+-        other_ata,
+-        other_exists,
+-    } = *ata_cache;
+-
+-    let _ = other_token_decimals;
+-
+-    let amount_in_lamports = opportunity.trade_size_lamports;
+-
+-    let other_token_amount_raw = opportunity.expected_output_after_buy_raw;
+-
+-    let mut instructions = vec![];
+-
+-    if !wsol_exists {
+-        instructions.push(create_associated_token_account(
+-            &wallet,
+-            &wallet,
+-            &wsol_mint,
+-            &token_program,
+-        ));
+-    }
+-
+-    if !other_exists {
+-        instructions.push(create_associated_token_account(
+-            &wallet,
+-            &wallet,
+-            other_token_mint,
+-            &token_program,
+-        ));
+-    }
+-
+-    instructions.push(system_instruction::transfer(
+-        &wallet,
+-        &wsol_ata,
+-        amount_in_lamports,
+-    ));
+-
+-    instructions.push(spl_token::instruction::sync_native(
+-        &token_program,
+-        &wsol_ata,
+-    )?);
+-
+-    const SLIPPAGE_TOLERANCE_BPS: u32 = 100;
+-
+-    let buy_minimum_out_raw = analyzer::calculate_minimum_out_raw(
+-        opportunity.expected_output_after_buy_raw,
+-        SLIPPAGE_TOLERANCE_BPS,
+-    )
+-    .context("Failed to compute buy-leg minimum_out")?;
+-
+-    let buy_ix = build_leg_instruction(
+-        &opportunity.buy_dex,
+-        raydium_ctx,
+-        orca_ctx,
+-        wallet,
+-        wsol_ata,
+-        other_ata,
+-        &wsol_mint,
+-        amount_in_lamports,
+-        buy_minimum_out_raw,
+-    )?;
+-
+-    instructions.push(buy_ix);
+-
+-    instructions.insert(
+-        0,
+-        solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(350_000),
+-    );
+-
+-    instructions.insert(
+-        1,
+-        solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_price(25_000),
+-    );
+-
+-    let base_sell_minimum_out = analyzer::calculate_minimum_out_raw(
+-        opportunity.expected_output_after_sell_raw,
+-        SLIPPAGE_TOLERANCE_BPS,
+-    )
+-    .context("Failed to compute sell-leg minimum_out")?;
+-
+-    let breakeven_lamports = amount_in_lamports + 1_000;
+-
+-    let sell_minimum_out_lamports = base_sell_minimum_out.max(breakeven_lamports);
+-
+-    let sell_ix = build_leg_instruction(
+-        &opportunity.sell_dex,
+-        raydium_ctx,
+-        orca_ctx,
+-        wallet,
+-        wsol_ata,
+-        other_ata,
+-        other_token_mint,
+-        other_token_amount_raw,
+-        sell_minimum_out_lamports,
+-    )?;
+-
+-    instructions.push(sell_ix);
+-
+-    tracing::info!(
+-        "Built atomic opportunity tx: buy on {} ({} lamports SOL in), sell on {} ({} raw units token in)",
+-        opportunity.buy_dex,
+-        amount_in_lamports,
+-        opportunity.sell_dex,
+-        other_token_amount_raw
+-    );
+-
+-    simulate_with_blockhash(client, payer, instructions, cached_blockhash)
+-}
+-
+-use solana_sdk::hash::Hash;
+-use std::sync::{Arc, RwLock};
+-
+-pub type BlockhashCache = Arc<RwLock<Hash>>;
+-
+-pub fn spawn_blockhash_poller(rpc_url: String, interval_ms: u64) -> Result<BlockhashCache> {
+-    let client = RpcClient::new(rpc_url);
+-
+-    let initial_hash = client
+-        .get_latest_blockhash()
+-        .context("Failed to get initial blockhash")?;
+-
+-    let cache = Arc::new(RwLock::new(initial_hash));
+-
+-    let cache_clone = Arc::clone(&cache);
+-
+-    std::thread::spawn(move || loop {
+-        std::thread::sleep(std::time::Duration::from_millis(interval_ms));
+-
+-        match client.get_latest_blockhash() {
+-            Ok(hash) => {
+-                if let Ok(mut lock) = cache_clone.write() {
+-                    *lock = hash;
+-                }
+-            }
+-
+-            Err(e) => {
+-                tracing::warn!("Failed to refresh blockhash: {}", e);
+-            }
+-        }
+-    });
+-
+-    Ok(cache)
+-}
+-
+-pub fn ensure_wallet_atas(
+-    client: &RpcClient,
+-    payer: &Keypair,
+-    other_token_mint: &Pubkey,
+-) -> Result<(Pubkey, Pubkey)> {
+-    let wallet = payer.pubkey();
+-
+-    let token_program = Pubkey::from_str(TOKEN_PROGRAM_ID)?;
+-
+-    let wsol_mint = Pubkey::from_str(WSOL_MINT)?;
+-
+-    let (wsol_ata, wsol_exists, other_ata, other_exists) =
+-        check_wallet_atas(client, &wallet, other_token_mint)?;
+-
+-    let mut setup_ixs = Vec::new();
+-
+-    if !wsol_exists {
+-        setup_ixs.push(create_associated_token_account(
+-            &wallet,
+-            &wallet,
+-            &wsol_mint,
+-            &token_program,
+-        ));
+-    }
+-
+-    if !other_exists {
+-        setup_ixs.push(create_associated_token_account(
+-            &wallet,
+-            &wallet,
+-            other_token_mint,
+-            &token_program,
+-        ));
+-    }
+-
+-    if !setup_ixs.is_empty() {
+-        tracing::info!("Pre-creating {} missing ATA(s)...", setup_ixs.len());
+-
+-        let recent_blockhash = client.get_latest_blockhash()?;
+-
+-        let message = Message::new(&setup_ixs, Some(&wallet));
+-
+-        let mut tx = Transaction::new_unsigned(message);
+-
+-        tx.sign(&[payer], recent_blockhash);
+-
+-        client
+-            .send_and_confirm_transaction(&tx)
+-            .context("Failed to pre-create ATAs")?;
+-
+-        tracing::info!("ATAs successfully pre-created and ready!");
+-    } else {
+-        tracing::info!("All necessary ATAs already exist!");
+-    }
+-
+-    Ok((wsol_ata, other_ata))
+-}
++pub mod orca;
++pub mod raydium;
++pub mod raydium_cpmm;
++
++use anyhow::{bail, Context, Result};
++use solana_client::rpc_client::RpcClient;
++use solana_sdk::{
++    instruction::Instruction,
++    message::Message,
++    pubkey::Pubkey,
++    signature::{Keypair, Signer},
++    system_instruction,
++    transaction::Transaction,
++};
++use spl_associated_token_account::{
++    get_associated_token_address, instruction::create_associated_token_account,
++};
++use std::str::FromStr;
++
++use crate::analyzer::{self, Opportunity};
++use crate::scanner::orca::WhirlpoolInfo;
++
++pub const TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
++pub const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
++
++/// Known accounts for a specific Raydium pool. Loaded once per run from live chain state.
++pub enum RaydiumPoolContext {
++    Amm {
++        pool_id: Pubkey,
++        amm_authority: Pubkey,
++        coin_vault: Pubkey,
++        pc_vault: Pubkey,
++    },
++    Cpmm {
++        pool_info: crate::scanner::raydium_cpmm::CpmmPoolInfo,
++    },
++}
++
++impl RaydiumPoolContext {
++    pub fn load_amm(client: &RpcClient, pool_id: &str) -> Result<Self> {
++        let pool_pubkey = Pubkey::from_str(pool_id).context("Invalid Raydium pool pubkey")?;
++
++        let vaults = crate::scanner::raydium::fetch_pool_vaults(client, pool_id)?;
++
++        let amm_program = Pubkey::from_str("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8")?;
++
++        let (amm_authority, _) = Pubkey::find_program_address(&[b"amm authority"], &amm_program);
++
++        Ok(Self::Amm {
++            pool_id: pool_pubkey,
++            amm_authority,
++            coin_vault: vaults.coin_vault,
++            pc_vault: vaults.pc_vault,
++        })
++    }
++
++    pub fn load_cpmm(client: &RpcClient, pool_id: &str) -> Result<Self> {
++        let pool_info = crate::scanner::raydium_cpmm::fetch_pool_info(client, pool_id)?;
++
++        Ok(Self::Cpmm { pool_info })
++    }
++
++    pub fn load(
++        client: &RpcClient,
++        pool_id: &str,
++        decoder: crate::config::DecoderType,
++    ) -> Result<Self> {
++        match decoder {
++            crate::config::DecoderType::Amm => Self::load_amm(client, pool_id),
++            crate::config::DecoderType::Cpmm => Self::load_cpmm(client, pool_id),
++        }
++    }
++}
++
++/// Known accounts for a specific Orca pool. Loaded once per run from live chain state.
++pub struct OrcaPoolContext {
++    pub pool_id: Pubkey,
++    pub info: WhirlpoolInfo,
++}
++
++impl OrcaPoolContext {
++    /// Loads the Whirlpool's static account layout once at startup.
++    pub fn load(client: &RpcClient, pool_id: &str) -> Result<Self> {
++        let pool_pubkey = Pubkey::from_str(pool_id).context("Invalid Orca Whirlpool pubkey")?;
++
++        let info = crate::scanner::orca::fetch_pool_info(client, pool_id)?;
++
++        Ok(Self {
++            pool_id: pool_pubkey,
++            info,
++        })
++    }
++}
++
++/// Cached ATA pubkeys + existence, computed once at startup.
++#[derive(Debug, Clone, Copy)]
++pub struct AtaCache {
++    pub wsol_ata: Pubkey,
++    pub wsol_exists: bool,
++    pub other_ata: Pubkey,
++    pub other_exists: bool,
++}
++
++impl AtaCache {
++    /// One-time RPC check at startup.
++    pub fn load(client: &RpcClient, wallet: &Pubkey, other_token_mint: &Pubkey) -> Result<Self> {
++        let (wsol_ata, wsol_exists, other_ata, other_exists) =
++            check_wallet_atas(client, wallet, other_token_mint)?;
++
++        Ok(Self {
++            wsol_ata,
++            wsol_exists,
++            other_ata,
++            other_exists,
++        })
++    }
++}
++
++pub fn simulate_cpmm_swap(
++    client: &RpcClient,
++    payer: &Keypair,
++    pool_info: &crate::scanner::raydium_cpmm::CpmmPoolInfo,
++    input_mint: &Pubkey,
++    amount_in: u64,
++    minimum_amount_out: u64,
++) -> Result<()> {
++    let wallet = payer.pubkey();
++    let wsol_mint = Pubkey::from_str(WSOL_MINT)?;
++
++    let output_mint = if pool_info.token_0_mint == *input_mint {
++        pool_info.token_1_mint
++    } else {
++        pool_info.token_0_mint
++    };
++
++    let non_sol_mint = if pool_info.token_0_mint == wsol_mint {
++        pool_info.token_1_mint
++    } else {
++        pool_info.token_0_mint
++    };
++
++    let (wsol_ata, wsol_exists, other_ata, other_exists) =
++        check_wallet_atas(client, &wallet, &non_sol_mint)?;
++
++    let (input_token_account, output_token_account) = if *input_mint == wsol_mint {
++        (wsol_ata, other_ata)
++    } else {
++        (other_ata, wsol_ata)
++    };
++
++    let (input_vault, output_vault) = if pool_info.token_0_mint == *input_mint {
++        (pool_info.token_0_vault, pool_info.token_1_vault)
++    } else {
++        (pool_info.token_1_vault, pool_info.token_0_vault)
++    };
++
++    let (input_token_program, output_token_program) = if pool_info.token_0_mint == *input_mint {
++        (pool_info.token_0_program, pool_info.token_1_program)
++    } else {
++        (pool_info.token_1_program, pool_info.token_0_program)
++    };
++
++    let mut instructions = vec![];
++    let token_program = Pubkey::from_str(TOKEN_PROGRAM_ID)?;
++
++    if !wsol_exists {
++        instructions.push(create_associated_token_account(
++            &wallet,
++            &wallet,
++            &wsol_mint,
++            &token_program,
++        ));
++    }
++
++    if !other_exists {
++        instructions.push(create_associated_token_account(
++            &wallet,
++            &wallet,
++            &non_sol_mint,
++            &token_program,
++        ));
++    }
++
++    if *input_mint == wsol_mint {
++        instructions.push(system_instruction::transfer(&wallet, &wsol_ata, amount_in));
++
++        instructions.push(spl_token::instruction::sync_native(
++            &token_program,
++            &wsol_ata,
++        )?);
++    }
++
++    let accounts = raydium_cpmm::SwapAccounts {
++        payer: wallet,
++        amm_config: pool_info.amm_config,
++        pool_state: pool_info.pool_state,
++        input_token_account,
++        output_token_account,
++        input_vault,
++        output_vault,
++        input_token_program,
++        output_token_program,
++        input_token_mint: *input_mint,
++        output_token_mint: output_mint,
++        observation_state: pool_info.observation_key,
++    };
++
++    instructions.push(raydium_cpmm::build_swap_instruction(
++        &accounts,
++        amount_in,
++        minimum_amount_out,
++    )?);
++
++    simulate(client, payer, instructions)
++}
++
++pub fn simulate_orca_swap(
++    client: &RpcClient,
++    payer: &Keypair,
++    whirlpool: &Pubkey,
++    pool: &crate::scanner::orca::WhirlpoolInfo,
++    input_mint: &Pubkey,
++    amount_in: u64,
++    minimum_amount_out: u64,
++) -> Result<()> {
++    let wallet = payer.pubkey();
++    let token_program = Pubkey::from_str(TOKEN_PROGRAM_ID)?;
++    let wsol_mint = Pubkey::from_str(WSOL_MINT)?;
++
++    let non_sol_mint = if pool.token_mint_a == wsol_mint {
++        pool.token_mint_b
++    } else {
++        pool.token_mint_a
++    };
++
++    let (wsol_ata, wsol_exists, other_ata, other_exists) =
++        check_wallet_atas(client, &wallet, &non_sol_mint)?;
++
++    let (token_owner_account_a, token_owner_account_b) = if pool.token_mint_a == wsol_mint {
++        (wsol_ata, other_ata)
++    } else {
++        (other_ata, wsol_ata)
++    };
++
++    let a_to_b = pool.token_mint_a == *input_mint;
++
++    let mut instructions = vec![];
++
++    if !wsol_exists {
++        instructions.push(create_associated_token_account(
++            &wallet,
++            &wallet,
++            &wsol_mint,
++            &token_program,
++        ));
++    }
++
++    if !other_exists {
++        instructions.push(create_associated_token_account(
++            &wallet,
++            &wallet,
++            &non_sol_mint,
++            &token_program,
++        ));
++    }
++
++    if *input_mint == wsol_mint {
++        instructions.push(system_instruction::transfer(&wallet, &wsol_ata, amount_in));
++
++        instructions.push(spl_token::instruction::sync_native(
++            &token_program,
++            &wsol_ata,
++        )?);
++    }
++
++    let accounts = orca::SwapAccounts {
++        whirlpool: *whirlpool,
++        token_owner_account_a,
++        token_vault_a: pool.token_vault_a,
++        token_owner_account_b,
++        token_vault_b: pool.token_vault_b,
++        token_authority: wallet,
++    };
++
++    instructions.push(orca::build_swap_instruction(
++        &accounts,
++        pool.tick_current_index,
++        pool.tick_spacing,
++        amount_in,
++        minimum_amount_out,
++        a_to_b,
++    )?);
++
++    simulate(client, payer, instructions)
++}
++
++pub fn check_wallet_atas(
++    client: &RpcClient,
++    wallet: &Pubkey,
++    other_token_mint: &Pubkey,
++) -> Result<(Pubkey, bool, Pubkey, bool)> {
++    let wsol_mint = Pubkey::from_str(WSOL_MINT).context("Invalid WSOL mint")?;
++
++    let wsol_ata = get_associated_token_address(wallet, &wsol_mint);
++
++    let other_ata = get_associated_token_address(wallet, other_token_mint);
++
++    let wsol_exists = client.get_account(&wsol_ata).is_ok();
++
++    let other_exists = client.get_account(&other_ata).is_ok();
++
++    tracing::info!("WSOL ATA: {} (exists: {})", wsol_ata, wsol_exists);
++
++    tracing::info!("Other token ATA: {} (exists: {})", other_ata, other_exists);
++
++    Ok((wsol_ata, wsol_exists, other_ata, other_exists))
++}
++
++fn simulate(client: &RpcClient, payer: &Keypair, instructions: Vec<Instruction>) -> Result<()> {
++    simulate_with_blockhash(client, payer, instructions, None)
++}
++
++/// Simulate a transaction and enforce simulation truth.
++///
++/// IMPORTANT:
++/// `RpcClient::simulate_transaction()` can return successfully at the RPC
++/// transport level while the simulated transaction itself contains a
++/// Solana program error in `sim.value.err`.
++///
++/// That program error is NOT a successful simulation.
++///
++/// Therefore:
++///
++///     RPC request success
++///         !=
++///     transaction simulation success
++///
++/// This function treats `sim.value.err` as a hard failure.
++fn simulate_with_blockhash(
++    client: &RpcClient,
++    payer: &Keypair,
++    instructions: Vec<Instruction>,
++    cached_blockhash: Option<solana_sdk::hash::Hash>,
++) -> Result<()> {
++    let recent_blockhash = match cached_blockhash {
++        Some(h) => h,
++        None => client
++            .get_latest_blockhash()
++            .context("Failed to fetch recent blockhash")?,
++    };
++
++    // Program of each instruction, in submission order. Message compilation
++    // preserves instruction order, so the index inside a chain-reported
++    // `InstructionError` indexes this list. Needed to know WHICH program's
++    // error code we are looking at (codes collide across programs).
++    let instruction_programs: Vec<Pubkey> = instructions.iter().map(|ix| ix.program_id).collect();
++
++    let message = Message::new(&instructions, Some(&payer.pubkey()));
++
++    let mut tx = Transaction::new_unsigned(message);
++
++    tx.sign(&[payer], recent_blockhash);
++
++    tracing::info!(
++        "Simulating transaction with {} instructions...",
++        tx.message.instructions.len()
++    );
++
++    // Transport failure is a failed simulation (typed as `rpc_error`).
++    let sim = client.simulate_transaction(&tx).map_err(|e| {
++        anyhow::Error::new(crate::failure::SimulationFailure::Rpc(format!(
++            "Failed to simulate transaction: {e}"
++        )))
++    })?;
++
++    if let Some(logs) = &sim.value.logs {
++        for (index, log) in logs.iter().enumerate() {
++            tracing::info!("LOG[{}]: {}", index, log);
++        }
++    }
++
++    tracing::info!("Compute units consumed: {:?}", sim.value.units_consumed);
++
++    // Simulation truth gate: success requires the RPC call to have succeeded
++    // (we are past it) AND `value.err == None`. Any chain-reported error is a
++    // failed simulation, returned as a typed, classifiable failure.
++    if let Err(failure) =
++        crate::failure::simulation_outcome(sim.value.err.clone(), &instruction_programs)
++    {
++        tracing::error!(
++            failure_class = %failure.class(),
++            "SIMULATION FAILED: {}",
++            failure
++        );
++
++        return Err(failure.into());
++    }
++
++    tracing::info!("SIMULATION SUCCESS: transaction executed successfully with no error");
++
++    Ok(())
++}
++
++/// Builds a single swap instruction for the named DEX, spending `input_mint`
++/// for the other token. Direction-agnostic.
++fn build_leg_instruction(
++    dex_name: &str,
++    raydium_ctx: &RaydiumPoolContext,
++    orca_ctx: &OrcaPoolContext,
++    wallet: Pubkey,
++    wsol_ata: Pubkey,
++    other_ata: Pubkey,
++    input_mint: &Pubkey,
++    amount_in: u64,
++    minimum_amount_out: u64,
++) -> Result<Instruction> {
++    let wsol_mint = Pubkey::from_str(WSOL_MINT)?;
++
++    match dex_name {
++        "Raydium" | "RaydiumCPMM" => match raydium_ctx {
++            RaydiumPoolContext::Amm {
++                pool_id,
++                amm_authority,
++                coin_vault,
++                pc_vault,
++            } => {
++                let (user_source, user_destination) = if *input_mint == wsol_mint {
++                    (wsol_ata, other_ata)
++                } else {
++                    (other_ata, wsol_ata)
++                };
++
++                let accounts = raydium::SwapAccounts {
++                    amm_pool: *pool_id,
++                    amm_authority: *amm_authority,
++                    pool_coin_token_account: *coin_vault,
++                    pool_pc_token_account: *pc_vault,
++                    user_source,
++                    user_destination,
++                    user_owner: wallet,
++                };
++
++                raydium::build_swap_instruction(&accounts, amount_in, minimum_amount_out)
++            }
++
++            RaydiumPoolContext::Cpmm { pool_info } => {
++                let output_mint = if pool_info.token_0_mint == *input_mint {
++                    pool_info.token_1_mint
++                } else {
++                    pool_info.token_0_mint
++                };
++
++                let (input_token_account, output_token_account) = if *input_mint == wsol_mint {
++                    (wsol_ata, other_ata)
++                } else {
++                    (other_ata, wsol_ata)
++                };
++
++                let (input_vault, output_vault) = if pool_info.token_0_mint == *input_mint {
++                    (pool_info.token_0_vault, pool_info.token_1_vault)
++                } else {
++                    (pool_info.token_1_vault, pool_info.token_0_vault)
++                };
++
++                let (input_token_program, output_token_program) =
++                    if pool_info.token_0_mint == *input_mint {
++                        (pool_info.token_0_program, pool_info.token_1_program)
++                    } else {
++                        (pool_info.token_1_program, pool_info.token_0_program)
++                    };
++
++                let accounts = raydium_cpmm::SwapAccounts {
++                    payer: wallet,
++                    amm_config: pool_info.amm_config,
++                    pool_state: pool_info.pool_state,
++                    input_token_account,
++                    output_token_account,
++                    input_vault,
++                    output_vault,
++                    input_token_program,
++                    output_token_program,
++                    input_token_mint: *input_mint,
++                    output_token_mint: output_mint,
++                    observation_state: pool_info.observation_key,
++                };
++
++                raydium_cpmm::build_swap_instruction(&accounts, amount_in, minimum_amount_out)
++            }
++        },
++
++        "Orca" => {
++            let info = &orca_ctx.info;
++
++            let (token_owner_account_a, token_owner_account_b) = if info.token_mint_a == wsol_mint {
++                (wsol_ata, other_ata)
++            } else {
++                (other_ata, wsol_ata)
++            };
++
++            let a_to_b = info.token_mint_a == *input_mint;
++
++            let accounts = orca::SwapAccounts {
++                whirlpool: orca_ctx.pool_id,
++                token_owner_account_a,
++                token_vault_a: info.token_vault_a,
++                token_owner_account_b,
++                token_vault_b: info.token_vault_b,
++                token_authority: wallet,
++            };
++
++            orca::build_swap_instruction(
++                &accounts,
++                info.tick_current_index,
++                info.tick_spacing,
++                amount_in,
++                minimum_amount_out,
++                a_to_b,
++            )
++        }
++
++        other => bail!("Unknown DEX: {other}"),
++    }
++}
++
++/// Builds and simulates the full atomic arbitrage transaction.
++///
++/// Never sends anything - simulation only.
++///
++/// The analyzer's expected buy output is used directly as the sell input.
++#[allow(clippy::too_many_arguments)]
++pub fn simulate_opportunity(
++    client: &RpcClient,
++    payer: &Keypair,
++    opportunity: &Opportunity,
++    raydium_ctx: &RaydiumPoolContext,
++    orca_ctx: &OrcaPoolContext,
++    other_token_mint: &Pubkey,
++    other_token_decimals: u32,
++    cached_blockhash: Option<solana_sdk::hash::Hash>,
++    ata_cache: &AtaCache,
++) -> Result<()> {
++    let wallet = payer.pubkey();
++
++    let token_program = Pubkey::from_str(TOKEN_PROGRAM_ID)?;
++
++    let wsol_mint = Pubkey::from_str(WSOL_MINT)?;
++
++    let AtaCache {
++        wsol_ata,
++        wsol_exists,
++        other_ata,
++        other_exists,
++    } = *ata_cache;
++
++    let _ = other_token_decimals;
++
++    let amount_in_lamports = opportunity.trade_size_lamports;
++
++    let other_token_amount_raw = opportunity.expected_output_after_buy_raw;
++
++    let mut instructions = vec![];
++
++    if !wsol_exists {
++        instructions.push(create_associated_token_account(
++            &wallet,
++            &wallet,
++            &wsol_mint,
++            &token_program,
++        ));
++    }
++
++    if !other_exists {
++        instructions.push(create_associated_token_account(
++            &wallet,
++            &wallet,
++            other_token_mint,
++            &token_program,
++        ));
++    }
++
++    instructions.push(system_instruction::transfer(
++        &wallet,
++        &wsol_ata,
++        amount_in_lamports,
++    ));
++
++    instructions.push(spl_token::instruction::sync_native(
++        &token_program,
++        &wsol_ata,
++    )?);
++
++    const SLIPPAGE_TOLERANCE_BPS: u32 = 100;
++
++    let buy_minimum_out_raw = analyzer::calculate_minimum_out_raw(
++        opportunity.expected_output_after_buy_raw,
++        SLIPPAGE_TOLERANCE_BPS,
++    )
++    .context("Failed to compute buy-leg minimum_out")?;
++
++    let buy_ix = build_leg_instruction(
++        &opportunity.buy_dex,
++        raydium_ctx,
++        orca_ctx,
++        wallet,
++        wsol_ata,
++        other_ata,
++        &wsol_mint,
++        amount_in_lamports,
++        buy_minimum_out_raw,
++    )?;
++
++    instructions.push(buy_ix);
++
++    instructions.insert(
++        0,
++        solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(
++            crate::config::COMPUTE_UNIT_LIMIT,
++        ),
++    );
++
++    instructions.insert(
++        1,
++        solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_price(
++            crate::config::COMPUTE_UNIT_PRICE_MICRO_LAMPORTS,
++        ),
++    );
++
++    let base_sell_minimum_out = analyzer::calculate_minimum_out_raw(
++        opportunity.expected_output_after_sell_raw,
++        SLIPPAGE_TOLERANCE_BPS,
++    )
++    .context("Failed to compute sell-leg minimum_out")?;
++
++    let breakeven_lamports = amount_in_lamports + 1_000;
++
++    let sell_minimum_out_lamports = base_sell_minimum_out.max(breakeven_lamports);
++
++    let sell_ix = build_leg_instruction(
++        &opportunity.sell_dex,
++        raydium_ctx,
++        orca_ctx,
++        wallet,
++        wsol_ata,
++        other_ata,
++        other_token_mint,
++        other_token_amount_raw,
++        sell_minimum_out_lamports,
++    )?;
++
++    instructions.push(sell_ix);
++
++    tracing::info!(
++        "Built atomic opportunity tx: buy on {} ({} lamports SOL in), sell on {} ({} raw units token in)",
++        opportunity.buy_dex,
++        amount_in_lamports,
++        opportunity.sell_dex,
++        other_token_amount_raw
++    );
++
++    simulate_with_blockhash(client, payer, instructions, cached_blockhash)
++}
++
++use solana_sdk::hash::Hash;
++use std::sync::{Arc, RwLock};
++
++pub type BlockhashCache = Arc<RwLock<Hash>>;
++
++pub fn spawn_blockhash_poller(rpc_url: String, interval_ms: u64) -> Result<BlockhashCache> {
++    let client = RpcClient::new(rpc_url);
++
++    let initial_hash = client
++        .get_latest_blockhash()
++        .context("Failed to get initial blockhash")?;
++
++    let cache = Arc::new(RwLock::new(initial_hash));
++
++    let cache_clone = Arc::clone(&cache);
++
++    std::thread::spawn(move || loop {
++        std::thread::sleep(std::time::Duration::from_millis(interval_ms));
++
++        match client.get_latest_blockhash() {
++            Ok(hash) => {
++                if let Ok(mut lock) = cache_clone.write() {
++                    *lock = hash;
++                }
++            }
++
++            Err(e) => {
++                tracing::warn!("Failed to refresh blockhash: {}", e);
++            }
++        }
++    });
++
++    Ok(cache)
++}
++
++pub fn ensure_wallet_atas(
++    client: &RpcClient,
++    payer: &Keypair,
++    other_token_mint: &Pubkey,
++) -> Result<(Pubkey, Pubkey)> {
++    let wallet = payer.pubkey();
++
++    let token_program = Pubkey::from_str(TOKEN_PROGRAM_ID)?;
++
++    let wsol_mint = Pubkey::from_str(WSOL_MINT)?;
++
++    let (wsol_ata, wsol_exists, other_ata, other_exists) =
++        check_wallet_atas(client, &wallet, other_token_mint)?;
++
++    let mut setup_ixs = Vec::new();
++
++    if !wsol_exists {
++        setup_ixs.push(create_associated_token_account(
++            &wallet,
++            &wallet,
++            &wsol_mint,
++            &token_program,
++        ));
++    }
++
++    if !other_exists {
++        setup_ixs.push(create_associated_token_account(
++            &wallet,
++            &wallet,
++            other_token_mint,
++            &token_program,
++        ));
++    }
++
++    if !setup_ixs.is_empty() {
++        tracing::info!("Pre-creating {} missing ATA(s)...", setup_ixs.len());
++
++        let recent_blockhash = client.get_latest_blockhash()?;
++
++        let message = Message::new(&setup_ixs, Some(&wallet));
++
++        let mut tx = Transaction::new_unsigned(message);
++
++        tx.sign(&[payer], recent_blockhash);
++
++        client
++            .send_and_confirm_transaction(&tx)
++            .context("Failed to pre-create ATAs")?;
++
++        tracing::info!("ATAs successfully pre-created and ready!");
++    } else {
++        tracing::info!("All necessary ATAs already exist!");
++    }
++
++    Ok((wsol_ata, other_ata))
++}
+diff --git a/src/failure.rs b/src/failure.rs
+new file mode 100644
+index 0000000..935f263
+--- /dev/null
++++ b/src/failure.rs
+@@ -0,0 +1,930 @@
++//! Failure classification (Phase 4).
++//!
++//! This is a TAXONOMY over the error types the project already has
++//! (`MathError`, `RevalidationError`, `TickArrayError`, `CpmmQuoteError`, and
++//! the executor's `anyhow` errors) - not a second error system. Every existing
++//! error keeps its own type and message; `FailureClass` only answers "what
++//! kind of failure is this, and what should an operator/caller do about it".
++//!
++//! The one genuinely new error type is [`SimulationFailure`]. The executor used
++//! to collapse every simulation failure into an untyped string, which made a
++//! chain error like `InstructionError(5, Custom(6005))` impossible to
++//! classify. It now carries the typed `TransactionError` plus the instruction
++//! index and the program that instruction invoked.
++//!
++//! ## Why classification is keyed on (program, code), never on code alone
++//!
++//! Custom error codes are per-program and collide. `6005` is
++//! `ExceededSlippage` in Raydium CPMM but `ClosePositionNotEmpty` in the Orca
++//! Whirlpool program. A global "6005 => slippage" rule would misclassify an
++//! Orca failure. So the failing instruction's program is resolved first.
++//!
++//! Code tables were verified against:
++//!   - Raydium CPMM: raydium-io/raydium-cp-swap `error.rs` (6000-based numbering
++//!     confirmed via the raydium-cp-swap-cpi crate).
++//!   - Orca Whirlpool: the IDL-derived `WhirlpoolError` table (cross-checked
++//!     across three independent generated mirrors). Worth re-checking against
++//!     Orca's own `errors.rs` if Orca ships a new program version.
++//!
++//! Codes not listed below deliberately fall through to `SimulationError`
++//! with the raw code preserved in the message - the classifier never
++//! guesses.
++
++use crate::analyzer::{MathError, RevalidationError};
++use crate::scanner::orca::TickArrayError;
++use crate::scanner::raydium_cpmm::CpmmQuoteError;
++use solana_sdk::instruction::InstructionError;
++use solana_sdk::pubkey::Pubkey;
++use solana_sdk::transaction::TransactionError;
++use std::str::FromStr;
++
++/// What kind of failure occurred.
++///
++/// The `as_str` values are stable identifiers used in logs (and later in
++/// metrics); do not rename them without treating it as a breaking change.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
++pub enum FailureClass {
++    /// Our snapshot is old, incoherent, or not yet available. Wait/re-fetch.
++    StaleState,
++    /// Our quote and the chain disagree in a way that is not just price
++    /// movement (e.g. a partial fill). Investigate - possible math bug.
++    QuoteMismatch,
++    /// The chain refused the trade because output fell below our minimum.
++    /// Normal market movement between quote and execution: discard.
++    ExceededSlippage,
++    /// An account we depend on is gone or changed underneath us.
++    AccountStateChanged,
++    /// Transport-level RPC failure. Infrastructure, not market.
++    RpcError,
++    /// The chain rejected the transaction for a reason we do not classify
++    /// more precisely. The raw error is always preserved.
++    SimulationError,
++    /// The pool (or an account we decoded) is malformed or not tradable.
++    InvalidPoolState,
++    /// Tick-array coverage is missing, mis-sequenced, or incomplete.
++    MissingTickArray,
++    /// Our own integer arithmetic overflowed or was fed a degenerate value.
++    ArithmeticError,
++    /// We built or ran something incorrectly (bad account, budget exceeded,
++    /// or an error we have no better bucket for).
++    ExecutionError,
++}
++
++impl FailureClass {
++    pub const fn as_str(self) -> &'static str {
++        match self {
++            FailureClass::StaleState => "stale_state",
++            FailureClass::QuoteMismatch => "quote_mismatch",
++            FailureClass::ExceededSlippage => "exceeded_slippage",
++            FailureClass::AccountStateChanged => "account_state_changed",
++            FailureClass::RpcError => "rpc_error",
++            FailureClass::SimulationError => "simulation_error",
++            FailureClass::InvalidPoolState => "invalid_pool_state",
++            FailureClass::MissingTickArray => "missing_tick_array",
++            FailureClass::ArithmeticError => "arithmetic_error",
++            FailureClass::ExecutionError => "execution_error",
++        }
++    }
++}
++
++impl std::fmt::Display for FailureClass {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.write_str(self.as_str())
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Program identification
++// ---------------------------------------------------------------------------
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum KnownProgram {
++    OrcaWhirlpool,
++    RaydiumCpmm,
++    RaydiumAmmV4,
++    /// Anything else (System, Token, ComputeBudget, ...). Custom codes from
++    /// these are not interpreted.
++    Other,
++}
++
++/// Resolves a program id to a program we know the error table of. Program ids
++/// come from the same constants the executor uses to build instructions, so
++/// the classifier cannot drift from what is actually submitted.
++pub fn identify_program(program_id: &Pubkey) -> KnownProgram {
++    let matches = |s: &str| {
++        Pubkey::from_str(s)
++            .map(|p| p == *program_id)
++            .unwrap_or(false)
++    };
++
++    if matches(crate::executor::orca::ORCA_WHIRLPOOL_PROGRAM) {
++        KnownProgram::OrcaWhirlpool
++    } else if matches(crate::executor::raydium_cpmm::RAYDIUM_CPMM_PROGRAM) {
++        KnownProgram::RaydiumCpmm
++    } else if matches(crate::executor::raydium::RAYDIUM_AMM_V4_PROGRAM) {
++        KnownProgram::RaydiumAmmV4
++    } else {
++        KnownProgram::Other
++    }
++}
++
++/// Maps a program's `Custom(code)` to a failure class.
++///
++/// Only codes whose meaning is established are mapped. Everything else,
++/// including every Raydium AMM v4 code (its numbering is a different scheme
++/// and is intentionally not interpreted), is `SimulationError`.
++pub fn classify_program_error(program: KnownProgram, code: u32) -> FailureClass {
++    match program {
++        KnownProgram::RaydiumCpmm => match code {
++            // ExceededSlippage - "Exceeds desired slippage limit".
++            6005 => FailureClass::ExceededSlippage,
++            // NotApproved: swap not currently allowed on this pool.
++            6000 => FailureClass::InvalidPoolState,
++            // NotSupportMint: "Not support token_2022 mint extension".
++            6007 => FailureClass::InvalidPoolState,
++            _ => FailureClass::SimulationError,
++        },
++        KnownProgram::OrcaWhirlpool => match code {
++            // AmountOutBelowMinimum / AmountInAboveMaximum: Orca's swap
++            // slippage checks. (NOT 6005 - that is ClosePositionNotEmpty.)
++            6036 | 6037 => FailureClass::ExceededSlippage,
++            // TickArrayIndexOutofBounds, InvalidTickArraySequence,
++            // TickArraySequenceInvalidIndex: the tick-array set we supplied
++            // does not cover the swap.
++            6003 | 6023 | 6038 => FailureClass::MissingTickArray,
++            // PartialFillError: the trade could not be fully filled, so the
++            // liquidity our quote assumed was not there.
++            6057 => FailureClass::QuoteMismatch,
++            // TradeIsNotEnabled.
++            6064 => FailureClass::InvalidPoolState,
++            // DivideByZero, NumberCastError, NumberDownCastError,
++            // LiquidityOverflow, LiquidityUnderflow, and the multiplication /
++            // muldiv / amount overflow family.
++            6006 | 6007 | 6008 | 6014 | 6015 | 6030 | 6031 | 6032 | 6033 | 6039 | 6040 => {
++                FailureClass::ArithmeticError
++            }
++            // DifferentWhirlpoolTickArrayAccount: we passed a tick array that
++            // belongs to another pool - an instruction-construction fault.
++            6056 => FailureClass::ExecutionError,
++            _ => FailureClass::SimulationError,
++        },
++        KnownProgram::RaydiumAmmV4 | KnownProgram::Other => FailureClass::SimulationError,
++    }
++}
++
++/// Classifies a chain-returned `TransactionError`, given the program that
++/// owned the failing instruction (if any).
++pub fn classify_transaction_error(err: &TransactionError, program: KnownProgram) -> FailureClass {
++    match err {
++        TransactionError::InstructionError(_, InstructionError::Custom(code)) => {
++            classify_program_error(program, *code)
++        }
++        TransactionError::InstructionError(_, InstructionError::ComputationalBudgetExceeded) => {
++            FailureClass::ExecutionError
++        }
++        // The blockhash we signed with is no longer valid: our cached state
++        // is stale.
++        TransactionError::BlockhashNotFound => FailureClass::StaleState,
++        // An account the transaction needs no longer exists.
++        TransactionError::AccountNotFound => FailureClass::AccountStateChanged,
++        _ => FailureClass::SimulationError,
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Simulation truth gate
++// ---------------------------------------------------------------------------
++
++/// A failed simulation. The two variants are the two ways a simulation can
++/// fail, and BOTH are failures: transport errors and chain-reported errors.
++#[derive(Debug, thiserror::Error)]
++pub enum SimulationFailure {
++    /// The RPC call itself failed; nothing was learned about the transaction.
++    #[error("RPC transport error during simulation: {0}")]
++    Rpc(String),
++    /// The RPC call succeeded but the simulated transaction returned an error
++    /// (`RpcSimulateTransactionResult.err`). This is the case a naive
++    /// `.is_ok()` check would miss.
++    #[error(
++        "simulated transaction failed at instruction {instruction_index:?} \
++         (program {program:?}, id {program_id:?}): {error:?}"
++    )]
++    Chain {
++        instruction_index: Option<u8>,
++        program: KnownProgram,
++        program_id: Option<Pubkey>,
++        error: TransactionError,
++    },
++}
++
++impl SimulationFailure {
++    pub fn class(&self) -> FailureClass {
++        match self {
++            SimulationFailure::Rpc(_) => FailureClass::RpcError,
++            SimulationFailure::Chain { error, program, .. } => {
++                classify_transaction_error(error, *program)
++            }
++        }
++    }
++}
++
++/// THE simulation truth gate.
++///
++/// A simulation succeeds ONLY when the RPC transport succeeded (the caller
++/// only reaches this function with a response in hand) AND the response's
++/// `value.err` is `None`. Any `Some(err)` is a failure, with the failing
++/// instruction's program resolved from `instruction_programs` (the program id
++/// of each instruction in submission order; message compilation preserves
++/// instruction order, so the index in `InstructionError` indexes this slice).
++///
++/// Kept as a pure function so the gate itself is unit-testable without a
++/// network.
++pub fn simulation_outcome(
++    value_err: Option<TransactionError>,
++    instruction_programs: &[Pubkey],
++) -> Result<(), SimulationFailure> {
++    let Some(error) = value_err else {
++        return Ok(());
++    };
++
++    let instruction_index = match &error {
++        TransactionError::InstructionError(idx, _) => Some(*idx),
++        _ => None,
++    };
++
++    let program_id = instruction_index
++        .and_then(|idx| instruction_programs.get(idx as usize))
++        .copied();
++
++    let program = program_id
++        .as_ref()
++        .map(identify_program)
++        .unwrap_or(KnownProgram::Other);
++
++    Err(SimulationFailure::Chain {
++        instruction_index,
++        program,
++        program_id,
++        error,
++    })
++}
++
++// ---------------------------------------------------------------------------
++// Classification of the project's existing error types
++// ---------------------------------------------------------------------------
++
++/// Implemented by every existing error type that participates in
++/// classification.
++pub trait Classify {
++    fn failure_class(&self) -> FailureClass;
++}
++
++impl Classify for SimulationFailure {
++    fn failure_class(&self) -> FailureClass {
++        self.class()
++    }
++}
++
++impl Classify for CpmmQuoteError {
++    fn failure_class(&self) -> FailureClass {
++        match self {
++            CpmmQuoteError::ZeroReserve
++            | CpmmQuoteError::InvalidCreatorFeeMode
++            | CpmmQuoteError::Token2022Unsupported
++            | CpmmQuoteError::SwapDisabled
++            | CpmmQuoteError::PoolNotOpen => FailureClass::InvalidPoolState,
++            CpmmQuoteError::ReserveFeeUnderflow
++            | CpmmQuoteError::ArithmeticOverflow
++            | CpmmQuoteError::OutputTooLarge
++            // Fees consumed the entire input: a degenerate numeric outcome.
++            | CpmmQuoteError::InsufficientInputAfterFees => FailureClass::ArithmeticError,
++        }
++    }
++}
++
++impl Classify for TickArrayError {
++    fn failure_class(&self) -> FailureClass {
++        match self {
++            TickArrayError::MissingNeighbor { .. } => FailureClass::MissingTickArray,
++            TickArrayError::TooShort { .. }
++            | TickArrayError::WrongOwner { .. }
++            | TickArrayError::WrongWhirlpool { .. }
++            | TickArrayError::InvalidStartTick { .. }
++            | TickArrayError::TickDecode { .. } => FailureClass::InvalidPoolState,
++        }
++    }
++}
++
++impl Classify for RevalidationError {
++    fn failure_class(&self) -> FailureClass {
++        match self {
++            RevalidationError::NoSnapshot
++            | RevalidationError::Incoherent { .. }
++            | RevalidationError::SnapshotTooOld { .. } => FailureClass::StaleState,
++            RevalidationError::CurrentTickArrayMissing { .. }
++            | RevalidationError::ExecutionArrayMissing { .. } => FailureClass::MissingTickArray,
++        }
++    }
++}
++
++impl Classify for MathError {
++    fn failure_class(&self) -> FailureClass {
++        match self {
++            MathError::ZeroReserve => FailureClass::InvalidPoolState,
++            MathError::Overflow(_)
++            | MathError::DivisionByZero(_)
++            | MathError::OutputTooLarge
++            | MathError::InvalidInput(_) => FailureClass::ArithmeticError,
++            // No published state yet: not an error in the math, the state is
++            // simply not ready.
++            MathError::OrcaQuoteUnavailable(_)
++            | MathError::CpmmQuoteStateUnavailable
++            | MathError::OrcaStateIncoherent { .. } => FailureClass::StaleState,
++            MathError::OrcaInsufficientTickCoverage => FailureClass::MissingTickArray,
++            MathError::CpmmQuote(e) => e.failure_class(),
++            MathError::OrcaQuoteFailed(msg) => classify_orca_core_error(msg),
++        }
++    }
++}
++
++/// Classifies an `orca_whirlpools_core` quote error by matching against the
++/// crate's own exported error constants (not copied string literals), so a
++/// wording change in the crate is a compile error here rather than a silent
++/// misclassification.
++fn classify_orca_core_error(msg: &str) -> FailureClass {
++    use orca_whirlpools_core as core;
++
++    if msg == core::INVALID_TICK_ARRAY_SEQUENCE
++        || msg == core::TICK_SEQUENCE_EMPTY
++        || msg == core::TICK_INDEX_NOT_IN_ARRAY
++        || msg == core::TICK_ARRAY_NOT_EVENLY_SPACED
++    {
++        FailureClass::MissingTickArray
++    } else if msg == core::ARITHMETIC_OVERFLOW
++        || msg == core::AMOUNT_EXCEEDS_MAX_U64
++        || msg == core::ZERO_TRADABLE_AMOUNT
++    {
++        FailureClass::ArithmeticError
++    } else if msg == core::SQRT_PRICE_OUT_OF_BOUNDS
++        || msg == core::SQRT_PRICE_LIMIT_OUT_OF_BOUNDS
++        || msg == core::TICK_INDEX_OUT_OF_BOUNDS
++        || msg == core::INVALID_TICK_INDEX
++        // We pass no oracle; an adaptive-fee pool reaching here means the pool
++        // is not what we assumed.
++        || msg == core::INVALID_ADAPTIVE_FEE_INFO
++    {
++        FailureClass::InvalidPoolState
++    } else {
++        FailureClass::ExecutionError
++    }
++}
++
++/// Classifies an arbitrary `anyhow::Error` by walking its cause chain and
++/// returning the class of the first recognised typed error. Context wrappers
++/// added with `.context(...)` do not hide the underlying typed error.
++///
++/// Errors with no recognised type default to `ExecutionError`, except a
++/// `solana_client` `ClientError` anywhere in the chain, which is `RpcError`.
++pub fn classify_error_chain(err: &anyhow::Error) -> FailureClass {
++    for cause in err.chain() {
++        if let Some(e) = cause.downcast_ref::<SimulationFailure>() {
++            return e.failure_class();
++        }
++        if let Some(e) = cause.downcast_ref::<MathError>() {
++            return e.failure_class();
++        }
++        if let Some(e) = cause.downcast_ref::<RevalidationError>() {
++            return e.failure_class();
++        }
++        if let Some(e) = cause.downcast_ref::<TickArrayError>() {
++            return e.failure_class();
++        }
++        if cause
++            .downcast_ref::<solana_client::client_error::ClientError>()
++            .is_some()
++        {
++            return FailureClass::RpcError;
++        }
++    }
++    FailureClass::ExecutionError
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[allow(deprecated)] // no non-deprecated re-export exists in this solana-sdk version
++    use solana_sdk::compute_budget;
++    #[allow(deprecated)]
++    use solana_sdk::system_program;
++
++    fn pk(s: &str) -> Pubkey {
++        Pubkey::from_str(s).unwrap()
++    }
++    fn orca() -> Pubkey {
++        pk(crate::executor::orca::ORCA_WHIRLPOOL_PROGRAM)
++    }
++    fn cpmm() -> Pubkey {
++        pk(crate::executor::raydium_cpmm::RAYDIUM_CPMM_PROGRAM)
++    }
++
++    /// Program ids in the exact order Falcon's atomic transaction is built
++    /// when both ATAs already exist: 0=CU limit, 1=CU price, 2=SOL transfer,
++    /// 3=sync_native, 4=buy leg, 5=sell leg.
++    fn atomic_tx_programs(buy: Pubkey, sell: Pubkey) -> Vec<Pubkey> {
++        vec![
++            compute_budget::id(),
++            compute_budget::id(),
++            system_program::id(),
++            spl_token::id(),
++            buy,
++            sell,
++        ]
++    }
++
++    // --- taxonomy identity ---
++
++    #[test]
++    fn failure_class_strings_are_stable() {
++        // Logs and future metrics key on these exact strings.
++        let all = [
++            (FailureClass::StaleState, "stale_state"),
++            (FailureClass::QuoteMismatch, "quote_mismatch"),
++            (FailureClass::ExceededSlippage, "exceeded_slippage"),
++            (FailureClass::AccountStateChanged, "account_state_changed"),
++            (FailureClass::RpcError, "rpc_error"),
++            (FailureClass::SimulationError, "simulation_error"),
++            (FailureClass::InvalidPoolState, "invalid_pool_state"),
++            (FailureClass::MissingTickArray, "missing_tick_array"),
++            (FailureClass::ArithmeticError, "arithmetic_error"),
++            (FailureClass::ExecutionError, "execution_error"),
++        ];
++        for (class, s) in all {
++            assert_eq!(class.as_str(), s);
++            assert_eq!(class.to_string(), s);
++        }
++    }
++
++    #[test]
++    fn program_ids_resolve_to_known_programs() {
++        assert_eq!(identify_program(&orca()), KnownProgram::OrcaWhirlpool);
++        assert_eq!(identify_program(&cpmm()), KnownProgram::RaydiumCpmm);
++        assert_eq!(
++            identify_program(&pk(crate::executor::raydium::RAYDIUM_AMM_V4_PROGRAM)),
++            KnownProgram::RaydiumAmmV4
++        );
++        assert_eq!(identify_program(&system_program::id()), KnownProgram::Other);
++    }
++
++    // --- (program, code) mapping ---
++
++    #[test]
++    fn cpmm_6005_is_exceeded_slippage() {
++        assert_eq!(
++            classify_program_error(KnownProgram::RaydiumCpmm, 6005),
++            FailureClass::ExceededSlippage
++        );
++    }
++
++    #[test]
++    fn orca_6005_is_not_slippage() {
++        // The regression guard for the whole design: the SAME code means
++        // ClosePositionNotEmpty on Orca and must never read as slippage.
++        assert_ne!(
++            classify_program_error(KnownProgram::OrcaWhirlpool, 6005),
++            FailureClass::ExceededSlippage
++        );
++        assert_eq!(
++            classify_program_error(KnownProgram::OrcaWhirlpool, 6005),
++            FailureClass::SimulationError
++        );
++    }
++
++    #[test]
++    fn orca_slippage_codes_are_6036_and_6037() {
++        for code in [6036, 6037] {
++            assert_eq!(
++                classify_program_error(KnownProgram::OrcaWhirlpool, code),
++                FailureClass::ExceededSlippage
++            );
++        }
++        // And they are not slippage on Raydium CPMM.
++        assert_ne!(
++            classify_program_error(KnownProgram::RaydiumCpmm, 6036),
++            FailureClass::ExceededSlippage
++        );
++    }
++
++    #[test]
++    fn orca_tick_array_codes_are_missing_tick_array() {
++        for code in [6003, 6023, 6038] {
++            assert_eq!(
++                classify_program_error(KnownProgram::OrcaWhirlpool, code),
++                FailureClass::MissingTickArray,
++                "code {code}"
++            );
++        }
++    }
++
++    #[test]
++    fn orca_other_mapped_codes() {
++        let o = KnownProgram::OrcaWhirlpool;
++        assert_eq!(classify_program_error(o, 6057), FailureClass::QuoteMismatch);
++        assert_eq!(
++            classify_program_error(o, 6064),
++            FailureClass::InvalidPoolState
++        );
++        assert_eq!(
++            classify_program_error(o, 6056),
++            FailureClass::ExecutionError
++        );
++        for code in [
++            6006, 6007, 6008, 6014, 6015, 6030, 6031, 6032, 6033, 6039, 6040,
++        ] {
++            assert_eq!(
++                classify_program_error(o, code),
++                FailureClass::ArithmeticError,
++                "code {code}"
++            );
++        }
++    }
++
++    #[test]
++    fn cpmm_other_mapped_codes() {
++        let c = KnownProgram::RaydiumCpmm;
++        assert_eq!(
++            classify_program_error(c, 6000),
++            FailureClass::InvalidPoolState
++        );
++        assert_eq!(
++            classify_program_error(c, 6007),
++            FailureClass::InvalidPoolState
++        );
++    }
++
++    #[test]
++    fn unknown_codes_and_programs_are_not_guessed() {
++        assert_eq!(
++            classify_program_error(KnownProgram::RaydiumCpmm, 6999),
++            FailureClass::SimulationError
++        );
++        assert_eq!(
++            classify_program_error(KnownProgram::OrcaWhirlpool, 1),
++            FailureClass::SimulationError
++        );
++        // An unknown program's 6005 must not be read as slippage either.
++        assert_eq!(
++            classify_program_error(KnownProgram::Other, 6005),
++            FailureClass::SimulationError
++        );
++        // Raydium AMM v4 codes are not interpreted at all.
++        assert_eq!(
++            classify_program_error(KnownProgram::RaydiumAmmV4, 6005),
++            FailureClass::SimulationError
++        );
++    }
++
++    // --- transaction-level errors ---
++
++    #[test]
++    fn non_custom_transaction_errors() {
++        let o = KnownProgram::Other;
++        assert_eq!(
++            classify_transaction_error(&TransactionError::BlockhashNotFound, o),
++            FailureClass::StaleState
++        );
++        assert_eq!(
++            classify_transaction_error(&TransactionError::AccountNotFound, o),
++            FailureClass::AccountStateChanged
++        );
++        assert_eq!(
++            classify_transaction_error(
++                &TransactionError::InstructionError(
++                    3,
++                    InstructionError::ComputationalBudgetExceeded
++                ),
++                o
++            ),
++            FailureClass::ExecutionError
++        );
++        assert_eq!(
++            classify_transaction_error(&TransactionError::AlreadyProcessed, o),
++            FailureClass::SimulationError
++        );
++    }
++
++    // --- the simulation truth gate ---
++
++    #[test]
++    fn simulation_with_no_chain_error_succeeds() {
++        assert!(simulation_outcome(None, &atomic_tx_programs(orca(), cpmm())).is_ok());
++    }
++
++    #[test]
++    fn any_chain_error_is_a_failed_simulation() {
++        // Even an "uninteresting" error must fail the gate: transport success
++        // alone is not simulation success.
++        let err = TransactionError::AlreadyProcessed;
++        assert!(simulation_outcome(Some(err), &[]).is_err());
++    }
++
++    #[test]
++    fn the_real_observed_failure_classifies_as_exceeded_slippage() {
++        // The failure that started this phase: Orca buy succeeded, then
++        // InstructionError(5, Custom(6005)) on the Raydium CPMM sell.
++        let programs = atomic_tx_programs(orca(), cpmm());
++        let failure = simulation_outcome(
++            Some(TransactionError::InstructionError(
++                5,
++                InstructionError::Custom(6005),
++            )),
++            &programs,
++        )
++        .unwrap_err();
++
++        match &failure {
++            SimulationFailure::Chain {
++                instruction_index,
++                program,
++                program_id,
++                ..
++            } => {
++                assert_eq!(*instruction_index, Some(5));
++                assert_eq!(*program, KnownProgram::RaydiumCpmm);
++                assert_eq!(*program_id, Some(cpmm()));
++            }
++            other => panic!("expected Chain failure, got {other:?}"),
++        }
++        assert_eq!(failure.class(), FailureClass::ExceededSlippage);
++    }
++
++    #[test]
++    fn same_code_on_the_orca_leg_is_not_slippage() {
++        // Identical error, but at index 4 - the Orca buy leg.
++        let programs = atomic_tx_programs(orca(), cpmm());
++        let failure = simulation_outcome(
++            Some(TransactionError::InstructionError(
++                4,
++                InstructionError::Custom(6005),
++            )),
++            &programs,
++        )
++        .unwrap_err();
++        assert_ne!(failure.class(), FailureClass::ExceededSlippage);
++    }
++
++    #[test]
++    fn program_resolution_follows_leg_order() {
++        // Reversed route (Raydium buy, Orca sell): index 5 is now Orca, and
++        // its 6036 is the slippage code.
++        let programs = atomic_tx_programs(cpmm(), orca());
++        let failure = simulation_outcome(
++            Some(TransactionError::InstructionError(
++                5,
++                InstructionError::Custom(6036),
++            )),
++            &programs,
++        )
++        .unwrap_err();
++        assert_eq!(failure.class(), FailureClass::ExceededSlippage);
++    }
++
++    #[test]
++    fn out_of_range_instruction_index_does_not_panic() {
++        let failure = simulation_outcome(
++            Some(TransactionError::InstructionError(
++                200,
++                InstructionError::Custom(6005),
++            )),
++            &atomic_tx_programs(orca(), cpmm()),
++        )
++        .unwrap_err();
++        // Program unresolvable -> the code is not interpreted.
++        assert_eq!(failure.class(), FailureClass::SimulationError);
++    }
++
++    #[test]
++    fn rpc_transport_failure_is_rpc_error() {
++        assert_eq!(
++            SimulationFailure::Rpc("connection reset".into()).class(),
++            FailureClass::RpcError
++        );
++    }
++
++    // --- existing error types ---
++
++    #[test]
++    fn math_error_classification_table() {
++        use MathError::*;
++        let cases: Vec<(MathError, FailureClass)> = vec![
++            (ZeroReserve, FailureClass::InvalidPoolState),
++            (Overflow("x"), FailureClass::ArithmeticError),
++            (DivisionByZero("x"), FailureClass::ArithmeticError),
++            (OutputTooLarge, FailureClass::ArithmeticError),
++            (InvalidInput("x"), FailureClass::ArithmeticError),
++            (OrcaQuoteUnavailable("x"), FailureClass::StaleState),
++            (CpmmQuoteStateUnavailable, FailureClass::StaleState),
++            (
++                OrcaStateIncoherent { worst_drift: 9 },
++                FailureClass::StaleState,
++            ),
++            (OrcaInsufficientTickCoverage, FailureClass::MissingTickArray),
++            (
++                CpmmQuote(CpmmQuoteError::SwapDisabled),
++                FailureClass::InvalidPoolState,
++            ),
++            (
++                CpmmQuote(CpmmQuoteError::ArithmeticOverflow),
++                FailureClass::ArithmeticError,
++            ),
++        ];
++        for (err, want) in cases {
++            assert_eq!(err.failure_class(), want, "{err:?}");
++        }
++    }
++
++    #[test]
++    fn orca_core_errors_are_classified_via_the_crates_own_constants() {
++        use orca_whirlpools_core as c;
++        let cases = [
++            (
++                c::INVALID_TICK_ARRAY_SEQUENCE,
++                FailureClass::MissingTickArray,
++            ),
++            (c::TICK_SEQUENCE_EMPTY, FailureClass::MissingTickArray),
++            (c::TICK_INDEX_NOT_IN_ARRAY, FailureClass::MissingTickArray),
++            (
++                c::TICK_ARRAY_NOT_EVENLY_SPACED,
++                FailureClass::MissingTickArray,
++            ),
++            (c::ARITHMETIC_OVERFLOW, FailureClass::ArithmeticError),
++            (c::AMOUNT_EXCEEDS_MAX_U64, FailureClass::ArithmeticError),
++            (c::ZERO_TRADABLE_AMOUNT, FailureClass::ArithmeticError),
++            (c::SQRT_PRICE_OUT_OF_BOUNDS, FailureClass::InvalidPoolState),
++            (
++                c::SQRT_PRICE_LIMIT_OUT_OF_BOUNDS,
++                FailureClass::InvalidPoolState,
++            ),
++            (c::TICK_INDEX_OUT_OF_BOUNDS, FailureClass::InvalidPoolState),
++            (c::INVALID_TICK_INDEX, FailureClass::InvalidPoolState),
++            (c::INVALID_ADAPTIVE_FEE_INFO, FailureClass::InvalidPoolState),
++            // Unrecognised core error: falls to execution_error, not guessed.
++            ("some future core error", FailureClass::ExecutionError),
++        ];
++        for (msg, want) in cases {
++            assert_eq!(
++                MathError::OrcaQuoteFailed(msg).failure_class(),
++                want,
++                "{msg}"
++            );
++        }
++    }
++
++    #[test]
++    fn revalidation_error_classification_table() {
++        let cases = [
++            (RevalidationError::NoSnapshot, FailureClass::StaleState),
++            (
++                RevalidationError::Incoherent { worst_drift: 9 },
++                FailureClass::StaleState,
++            ),
++            (
++                RevalidationError::SnapshotTooOld {
++                    lag: 9,
++                    newest_slot: 9,
++                    max: 5,
++                },
++                FailureClass::StaleState,
++            ),
++            (
++                RevalidationError::CurrentTickArrayMissing { expected_start: 0 },
++                FailureClass::MissingTickArray,
++            ),
++            (
++                RevalidationError::ExecutionArrayMissing { start: 0 },
++                FailureClass::MissingTickArray,
++            ),
++        ];
++        for (err, want) in cases {
++            assert_eq!(err.failure_class(), want, "{err:?}");
++        }
++    }
++
++    #[test]
++    fn tick_array_error_classification_table() {
++        let p = Pubkey::new_unique();
++        let cases = vec![
++            (
++                TickArrayError::TooShort { got: 1, need: 2 },
++                FailureClass::InvalidPoolState,
++            ),
++            (
++                TickArrayError::WrongOwner {
++                    expected: p,
++                    got: p,
++                },
++                FailureClass::InvalidPoolState,
++            ),
++            (
++                TickArrayError::WrongWhirlpool {
++                    expected: p,
++                    found: p,
++                },
++                FailureClass::InvalidPoolState,
++            ),
++            (
++                TickArrayError::InvalidStartTick {
++                    got: 1,
++                    expected: 0,
++                    tick_spacing: 64,
++                },
++                FailureClass::InvalidPoolState,
++            ),
++            (
++                TickArrayError::TickDecode {
++                    index: 0,
++                    source: anyhow::anyhow!("x"),
++                },
++                FailureClass::InvalidPoolState,
++            ),
++            (
++                TickArrayError::MissingNeighbor { expected: 0 },
++                FailureClass::MissingTickArray,
++            ),
++        ];
++        for (err, want) in cases {
++            assert_eq!(err.failure_class(), want, "{err:?}");
++        }
++    }
++
++    #[test]
++    fn cpmm_quote_error_classification_table() {
++        use CpmmQuoteError::*;
++        for (err, want) in [
++            (ZeroReserve, FailureClass::InvalidPoolState),
++            (InvalidCreatorFeeMode, FailureClass::InvalidPoolState),
++            (Token2022Unsupported, FailureClass::InvalidPoolState),
++            (SwapDisabled, FailureClass::InvalidPoolState),
++            (PoolNotOpen, FailureClass::InvalidPoolState),
++            (ReserveFeeUnderflow, FailureClass::ArithmeticError),
++            (ArithmeticOverflow, FailureClass::ArithmeticError),
++            (OutputTooLarge, FailureClass::ArithmeticError),
++            (InsufficientInputAfterFees, FailureClass::ArithmeticError),
++        ] {
++            assert_eq!(err.failure_class(), want, "{err:?}");
++        }
++    }
++
++    // --- anyhow chain classification ---
++
++    #[test]
++    fn chain_classification_sees_through_context() {
++        use anyhow::Context;
++        let programs = atomic_tx_programs(orca(), cpmm());
++        let failure = simulation_outcome(
++            Some(TransactionError::InstructionError(
++                5,
++                InstructionError::Custom(6005),
++            )),
++            &programs,
++        )
++        .unwrap_err();
++
++        let wrapped: anyhow::Error = Err::<(), _>(failure)
++            .context("while simulating")
++            .context("while handling opportunity")
++            .unwrap_err();
++        assert_eq!(
++            classify_error_chain(&wrapped),
++            FailureClass::ExceededSlippage
++        );
++    }
++
++    #[test]
++    fn chain_classification_handles_each_typed_error() {
++        let e: anyhow::Error = MathError::OrcaInsufficientTickCoverage.into();
++        assert_eq!(classify_error_chain(&e), FailureClass::MissingTickArray);
++
++        let e: anyhow::Error = RevalidationError::NoSnapshot.into();
++        assert_eq!(classify_error_chain(&e), FailureClass::StaleState);
++
++        let e: anyhow::Error = TickArrayError::MissingNeighbor { expected: 0 }.into();
++        assert_eq!(classify_error_chain(&e), FailureClass::MissingTickArray);
++
++        let e: anyhow::Error = SimulationFailure::Rpc("x".into()).into();
++        assert_eq!(classify_error_chain(&e), FailureClass::RpcError);
++    }
++
++    #[test]
++    fn client_error_in_chain_is_rpc_error() {
++        use solana_client::client_error::{ClientError, ClientErrorKind};
++        let client_err = ClientError::from(ClientErrorKind::Custom("boom".into()));
++        let e = anyhow::Error::new(client_err).context("Failed to fetch recent blockhash");
++        assert_eq!(classify_error_chain(&e), FailureClass::RpcError);
++    }
++
++    #[test]
++    fn unrecognised_error_defaults_to_execution_error() {
++        let e = anyhow::anyhow!("something we have no type for");
++        assert_eq!(classify_error_chain(&e), FailureClass::ExecutionError);
++    }
++}
+diff --git a/src/main.rs b/src/main.rs
+index 8503e37..49a4b38 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1,6 +1,7 @@
+ mod analyzer;
+ mod config;
+ mod executor;
++mod failure;
+ mod logger;
+ mod scanner;
+ 
+diff --git a/src/scanner/mod.rs b/src/scanner/mod.rs
+index e29d1ea..31474d8 100644
+--- a/src/scanner/mod.rs
++++ b/src/scanner/mod.rs
+@@ -819,7 +819,9 @@ pub async fn run_realtime_loop(
+                     };
+ 
+                     if let Err(reason) = revalidation {
++                        let class = crate::failure::Classify::failure_class(&reason);
+                         tracing::warn!(
++                            failure_class = %class,
+                             "Discarding opportunity before simulation - pre-simulation revalidation failed: {}",
+                             reason
+                         );
+@@ -860,7 +862,28 @@ pub async fn run_realtime_loop(
+                         }
+ 
+                         Err(e) => {
+-                            tracing::error!("Failed to simulate opportunity: {:?}", e);
++                            let class = crate::failure::classify_error_chain(&e);
++                            tracing::error!(
++                                failure_class = %class,
++                                "Failed to simulate opportunity: {:?}",
++                                e
++                            );
++                            let _ = crate::logger::log_row(
++                                pair,
++                                r.price,
++                                o.price,
++                                r.base_liquidity,
++                                r.quote_liquidity,
++                                o.base_liquidity,
++                                o.quote_liquidity,
++                                &opp.buy_dex,
++                                &opp.sell_dex,
++                                opp.raw_spread_pct,
++                                opp.fee_adjusted_spread_pct,
++                                opp.net_spread_after_slippage_pct,
++                                opp.net_profit_pct,
++                                &format!("SIMULATION_FAILED[{}]: {}", class, e),
++                            );
+                         }
+                     }
+                 }
+                 

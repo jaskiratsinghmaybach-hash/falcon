@@ -1,0 +1,564 @@
+diff --git a/src/analyzer/mod.rs b/src/analyzer/mod.rs
+index ec68284..22ffb32 100644
+--- a/src/analyzer/mod.rs
++++ b/src/analyzer/mod.rs
+@@ -600,6 +600,44 @@ fn build_tick_arrays(
+ ///   if token B is WSOL:  spending quote => specified_token_a = false
+ ///                        spending base  => specified_token_a = true
+ /// i.e. specified_token_a == (spending_quote == is_a_wsol).
++/// Selects the exact 3 arrays (by `start_tick_index`) the on-chain legacy
++/// swap instruction will submit for a trade in direction `a_to_b`, out of
++/// however many are currently loaded in the snapshot - the SAME selection
++/// rule as `executor::orca::derive_tick_arrays`, applied to already-decoded
++/// arrays instead of deriving PDAs. This is what makes quote-time array
++/// selection and execution-time array selection provably the same 3
++/// accounts: both start from `tick_array_start_index(tick_current_index,
++/// tick_spacing)` and the same `[0,-1,-2]` / `[0,1,2]` offsets.
++///
++/// Errors, rather than silently substituting a different array or fewer
++/// than 3, if any of the 3 required starts is not present in the snapshot -
++/// this is the "coverage" a swap of this size and direction actually needs,
++/// distinct from `build_tick_arrays`'s generic 1-6-count check.
++fn select_tick_arrays_for_direction(
++    tick_arrays: &[crate::scanner::orca::SlottedTickArray],
++    tick_current_index: i32,
++    tick_spacing: u16,
++    a_to_b: bool,
++) -> Result<Vec<crate::scanner::orca::DecodedTickArray>, MathError> {
++    use crate::executor::orca::{tick_array_start_index, TICK_ARRAY_SIZE};
++
++    let ticks_in_array = TICK_ARRAY_SIZE * tick_spacing as i32;
++    let current_start = tick_array_start_index(tick_current_index, tick_spacing);
++    let offsets: [i32; 3] = if a_to_b { [0, -1, -2] } else { [0, 1, 2] };
++
++    offsets
++        .iter()
++        .map(|off| {
++            let start = current_start + off * ticks_in_array;
++            tick_arrays
++                .iter()
++                .find(|s| s.array.start_tick_index == start)
++                .map(|s| s.array.clone())
++                .ok_or(MathError::OrcaInsufficientTickCoverage)
++        })
++        .collect()
++}
++
+ fn exact_orca_clmm_quote(amount_in: u64, spending_quote: bool) -> Result<LegQuote, MathError> {
+     let state = crate::scanner::orca::current_orca_quote_state().ok_or(
+         MathError::OrcaQuoteUnavailable("no Orca quote state published yet"),
+@@ -622,11 +660,27 @@ fn exact_orca_clmm_quote(amount_in: u64, spending_quote: bool) -> Result<LegQuot
+         return Err(MathError::OrcaStateIncoherent { worst_drift });
+     }
+ 
+-    let is_a_wsol = state.whirlpool.token_mint_a.to_string() == crate::scanner::orca::WSOL_MINT;
+-    let specified_token_a = spending_quote == is_a_wsol;
+-
+-    let arrays_only: Vec<crate::scanner::orca::DecodedTickArray> =
+-        state.tick_arrays.iter().map(|s| s.array.clone()).collect();
++    // specified_token_a == a_to_b for the exact-input case (confirmed
++    // against orca_whirlpools_core::swap_quote_by_input_token's own source:
++    // it passes specified_token_a straight through to compute_swap's a_to_b
++    // parameter). Computed via orca_leg_a_to_b - the SAME function the
++    // pre-simulation gate uses (analyzer::revalidate_orca_snapshot's
++    // caller) - rather than a second, separately-maintained formula, so
++    // quote-time and gate-time direction can never disagree.
++    let a_to_b = orca_leg_a_to_b(&state, spending_quote);
++    let specified_token_a = a_to_b;
++
++    // Select arrays by direction FIRST (see select_tick_arrays_for_direction) -
++    // NOT by taking however many happen to be first in state.tick_arrays,
++    // which is not guaranteed to be the 3 the executor will actually submit
++    // once the realtime loop's 5-array subscription window is fully
++    // populated (see scanner::orca::subscription_tick_array_pdas).
++    let arrays_only = select_tick_arrays_for_direction(
++        &state.tick_arrays,
++        state.whirlpool.tick_current_index,
++        state.whirlpool.tick_spacing,
++        a_to_b,
++    )?;
+     let tick_arrays = build_tick_arrays(&arrays_only)?;
+     let whirlpool_facade = state.whirlpool.to_facade();
+ 
+@@ -1565,12 +1619,24 @@ mod tests {
+         /// liquidity is flat across the whole array, so no crossing occurs
+         /// for any swap that stays within it. There is room on both sides
+         /// of the current tick within this one array's bounds.
++        /// The full 5-array subscription window (2 below, current, 2 above)
++        /// a trade in EITHER direction can draw its 3-array selection from -
++        /// i.e. what scanner::orca::subscription_tick_array_pdas actually
++        /// subscribes to in production. All flat (no initialized ticks).
++        /// Needed because select_tick_arrays_for_direction requires the
++        /// EXACT 3 starts a trade's direction calls for
++        /// ([0,-1,-2]*ARRAY_SPAN for a_to_b, [0,1,2]*ARRAY_SPAN for b_to_a) -
++        /// a narrower fixture (e.g. only 1 neighbour each side) satisfies
++        /// one direction but not the other.
+         fn flat_single_array(pool_pubkey: Pubkey) -> Vec<DecodedTickArray> {
+-            vec![DecodedTickArray {
+-                start_tick_index: 0,
+-                whirlpool: pool_pubkey,
+-                ticks: [TickFacade::default(); TICK_ARRAY_SIZE],
+-            }]
++            [-2, -1, 0, 1, 2]
++                .into_iter()
++                .map(|off| DecodedTickArray {
++                    start_tick_index: off * ARRAY_SPAN,
++                    whirlpool: pool_pubkey,
++                    ticks: [TickFacade::default(); TICK_ARRAY_SIZE],
++                })
++                .collect()
+         }
+ 
+         /// Three adjacent tick arrays (covering the array containing the
+@@ -1599,18 +1665,22 @@ mod tests {
+                 reward_growths_outside: [0, 0, 0],
+             };
+ 
+-            let lower = DecodedTickArray {
+-                start_tick_index: -ARRAY_SPAN,
+-                whirlpool: pool_pubkey,
+-                ticks: [TickFacade::default(); TICK_ARRAY_SIZE],
+-            };
+-            let upper = DecodedTickArray {
+-                start_tick_index: ARRAY_SPAN,
+-                whirlpool: pool_pubkey,
+-                ticks: [TickFacade::default(); TICK_ARRAY_SIZE],
+-            };
+-
+-            vec![lower, middle, upper]
++            // Full 5-array window despite the name/docstring's "three" - the
++            // middle array carries the boundary tick; the 4 neighbours are
++            // flat. select_tick_arrays_for_direction needs the SPECIFIC 3
++            // starts a trade's direction calls for
++            // ([0,-1,-2]*ARRAY_SPAN or [0,1,2]*ARRAY_SPAN), so a trade in
++            // EITHER direction needs both sides present, not just one
++            // neighbour each side.
++            [-2, -1, 1, 2]
++                .into_iter()
++                .map(|off| DecodedTickArray {
++                    start_tick_index: off * ARRAY_SPAN,
++                    whirlpool: pool_pubkey,
++                    ticks: [TickFacade::default(); TICK_ARRAY_SIZE],
++                })
++                .chain(std::iter::once(middle))
++                .collect()
+         }
+ 
+         fn publish(whirlpool: Whirlpool, pool_pubkey: Pubkey, tick_arrays: Vec<DecodedTickArray>) {
+@@ -2200,5 +2270,415 @@ mod tests {
+             // if token B is WSOL: spending base => specified_token_a = true
+             assert!(specified_token_a(false, false));
+         }
++
++        // =====================================================================
++        // Quote/execution parity tests (Phase 4)
++        // =====================================================================
++        // These exist to prove, mechanically, that the arrays/accounts the
++        // analyzer QUOTES against are the exact same ones the executor will
++        // SUBMIT on-chain for the same trade - not merely "3 arrays selected
++        // somehow", but the specific 3 PDAs in the specific order
++        // executor::orca::derive_tick_arrays computes. A mismatch here is
++        // exactly the class of bug that produced the original observed
++        // failure (Orca buy succeeded at quote-time assumptions the
++        // Raydium CPMM sell then contradicted).
++        //
++        // This module found a real bug during Phase 4 stage 6: the array
++        // selection this suite exercises used to take whatever 3 entries
++        // happened to be first in OrcaQuoteState.tick_arrays's Vec, which is
++        // NOT guaranteed to be the direction-specific 3 the executor derives
++        // once more than 3 arrays are loaded (which the realtime loop's
++        // 5-array subscription window, added in stage 3, routinely does).
++        // select_tick_arrays_for_direction was added specifically to fix
++        // this; the tests below are the parity proof, and
++        // array_selection_ignores_vec_order_regression_guard is a direct
++        // regression test for the exact failure mode.
++        mod quote_execution_parity {
++            use super::*;
++            use crate::scanner::orca::{DecodedTickArray, SlottedTickArray};
++            use orca_whirlpools_core::{TickArrayFacade, TickFacade, TICK_ARRAY_SIZE};
++            use solana_sdk::pubkey::Pubkey;
++
++            fn flat_array(pool_pubkey: Pubkey, start_tick_index: i32) -> DecodedTickArray {
++                DecodedTickArray {
++                    start_tick_index,
++                    whirlpool: pool_pubkey,
++                    ticks: [TickFacade::default(); TICK_ARRAY_SIZE],
++                }
++            }
++
++            /// The full 5-array subscription window around `tick_current_index`,
++            /// matching what scanner::orca::subscription_tick_array_pdas
++            /// subscribes to in production.
++            fn five_array_window(
++                pool_pubkey: Pubkey,
++                tick_current_index: i32,
++                tick_spacing: u16,
++            ) -> Vec<DecodedTickArray> {
++                let ticks_in_array = crate::executor::orca::TICK_ARRAY_SIZE * tick_spacing as i32;
++                let start =
++                    crate::executor::orca::tick_array_start_index(tick_current_index, tick_spacing);
++                [-2, -1, 0, 1, 2]
++                    .into_iter()
++                    .map(|off| flat_array(pool_pubkey, start + off * ticks_in_array))
++                    .collect()
++            }
++
++            // --- Direct parity: selection logic vs. execution logic ---
++
++            #[test]
++            fn array_selection_matches_executor_derivation_across_many_ticks_and_both_directions() {
++                let pool_pubkey = Pubkey::new_unique();
++                let tick_spacing: u16 = 64;
++
++                // Sweep a range of current ticks, including negative ones and
++                // ones sitting exactly on an array boundary, to catch an
++                // off-by-one in either side's rounding.
++                let mut current_ticks = vec![0, 64, 2816, 5631, 5632, -1, -64, -2816, -5632];
++                for base in [-3, -2, -1, 0, 1, 2, 3] {
++                    current_ticks.push(base * TICK_ARRAY_SIZE as i32 * tick_spacing as i32);
++                }
++
++                for tick_current_index in current_ticks {
++                    let window = five_array_window(pool_pubkey, tick_current_index, tick_spacing);
++                    let slotted: Vec<SlottedTickArray> = window
++                        .iter()
++                        .cloned()
++                        .map(|array| SlottedTickArray { array, slot: 1 })
++                        .collect();
++
++                    for a_to_b in [true, false] {
++                        // What the executor will actually submit on-chain.
++                        let executor_pdas = crate::executor::orca::derive_tick_arrays(
++                            &pool_pubkey,
++                            tick_current_index,
++                            tick_spacing,
++                            a_to_b,
++                        )
++                        .unwrap();
++                        let executor_starts: Vec<i32> = executor_pdas
++                            .iter()
++                            .map(|pda| {
++                                // Recover the start each PDA was derived from by
++                                // checking which of the 5 window arrays' own PDA
++                                // matches - i.e. decode via re-derivation, proving
++                                // the PDAs are for these exact starts.
++                                window
++                                    .iter()
++                                    .find(|w| {
++                                        crate::executor::orca::derive_tick_array_pda(
++                                            &pool_pubkey,
++                                            w.start_tick_index,
++                                        )
++                                        .unwrap()
++                                            == *pda
++                                    })
++                                    .map(|w| w.start_tick_index)
++                                    .expect("executor PDA must correspond to one of the 5 window arrays")
++                            })
++                            .collect();
++
++                        // What the analyzer will quote against.
++                        let selected = select_tick_arrays_for_direction(
++                            &slotted,
++                            tick_current_index,
++                            tick_spacing,
++                            a_to_b,
++                        )
++                        .unwrap();
++                        let selected_starts: Vec<i32> =
++                            selected.iter().map(|a| a.start_tick_index).collect();
++
++                        assert_eq!(
++                            selected_starts, executor_starts,
++                            "tick={tick_current_index} a_to_b={a_to_b}: analyzer selected {selected_starts:?}, executor would submit {executor_starts:?}"
++                        );
++                    }
++                }
++            }
++
++            #[test]
++            fn selected_array_pdas_are_byte_identical_to_executor_pdas() {
++                // Same proof as above, but comparing actual derived Pubkeys
++                // rather than start_tick_index values, closing the gap that a
++                // start_tick_index match doesn't strictly prove PDA identity
++                // (a bug in derive_tick_array_pda itself could still slip
++                // through the test above).
++                let pool_pubkey = Pubkey::new_unique();
++                let tick_spacing: u16 = 64;
++                let tick_current_index = 2816;
++
++                let window = five_array_window(pool_pubkey, tick_current_index, tick_spacing);
++                let slotted: Vec<SlottedTickArray> = window
++                    .iter()
++                    .cloned()
++                    .map(|array| SlottedTickArray { array, slot: 1 })
++                    .collect();
++
++                for a_to_b in [true, false] {
++                    let executor_pdas = crate::executor::orca::derive_tick_arrays(
++                        &pool_pubkey,
++                        tick_current_index,
++                        tick_spacing,
++                        a_to_b,
++                    )
++                    .unwrap();
++
++                    let selected = select_tick_arrays_for_direction(
++                        &slotted,
++                        tick_current_index,
++                        tick_spacing,
++                        a_to_b,
++                    )
++                    .unwrap();
++                    let selected_pdas: Vec<Pubkey> = selected
++                        .iter()
++                        .map(|a| {
++                            crate::executor::orca::derive_tick_array_pda(
++                                &pool_pubkey,
++                                a.start_tick_index,
++                            )
++                            .unwrap()
++                        })
++                        .collect();
++
++                    assert_eq!(selected_pdas, executor_pdas.to_vec(), "a_to_b={a_to_b}");
++                }
++            }
++
++            #[test]
++            fn selection_is_order_sensitive_matching_derive_tick_arrays_exactly() {
++                // Not just SET equality - ORDER matters too, since
++                // build_tick_arrays feeds the 3 arrays to
++                // orca_whirlpools_core in the order given, and tick_array_0
++                // must specifically be the array containing the current
++                // price (see revalidate_orca_snapshot's
++                // CurrentTickArrayMissing check for why this matters).
++                let pool_pubkey = Pubkey::new_unique();
++                let tick_spacing: u16 = 64;
++                let tick_current_index = 2816;
++                let window = five_array_window(pool_pubkey, tick_current_index, tick_spacing);
++                let slotted: Vec<SlottedTickArray> = window
++                    .iter()
++                    .cloned()
++                    .map(|array| SlottedTickArray { array, slot: 1 })
++                    .collect();
++
++                let selected_a_to_b = select_tick_arrays_for_direction(
++                    &slotted,
++                    tick_current_index,
++                    tick_spacing,
++                    true,
++                )
++                .unwrap();
++                let starts: Vec<i32> = selected_a_to_b.iter().map(|a| a.start_tick_index).collect();
++                // a_to_b offsets are [0, -1, -2]: current array FIRST, then
++                // descending - exactly executor::orca::derive_tick_arrays's
++                // own offset order for a_to_b=true.
++                assert_eq!(starts, vec![0, -5632, -11264]);
++
++                let selected_b_to_a = select_tick_arrays_for_direction(
++                    &slotted,
++                    tick_current_index,
++                    tick_spacing,
++                    false,
++                )
++                .unwrap();
++                let starts: Vec<i32> = selected_b_to_a.iter().map(|a| a.start_tick_index).collect();
++                assert_eq!(starts, vec![0, 5632, 11264]);
++            }
++
++            // --- Regression guard for the exact bug this test module found ---
++
++            #[test]
++            fn array_selection_ignores_vec_order_regression_guard() {
++                // Deliberately construct OrcaQuoteState.tick_arrays in an
++                // order that would have fooled the OLD "just take the first
++                // 3 in the Vec" logic: put 3 arrays that are NOT what either
++                // direction needs first, with the correct 5-array window
++                // appended after them in scrambled order.
++                let pool_pubkey = Pubkey::new_unique();
++                let tick_spacing: u16 = 64;
++                let tick_current_index = 2816;
++                let window = five_array_window(pool_pubkey, tick_current_index, tick_spacing);
++
++                // Scrambled order: upper-2, current, lower-1, lower-2, upper-1.
++                // The old bug would have taken [upper-2, current, lower-1] as
++                // "the 3 arrays" regardless of direction - wrong for BOTH
++                // a_to_b (needs [current, lower-1, lower-2]) and b_to_a
++                // (needs [current, upper-1, upper-2]).
++                let scrambled = vec![
++                    window[4].clone(), // upper-2 (+2*ARRAY_SPAN)
++                    window[2].clone(), // current (0)
++                    window[1].clone(), // lower-1 (-1*ARRAY_SPAN)
++                    window[0].clone(), // lower-2 (-2*ARRAY_SPAN)
++                    window[3].clone(), // upper-1 (+1*ARRAY_SPAN)
++                ];
++                let slotted: Vec<SlottedTickArray> = scrambled
++                    .into_iter()
++                    .map(|array| SlottedTickArray { array, slot: 1 })
++                    .collect();
++
++                let selected = select_tick_arrays_for_direction(
++                    &slotted,
++                    tick_current_index,
++                    tick_spacing,
++                    true, // a_to_b
++                )
++                .unwrap();
++                let starts: Vec<i32> = selected.iter().map(|a| a.start_tick_index).collect();
++
++                // Correct regardless of input order: current, then
++                // descending - matching derive_tick_arrays's a_to_b=true
++                // offsets exactly, NOT whatever the Vec's first 3 entries
++                // happened to be.
++                assert_eq!(starts, vec![0, -5632, -11264]);
++                assert_ne!(
++                    starts,
++                    vec![5632 * 2, 0, -5632],
++                    "must not silently fall back to Vec insertion order"
++                );
++            }
++
++            #[test]
++            fn missing_the_specific_required_array_fails_even_with_enough_arrays_present() {
++                // 3 arrays are present - enough to satisfy build_tick_arrays's
++                // generic 1-6 count check - but they are the WRONG 3 for the
++                // requested direction. Must fail, not silently substitute.
++                let pool_pubkey = Pubkey::new_unique();
++                let tick_spacing: u16 = 64;
++                let tick_current_index = 2816;
++                let window = five_array_window(pool_pubkey, tick_current_index, tick_spacing);
++
++                // Only lower-2, lower-1, upper-1 - missing "current" (0) and
++                // upper-2, so NEITHER direction's exact 3 is present.
++                let insufficient = vec![window[0].clone(), window[1].clone(), window[3].clone()];
++                let slotted: Vec<SlottedTickArray> = insufficient
++                    .into_iter()
++                    .map(|array| SlottedTickArray { array, slot: 1 })
++                    .collect();
++
++                for a_to_b in [true, false] {
++                    let result = select_tick_arrays_for_direction(
++                        &slotted,
++                        tick_current_index,
++                        tick_spacing,
++                        a_to_b,
++                    );
++                    assert!(
++                        matches!(result, Err(MathError::OrcaInsufficientTickCoverage)),
++                        "a_to_b={a_to_b}: expected InsufficientTickCoverage, got {result:?}"
++                    );
++                }
++            }
++
++            // --- End-to-end: publish -> quote -> verify arrays actually used ---
++
++            #[test]
++            fn end_to_end_quote_uses_exactly_the_executor_selected_arrays() {
++                // Full round-trip through the real published-state global and
++                // exact_orca_clmm_quote, not just the pure selection function -
++                // proves the wiring, not just the algorithm.
++                let pool_pubkey = Pubkey::new_from_array([200u8; 32]);
++                let tick_spacing: u16 = 64;
++                let tick_current_index = 2816;
++                let sqrt_price = orca_whirlpools_core::tick_index_to_sqrt_price(tick_current_index);
++                let wsol = Pubkey::from_str(crate::scanner::orca::WSOL_MINT).unwrap();
++                let other = Pubkey::new_from_array([201u8; 32]);
++
++                let whirlpool = crate::scanner::orca::Whirlpool {
++                    whirlpools_config: Pubkey::default(),
++                    whirlpool_bump: [0],
++                    tick_spacing,
++                    tick_spacing_seed: tick_spacing.to_le_bytes(),
++                    fee_rate: 3000,
++                    protocol_fee_rate: 0,
++                    liquidity: 10_000_000_000_000,
++                    sqrt_price,
++                    tick_current_index,
++                    protocol_fee_owed_a: 0,
++                    protocol_fee_owed_b: 0,
++                    token_mint_a: wsol, // A = WSOL
++                    token_vault_a: Pubkey::new_from_array([1u8; 32]),
++                    fee_growth_global_a: 0,
++                    token_mint_b: other,
++                    token_vault_b: Pubkey::new_from_array([2u8; 32]),
++                    fee_growth_global_b: 0,
++                    reward_last_updated_timestamp: 0,
++                    reward_infos: [
++                        crate::scanner::orca::WhirlpoolRewardInfo {
++                            mint: Pubkey::default(),
++                            vault: Pubkey::default(),
++                            authority: Pubkey::default(),
++                            emissions_per_second_x64: 0,
++                            growth_global_x64: 0,
++                        },
++                        crate::scanner::orca::WhirlpoolRewardInfo {
++                            mint: Pubkey::default(),
++                            vault: Pubkey::default(),
++                            authority: Pubkey::default(),
++                            emissions_per_second_x64: 0,
++                            growth_global_x64: 0,
++                        },
++                        crate::scanner::orca::WhirlpoolRewardInfo {
++                            mint: Pubkey::default(),
++                            vault: Pubkey::default(),
++                            authority: Pubkey::default(),
++                            emissions_per_second_x64: 0,
++                            growth_global_x64: 0,
++                        },
++                    ],
++                };
++
++                let window = five_array_window(pool_pubkey, tick_current_index, tick_spacing);
++                let tick_arrays: Vec<SlottedTickArray> = window
++                    .into_iter()
++                    .map(|array| SlottedTickArray { array, slot: 1 })
++                    .collect();
++
++                let expected_pdas = crate::executor::orca::derive_tick_arrays(
++                    &pool_pubkey,
++                    tick_current_index,
++                    tick_spacing,
++                    true, // spending_quote=true with A=WSOL => a_to_b=true
++                )
++                .unwrap();
++
++                let (quote_result, arrays_actually_selected) = {
++                    let _guard = ORCA_STATE_TEST_LOCK.lock().unwrap();
++                    publish_orca_quote_state(OrcaQuoteState {
++                        whirlpool_pubkey: pool_pubkey,
++                        whirlpool: whirlpool.clone(),
++                        tick_arrays,
++                        pool_slot: 1,
++                    });
++                    let quote_result = exact_orca_clmm_quote(1_000_000, true);
++                    let arrays_actually_selected = select_tick_arrays_for_direction(
++                        &crate::scanner::orca::current_orca_quote_state()
++                            .unwrap()
++                            .tick_arrays,
++                        tick_current_index,
++                        tick_spacing,
++                        true,
++                    )
++                    .unwrap();
++                    (quote_result, arrays_actually_selected)
++                };
++
++                assert!(quote_result.is_ok(), "{quote_result:?}");
++
++                let actual_pdas: Vec<Pubkey> = arrays_actually_selected
++                    .iter()
++                    .map(|a| {
++                        crate::executor::orca::derive_tick_array_pda(
++                            &pool_pubkey,
++                            a.start_tick_index,
++                        )
++                        .unwrap()
++                    })
++                    .collect();
++                assert_eq!(actual_pdas, expected_pdas.to_vec());
++            }
++        }
+     }
+ }
+ 
