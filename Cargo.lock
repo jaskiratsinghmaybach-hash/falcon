@@ -1265,7 +1265,6 @@ dependencies = [
  "chrono",
  "csv",
  "dotenvy",
- "ethnum",
  "futures-util",
  "jito-sdk-rust",
  "orca_whirlpools_core",
