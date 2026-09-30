@@ -1,0 +1,505 @@
+diff --git a/src/analyzer/mod.rs b/src/analyzer/mod.rs
+index efeca4a..f78ecb0 100644
+--- a/src/analyzer/mod.rs
++++ b/src/analyzer/mod.rs
+@@ -82,6 +82,11 @@ pub enum RejectReason {
+     /// The cost model's arithmetic failed. This is NOT a market outcome, so it
+     /// must not be reported as "no spread".
+     ArithmeticFailure,
++    /// A leg quote could not be produced (e.g. Orca snapshot not loaded yet,
++    /// tick arrays missing, state incoherent, Raydium state missing). This is
++    /// NOT "no spread": the old code reported these as NoSpread, which hid the
++    /// real problem behind a market-sounding label.
++    QuoteUnavailable(String),
+ }
+ 
+ impl RejectReason {
+@@ -97,6 +102,7 @@ impl RejectReason {
+             } => *net_profit_lamports as f64 / 1_000_000_000.0,
+             RejectReason::StalePrice { age_secs, .. } => *age_secs as f64,
+             RejectReason::ArithmeticFailure => 0.0,
++            RejectReason::QuoteUnavailable(_) => 0.0,
+         }
+     }
+ }
+@@ -549,7 +555,7 @@ fn clmm_output_a_to_b(
+ /// Other constant-product pools use the generic fallback until their
+ /// protocol-specific reconstruction is completed.
+ #[derive(Debug, Clone)]
+-struct LegQuote {
++pub struct LegQuote {
+     pub amount_in_raw: u64,
+     pub amount_out_raw: u64,
+ 
+@@ -1001,14 +1007,24 @@ pub fn find_opportunity(
+     // leg 2 receives the exact raw output produced by leg 1.
+     let buy_quote = match estimate_leg_quote(buy, trade_size_lamports, true) {
+         Ok(v) => v,
+-        Err(_) => return Err(RejectReason::NoSpread),
++        Err(e) => {
++            return Err(RejectReason::QuoteUnavailable(format!(
++                "buy leg on {}: {}",
++                buy.dex, e
++            )))
++        }
+     };
+ 
+     let expected_output_after_buy_raw = buy_quote.amount_out_raw;
+ 
+     let sell_quote = match estimate_leg_quote(sell, expected_output_after_buy_raw, false) {
+         Ok(v) => v,
+-        Err(_) => return Err(RejectReason::NoSpread),
++        Err(e) => {
++            return Err(RejectReason::QuoteUnavailable(format!(
++                "sell leg on {}: {}",
++                sell.dex, e
++            )))
++        }
+     };
+ 
+     let expected_output_after_sell_raw = sell_quote.amount_out_raw;
+@@ -1072,6 +1088,57 @@ pub fn find_opportunity(
+     })
+ }
+ 
++/// DRY-RUN ONLY (enabled by FORCE_SIM in the scanner). Builds an
++/// `Opportunity` in the cheaper->dearer direction using the REAL quotes at
++/// `trade_size_lamports`, but skips every profitability gate. The result is
++/// used solely to exercise the full transaction path (account derivation,
++/// tick arrays, both swap instructions) through `simulateTransaction`, which
++/// spends nothing. It is never a trading decision and is never sent.
++pub fn build_forced_opportunity(
++    price_a: &PriceUpdate,
++    price_b: &PriceUpdate,
++    trade_size_lamports: u64,
++) -> Result<Opportunity, RejectReason> {
++    let (quote_a, base_a) = spot_price_ratio(price_a)?;
++    let (quote_b, base_b) = spot_price_ratio(price_b)?;
++    let (buy, sell) = if quote_a * base_b <= quote_b * base_a {
++        (price_a, price_b)
++    } else {
++        (price_b, price_a)
++    };
++
++    let buy_quote = estimate_leg_quote(buy, trade_size_lamports, true).map_err(|e| {
++        RejectReason::QuoteUnavailable(format!("buy leg on {}: {}", buy.dex, e))
++    })?;
++    let sell_quote = estimate_leg_quote(sell, buy_quote.amount_out_raw, false).map_err(|e| {
++        RejectReason::QuoteUnavailable(format!("sell leg on {}: {}", sell.dex, e))
++    })?;
++
++    let net_profit_lamports = (sell_quote.amount_out_raw as i128)
++        - (trade_size_lamports as i128)
++        - fixed_cost_lamports().map_err(|_| RejectReason::ArithmeticFailure)?;
++
++    Ok(Opportunity {
++        buy_dex: buy.dex.clone(),
++        sell_dex: sell.dex.clone(),
++        pair: price_a.pair.clone(),
++        trade_size_lamports,
++        expected_output_after_buy_raw: buy_quote.amount_out_raw,
++        expected_output_after_sell_raw: sell_quote.amount_out_raw,
++        net_profit_lamports,
++        buy_price: buy.price,
++        sell_price: sell.price,
++        raw_spread_pct: 0.0,
++        fee_adjusted_spread_pct: 0.0,
++        net_spread_after_slippage_pct: 0.0,
++        net_profit_pct: if trade_size_lamports > 0 {
++            net_profit_lamports as f64 / trade_size_lamports as f64 * 100.0
++        } else {
++            0.0
++        },
++    })
++}
++
+ /// Tries several trade sizes (as integer bps fractions of the thinner pool's
+ /// raw reserves) and returns whichever produces the best outcome - either the
+ /// highest-profit approved Opportunity (by integer lamports, not a
+@@ -1147,7 +1214,9 @@ pub fn find_best_opportunity(
+                     RejectReason::FeesExceedSpread { fee_adjusted_bps } => *fee_adjusted_bps,
+                     _ => i128::MIN,
+                 };
+-                if best_opportunity.is_none() && net > least_bad_net {
++                if best_opportunity.is_none()
++                    && (least_bad_rejection.is_none() || net > least_bad_net)
++                {
+                     least_bad_net = net;
+                     least_bad_rejection = Some(reason);
+                 }
+diff --git a/src/executor/mod.rs b/src/executor/mod.rs
+index 5ef05b4..f9cda86 100644
+--- a/src/executor/mod.rs
++++ b/src/executor/mod.rs
+@@ -543,6 +543,10 @@ pub fn simulate_opportunity(
+     cached_blockhash: Option<solana_sdk::hash::Hash>,
+     ata_cache: &AtaCache,
+     orca_state: Option<&crate::scanner::orca::OrcaQuoteState>,
++    // Dry-run plumbing test (FORCE_SIM): drop the sell-leg breakeven floor so
++    // a deliberately unprofitable trade still simulates cleanly. Simulation
++    // only - nothing is ever broadcast by this function.
++    relax_profit_floor: bool,
+ ) -> Result<()> {
+     let wallet = payer.pubkey();
+ 
+@@ -680,7 +684,11 @@ pub fn simulate_opportunity(
+ 
+     let breakeven_lamports = amount_in_lamports + 1_000;
+ 
+-    let sell_minimum_out_lamports = base_sell_minimum_out.max(breakeven_lamports);
++    let sell_minimum_out_lamports = if relax_profit_floor {
++        1
++    } else {
++        base_sell_minimum_out.max(breakeven_lamports)
++    };
+ 
+     let sell_ix = build_leg_instruction(
+         &opportunity.sell_dex,
+diff --git a/src/scanner/mod.rs b/src/scanner/mod.rs
+index e0b6ba3..2c0b75f 100644
+--- a/src/scanner/mod.rs
++++ b/src/scanner/mod.rs
+@@ -67,6 +67,78 @@ enum AccountRole {
+ struct RealtimeEvent {
+     role: AccountRole,
+     update: realtime::AccountUpdate,
++    /// True when this event came from the RPC snapshot poller rather than a
++    /// WebSocket push.
++    via_poll: bool,
++}
++
++/// Sentinel generation for polled tick-array events: "tag me with whatever
++/// the window's generation is at the moment I'm processed", so a window
++/// shift triggered by the pool event just before it cannot make the whole
++/// polled batch look stale.
++const POLLED_GENERATION: u64 = u64::MAX;
++
++/// How often the Orca snapshot is force-refreshed over RPC. The pool and all
++/// window tick arrays are fetched in ONE getMultipleAccounts call, so they
++/// share a single context slot (perfectly coherent). Keep this well under
++/// ~2s: analyzer::MAX_SNAPSHOT_LAG_SLOTS / MAX_COHERENT_SLOT_DRIFT are 5 slots.
++fn orca_poll_interval() -> std::time::Duration {
++    let ms = std::env::var("ORCA_POLL_MS")
++        .ok()
++        .and_then(|v| v.parse::<u64>().ok())
++        .unwrap_or(750)
++        .clamp(200, 1500);
++    std::time::Duration::from_millis(ms)
++}
++
++/// Fetches pool + both vaults + every tick array in the current window in one
++/// RPC call and turns them into synthetic events, so they flow through the
++/// exact same handling code as WebSocket pushes.
++fn poll_orca_events(
++    client: &RpcClient,
++    pool_pubkey: Pubkey,
++    ctx: &orca::OrcaStaticContext,
++    window: &orca::DynamicTickWindow,
++) -> Result<Vec<RealtimeEvent>> {
++    use solana_sdk::commitment_config::CommitmentConfig;
++
++    let mut keys: Vec<Pubkey> = vec![pool_pubkey, ctx.token_vault_a, ctx.token_vault_b];
++    keys.extend(window.window_pdas.iter().copied());
++
++    let response =
++        client.get_multiple_accounts_with_commitment(&keys, CommitmentConfig::confirmed())?;
++    let slot = response.context.slot;
++
++    let mut events = Vec::with_capacity(keys.len());
++    for (i, maybe_account) in response.value.into_iter().enumerate() {
++        let Some(account) = maybe_account else {
++            // A tick array that does not exist on-chain is legitimate (the
++            // range is uninitialised); the pool / vaults must exist.
++            if i < 3 {
++                anyhow::bail!("Orca poll: account {} not found", keys[i]);
++            }
++            continue;
++        };
++        let role = match i {
++            0 => AccountRole::OrcaPoolState,
++            1 => AccountRole::OrcaVaultA,
++            2 => AccountRole::OrcaVaultB,
++            _ => AccountRole::OrcaTickArray {
++                pda: keys[i],
++                generation: POLLED_GENERATION,
++            },
++        };
++        events.push(RealtimeEvent {
++            role,
++            update: realtime::AccountUpdate {
++                data: account.data,
++                owner: account.owner,
++                slot,
++            },
++            via_poll: true,
++        });
++    }
++    Ok(events)
+ }
+ 
+ fn spawn_cancellable_tick_subscriber(
+@@ -81,7 +153,7 @@ fn spawn_cancellable_tick_subscriber(
+     std::thread::spawn(move || {
+         let role = AccountRole::OrcaTickArray { pda, generation };
+         for update in inner_rx {
+-            if tx.send(RealtimeEvent { role, update }).is_err() {
++            if tx.send(RealtimeEvent { role, update, via_poll: false }).is_err() {
+                 break;
+             }
+         }
+@@ -109,7 +181,7 @@ fn spawn_subscriber(
+         });
+ 
+         for update in inner_rx {
+-            if tx.send(RealtimeEvent { role, update }).is_err() {
++            if tx.send(RealtimeEvent { role, update, via_poll: false }).is_err() {
+                 break;
+             }
+         }
+@@ -195,6 +267,80 @@ fn publish_orca_exact_snapshot(
+     );
+ }
+ 
++/// FORCE_SIM=1 dry-run: when the market offers no profitable opportunity
++/// (the normal case), build the cheaper->dearer round trip anyway at a tiny
++/// size and run it through `simulateTransaction`. This proves the whole
++/// transaction path against mainnet state without spending anything, and
++/// without pretending the trade is profitable. Nothing here ever broadcasts.
++fn run_forced_simulation(
++    r: &PriceUpdate,
++    o: &PriceUpdate,
++    capital_source: CapitalSource,
++    exec_ctx: &ExecutionContext,
++    newest_observed_slot: u64,
++) {
++    let requested: u64 = std::env::var("FORCE_SIM_LAMPORTS")
++        .ok()
++        .and_then(|v| v.parse().ok())
++        .unwrap_or(1_000_000);
++    let size = match capital_source {
++        CapitalSource::Wallet { max_lamports } => requested.min(max_lamports),
++        CapitalSource::Pool => requested,
++    };
++
++    let opp = match analyzer::build_forced_opportunity(r, o, size) {
++        Ok(opp) => opp,
++        Err(reason) => {
++            tracing::warn!("[FORCE_SIM] cannot build dry-run opportunity: {:?}", reason);
++            return;
++        }
++    };
++
++    let state = orca::current_orca_quote_state();
++    let orca_is_buy_leg = opp.buy_dex == "Orca";
++    let revalidation = match &state {
++        Some(st) => analyzer::revalidate_orca_snapshot(
++            st,
++            analyzer::orca_leg_a_to_b(st, orca_is_buy_leg),
++            newest_observed_slot,
++        ),
++        None => Err(analyzer::RevalidationError::NoSnapshot),
++    };
++    if let Err(reason) = revalidation {
++        tracing::warn!("[FORCE_SIM] skipped - Orca snapshot not usable: {}", reason);
++        return;
++    }
++
++    tracing::warn!(
++        "[FORCE_SIM] DRY RUN (nothing is sent): buy on {} with {} lamports, sell on {}; expected net {} lamports (unprofitable is expected)",
++        opp.buy_dex,
++        opp.trade_size_lamports,
++        opp.sell_dex,
++        opp.net_profit_lamports
++    );
++
++    let cached_hash = exec_ctx.blockhash_cache.read().ok().map(|guard| *guard);
++    match executor::simulate_opportunity(
++        &exec_ctx.client,
++        &exec_ctx.payer,
++        &opp,
++        &exec_ctx.raydium_ctx,
++        &exec_ctx.orca_ctx,
++        &exec_ctx.other_token_mint,
++        0,
++        cached_hash,
++        &exec_ctx.ata_cache,
++        state.as_ref(),
++        true,
++    ) {
++        Ok(()) => tracing::warn!("[FORCE_SIM] SIMULATION SUCCESS on mainnet state - no funds moved"),
++        Err(e) => {
++            let class = crate::failure::classify_error_chain(&e);
++            tracing::error!(failure_class = %class, "[FORCE_SIM] simulation failed: {:?}", e);
++        }
++    }
++}
++
+ #[allow(clippy::too_many_arguments)]
+ pub async fn run_realtime_loop(
+     ws_url: &str,
+@@ -459,14 +605,61 @@ pub async fn run_realtime_loop(
+     // the pre-simulation gate to judge how far behind the Orca snapshot is.
+     let mut newest_observed_slot: u64 = 0;
+ 
+-    for event in rx {
++    // Orca snapshot poller state. The WebSocket path alone is not enough for
++    // Orca: a quiet pool pushes nothing for long stretches (so the quote
++    // state was never published and every Orca leg failed to quote), and the
++    // 5 extra tick-array sockets can be refused by the RPC provider. Polling
++    // seeds the snapshot immediately and keeps it inside the freshness
++    // window; WebSocket pushes still apply on top, and never roll back a
++    // newer polled state (see the slot guards below).
++    let poll_interval = orca_poll_interval();
++    let mut last_orca_poll = std::time::Instant::now() - poll_interval;
++    let mut pending: std::collections::VecDeque<RealtimeEvent> =
++        std::collections::VecDeque::new();
++    let mut last_forced_sim = std::time::Instant::now() - std::time::Duration::from_secs(3600);
++    let force_sim_enabled = std::env::var("FORCE_SIM").map(|v| v == "1").unwrap_or(false);
++    if force_sim_enabled {
++        tracing::warn!("FORCE_SIM=1: dry-run simulations will be attempted even without a profitable spread (simulate-only, never broadcast)");
++    }
++
++    loop {
++        if let (Some(ctx), Some(pool_pk)) = (&orca_ctx, orca_pool_pubkey) {
++            if last_orca_poll.elapsed() >= poll_interval {
++                last_orca_poll = std::time::Instant::now();
++                if let Some(dw) = dynamic_window.as_ref() {
++                    match poll_orca_events(&client, pool_pk, ctx, dw) {
++                        Ok(events) => pending.extend(events),
++                        Err(e) => tracing::warn!("Orca RPC snapshot poll failed: {e:#}"),
++                    }
++                }
++            }
++        }
++
++        let event = match pending.pop_front() {
++            Some(e) => e,
++            None => match rx.recv_timeout(std::time::Duration::from_millis(100)) {
++                Ok(e) => e,
++                Err(mpsc::RecvTimeoutError::Timeout) => continue,
++                Err(mpsc::RecvTimeoutError::Disconnected) => break,
++            },
++        };
++
+         newest_observed_slot = newest_observed_slot.max(event.update.slot);
+ 
+-        tracing::info!(
+-            "WebSocket event received: {:?} ({} bytes)",
+-            event.role,
+-            event.update.data.len()
+-        );
++        if event.via_poll {
++            tracing::debug!(
++                "RPC poll event: {:?} ({} bytes, slot {})",
++                event.role,
++                event.update.data.len(),
++                event.update.slot
++            );
++        } else {
++            tracing::info!(
++                "WebSocket event received: {:?} ({} bytes)",
++                event.role,
++                event.update.data.len()
++            );
++        }
+ 
+         match event.role {
+             AccountRole::RaydiumPoolState => {
+@@ -570,6 +763,15 @@ pub async fn run_realtime_loop(
+             }
+ 
+             AccountRole::OrcaPoolState => match orca::decode_whirlpool(&event.update.data) {
++                Ok(_)
++                    if orca_whirlpool_decoded
++                        .as_ref()
++                        .map(|(_, s)| event.update.slot < *s)
++                        .unwrap_or(false) =>
++                {
++                    // Older than what we already hold (e.g. a late WebSocket
++                    // push after a newer RPC poll): never roll state back.
++                }
+                 Ok(whirlpool) => {
+                     orca_sqrt_price = whirlpool.sqrt_price;
+                     orca_liquidity = whirlpool.liquidity;
+@@ -695,6 +897,12 @@ pub async fn run_realtime_loop(
+                     continue;
+                 };
+ 
++                let generation = if generation == POLLED_GENERATION {
++                    dw.generation
++                } else {
++                    generation
++                };
++
+                 if generation != dw.generation {
+                     tracing::warn!(
+                         "Ignoring Orca tick-array push for stale subscription generation {} (current: {}) for PDA {}",
+@@ -844,6 +1052,7 @@ pub async fn run_realtime_loop(
+                         cached_hash,
+                         &exec_ctx.ata_cache,
+                         live_orca_state_for_exec.as_ref(),
++                        false,
+                     ) {
+                         Ok(()) => {
+                             tracing::warn!(
+@@ -915,6 +1124,13 @@ pub async fn run_realtime_loop(
+                         reason.as_display_pct(),
+                         &format!("{:?}", reason),
+                     );
++
++                    if force_sim_enabled
++                        && last_forced_sim.elapsed() >= std::time::Duration::from_secs(20)
++                    {
++                        last_forced_sim = std::time::Instant::now();
++                        run_forced_simulation(r, o, capital_source, &exec_ctx, newest_observed_slot);
++                    }
+                 }
+             }
+         }
+diff --git a/src/scanner/orca.rs b/src/scanner/orca.rs
+index d7380a5..039fff1 100644
+--- a/src/scanner/orca.rs
++++ b/src/scanner/orca.rs
+@@ -636,6 +636,13 @@ impl DynamicTickWindow {
+             return Err("Stale generation");
+         }
+         if let Some(idx) = self.window_pdas.iter().position(|p| p == pda) {
++            // Never roll a tick array back to an older slot (a late
++            // WebSocket push can arrive after a newer RPC poll).
++            if let Some((_, existing_slot)) = &self.tick_arrays[idx] {
++                if slot < *existing_slot {
++                    return Ok(false);
++                }
++            }
+             self.tick_arrays[idx] = Some((decoded, slot));
+             Ok(true)
+         } else {
+@@ -1299,6 +1306,27 @@ mod tick_array_tests {
+             assert_eq!(err, Err("Stale generation"));
+         }
+ 
++        #[test]
++        fn older_slot_push_never_rolls_back_newer_polled_tick_array() {
++            let pool_pubkey = Pubkey::new_unique();
++            let mut window = DynamicTickWindow::new(pool_pubkey, 64, 2816).unwrap();
++            let pda = window.window_pdas[2];
++            let decoded = DecodedTickArray {
++                start_tick_index: 0,
++                whirlpool: pool_pubkey,
++                ticks: [TickFacade::default(); TICK_ARRAY_SIZE],
++            };
++
++            // Newer RPC-polled state at slot 200.
++            assert_eq!(window.handle_tick_array_update(&pda, 0, decoded.clone(), 200), Ok(true));
++            // A late WebSocket push from slot 150 must be ignored (Ok(false)).
++            assert_eq!(window.handle_tick_array_update(&pda, 0, decoded.clone(), 150), Ok(false));
++            assert_eq!(window.tick_arrays[2].as_ref().unwrap().1, 200);
++            // An equal-or-newer slot is still accepted.
++            assert_eq!(window.handle_tick_array_update(&pda, 0, decoded, 201), Ok(true));
++            assert_eq!(window.tick_arrays[2].as_ref().unwrap().1, 201);
++        }
++
+         #[test]
+         fn duplicate_subscription_prevention() {
+             let pool_pubkey = Pubkey::new_unique();
+             
