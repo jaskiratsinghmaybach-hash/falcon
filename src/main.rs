@@ -55,7 +55,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Falcon initialized and ready - starting real-time engine");
 
     scanner::run_realtime_loop(
-        &config.helius_ws_url,
+        &config.ws_endpoints,
         &config.helius_rpc_url,
         &config.pair,
         &config.raydium_pool_id,

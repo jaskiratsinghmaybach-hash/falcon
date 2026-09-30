@@ -92,6 +92,16 @@ pub fn fixed_tx_cost_lamports(
 pub struct Config {
     pub helius_rpc_url: String,
     pub helius_ws_url: String,
+    /// Every WebSocket endpoint available for account subscriptions, in
+    /// order. Index 0 is always `helius_ws_url` (HELIUS_WS_URL) for
+    /// backward compatibility; HELIUS_WS_URL_2, HELIUS_WS_URL_3, ... add
+    /// more. Each distinct Helius API key has its own concurrent-
+    /// WebSocket-connection cap (5 on Free as of writing), so splitting
+    /// subscriptions across several keys is how a process that needs more
+    /// than one key's worth of live sockets stays under each individual
+    /// cap. See scanner::mod::ws_endpoint_for, which assigns each
+    /// subscription a fixed slot into this list.
+    pub ws_endpoints: Vec<String>,
     pub keypair: Keypair,
     pub pair: String,
     pub raydium_pool_id: String,
@@ -110,6 +120,32 @@ impl Config {
 
         let helius_ws_url =
             std::env::var("HELIUS_WS_URL").context("HELIUS_WS_URL not set in environment")?;
+
+        // Additional WebSocket endpoints (separate Helius API keys, or any
+        // other RPC provider's WS endpoint) for spreading account
+        // subscriptions across more than one connection-count cap.
+        // HELIUS_WS_URL_2, HELIUS_WS_URL_3, ... - numbering starts at 2
+        // because HELIUS_WS_URL itself is endpoint 1. Stops at the first
+        // gap (e.g. HELIUS_WS_URL_2 set but HELIUS_WS_URL_3 unset ends the
+        // scan at 2 endpoints total) so a typo'd higher number is never
+        // silently skipped over.
+        let mut ws_endpoints = vec![helius_ws_url.clone()];
+        let mut n = 2u32;
+        loop {
+            match std::env::var(format!("HELIUS_WS_URL_{n}")) {
+                Ok(url) if !url.trim().is_empty() => {
+                    ws_endpoints.push(url);
+                    n += 1;
+                }
+                _ => break,
+            }
+        }
+        if ws_endpoints.len() > 1 {
+            tracing::info!(
+                "{} WebSocket endpoint(s) configured for account subscriptions",
+                ws_endpoints.len()
+            );
+        }
 
         let private_key_str = std::env::var("WALLET_PRIVATE_KEY")
             .context("WALLET_PRIVATE_KEY not set in environment")?;
@@ -210,6 +246,7 @@ impl Config {
         Ok(Self {
             helius_rpc_url,
             helius_ws_url,
+            ws_endpoints,
             keypair,
             pair,
             raydium_pool_id,

@@ -57,13 +57,9 @@ enum AccountRole {
     OrcaVaultB,
     /// One of the 5 tick-array accounts in the current subscription
     /// window (see `orca::subscription_tick_array_pdas`), identified by
-    /// its position in that fixed-order array (0..5), NOT by its on-chain
-    /// start_tick_index - the window shifts as price moves, so the same
-    /// index can refer to a different account over the life of the
-    /// process. `role_generation` disambiguates a push against a since-
-    /// superseded window from one that matches the current window.
+    /// its Pubkey and subscription generation.
     OrcaTickArray {
-        index: usize,
+        pda: Pubkey,
         generation: u64,
     },
 }
@@ -71,6 +67,98 @@ enum AccountRole {
 struct RealtimeEvent {
     role: AccountRole,
     update: realtime::AccountUpdate,
+    /// True when this event came from the RPC snapshot poller rather than a
+    /// WebSocket push.
+    via_poll: bool,
+}
+
+/// Sentinel generation for polled tick-array events: "tag me with whatever
+/// the window's generation is at the moment I'm processed", so a window
+/// shift triggered by the pool event just before it cannot make the whole
+/// polled batch look stale.
+const POLLED_GENERATION: u64 = u64::MAX;
+
+/// How often the Orca snapshot is force-refreshed over RPC. The pool and all
+/// window tick arrays are fetched in ONE getMultipleAccounts call, so they
+/// share a single context slot (perfectly coherent). Keep this well under
+/// ~2s: analyzer::MAX_SNAPSHOT_LAG_SLOTS / MAX_COHERENT_SLOT_DRIFT are 5 slots.
+fn orca_poll_interval() -> std::time::Duration {
+    let ms = std::env::var("ORCA_POLL_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(750)
+        .clamp(200, 1500);
+    std::time::Duration::from_millis(ms)
+}
+
+/// Fetches pool + both vaults + every tick array in the current window in one
+/// RPC call and turns them into synthetic events, so they flow through the
+/// exact same handling code as WebSocket pushes.
+fn poll_orca_events(
+    client: &RpcClient,
+    pool_pubkey: Pubkey,
+    ctx: &orca::OrcaStaticContext,
+    window: &orca::DynamicTickWindow,
+) -> Result<Vec<RealtimeEvent>> {
+    use solana_sdk::commitment_config::CommitmentConfig;
+
+    let mut keys: Vec<Pubkey> = vec![pool_pubkey, ctx.token_vault_a, ctx.token_vault_b];
+    keys.extend(window.window_pdas.iter().copied());
+
+    let response =
+        client.get_multiple_accounts_with_commitment(&keys, CommitmentConfig::confirmed())?;
+    let slot = response.context.slot;
+
+    let mut events = Vec::with_capacity(keys.len());
+    for (i, maybe_account) in response.value.into_iter().enumerate() {
+        let Some(account) = maybe_account else {
+            // A tick array that does not exist on-chain is legitimate (the
+            // range is uninitialised); the pool / vaults must exist.
+            if i < 3 {
+                anyhow::bail!("Orca poll: account {} not found", keys[i]);
+            }
+            continue;
+        };
+        let role = match i {
+            0 => AccountRole::OrcaPoolState,
+            1 => AccountRole::OrcaVaultA,
+            2 => AccountRole::OrcaVaultB,
+            _ => AccountRole::OrcaTickArray {
+                pda: keys[i],
+                generation: POLLED_GENERATION,
+            },
+        };
+        events.push(RealtimeEvent {
+            role,
+            update: realtime::AccountUpdate {
+                data: account.data,
+                owner: account.owner,
+                slot,
+            },
+            via_poll: true,
+        });
+    }
+    Ok(events)
+}
+
+fn spawn_cancellable_tick_subscriber(
+    ws_url: String,
+    account_id: String,
+    pda: Pubkey,
+    generation: u64,
+    tx: mpsc::Sender<RealtimeEvent>,
+) -> realtime::CancellableAccountSubscription {
+    let (inner_tx, inner_rx) = mpsc::channel();
+    let sub = realtime::spawn_cancellable_account_subscription(ws_url, account_id, inner_tx);
+    std::thread::spawn(move || {
+        let role = AccountRole::OrcaTickArray { pda, generation };
+        for update in inner_rx {
+            if tx.send(RealtimeEvent { role, update, via_poll: false }).is_err() {
+                break;
+            }
+        }
+    });
+    sub
 }
 
 fn spawn_subscriber(
@@ -93,7 +181,7 @@ fn spawn_subscriber(
         });
 
         for update in inner_rx {
-            if tx.send(RealtimeEvent { role, update }).is_err() {
+            if tx.send(RealtimeEvent { role, update, via_poll: false }).is_err() {
                 break;
             }
         }
@@ -179,9 +267,121 @@ fn publish_orca_exact_snapshot(
     );
 }
 
+/// FORCE_SIM=1 dry-run: when the market offers no profitable opportunity
+/// (the normal case), build the cheaper->dearer round trip anyway at a tiny
+/// size and run it through `simulateTransaction`. This proves the whole
+/// transaction path against mainnet state without spending anything, and
+/// without pretending the trade is profitable. Nothing here ever broadcasts.
+fn run_forced_simulation(
+    r: &PriceUpdate,
+    o: &PriceUpdate,
+    capital_source: CapitalSource,
+    exec_ctx: &ExecutionContext,
+    newest_observed_slot: u64,
+) {
+    let requested: u64 = std::env::var("FORCE_SIM_LAMPORTS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1_000_000);
+    let size = match capital_source {
+        CapitalSource::Wallet { max_lamports } => requested.min(max_lamports),
+        CapitalSource::Pool => requested,
+    };
+
+    let opp = match analyzer::build_forced_opportunity(r, o, size) {
+        Ok(opp) => opp,
+        Err(reason) => {
+            tracing::warn!("[FORCE_SIM] cannot build dry-run opportunity: {:?}", reason);
+            return;
+        }
+    };
+
+    let state = orca::current_orca_quote_state();
+    let orca_is_buy_leg = opp.buy_dex == "Orca";
+    let revalidation = match &state {
+        Some(st) => analyzer::revalidate_orca_snapshot(
+            st,
+            analyzer::orca_leg_a_to_b(st, orca_is_buy_leg),
+            newest_observed_slot,
+        ),
+        None => Err(analyzer::RevalidationError::NoSnapshot),
+    };
+    if let Err(reason) = revalidation {
+        tracing::warn!("[FORCE_SIM] skipped - Orca snapshot not usable: {}", reason);
+        return;
+    }
+
+    tracing::warn!(
+        "[FORCE_SIM] DRY RUN (nothing is sent): buy on {} with {} lamports, sell on {}; expected net {} lamports (unprofitable is expected)",
+        opp.buy_dex,
+        opp.trade_size_lamports,
+        opp.sell_dex,
+        opp.net_profit_lamports
+    );
+
+    let cached_hash = exec_ctx.blockhash_cache.read().ok().map(|guard| *guard);
+    match executor::simulate_opportunity(
+        &exec_ctx.client,
+        &exec_ctx.payer,
+        &opp,
+        &exec_ctx.raydium_ctx,
+        &exec_ctx.orca_ctx,
+        &exec_ctx.other_token_mint,
+        0,
+        cached_hash,
+        &exec_ctx.ata_cache,
+        state.as_ref(),
+        true,
+    ) {
+        Ok(()) => tracing::warn!("[FORCE_SIM] SIMULATION SUCCESS on mainnet state - no funds moved"),
+        Err(e) => {
+            let class = crate::failure::classify_error_chain(&e);
+            tracing::error!(failure_class = %class, "[FORCE_SIM] simulation failed: {:?}", e);
+        }
+    }
+}
+
+/// Which WebSocket key slot (0-based, into `ws_endpoints`) a given
+/// tick-array PDA should use. Deterministic by PDA bytes rather than by
+/// loop position, so a PDA keeps the same key across a window shift (its
+/// subscription is cancelled and a fresh one opened, but always against
+/// the same key) instead of key assignment depending on which iteration
+/// of which loop happened to (re)subscribe it - which could otherwise pile
+/// more than 2-3 tick arrays onto one key over time and blow past its
+/// connection cap. Spreads across TICK_ARRAY_KEY_SLOTS below.
+fn tick_array_key_slot(pda: &Pubkey) -> usize {
+    TICK_ARRAY_KEY_SLOTS[(pda.to_bytes()[0] as usize) % TICK_ARRAY_KEY_SLOTS.len()]
+}
+
+/// Target key slot for each of the 5 window tick arrays, matching the
+/// 3-key Free-tier split documented on `ws_endpoint_for`: 3 land on key 1
+/// (alongside the 2 Orca vaults, 5 total), 2 land on key 2. Assignment is
+/// probabilistic (by PDA byte, not a guaranteed round-robin over the 5
+/// actual window PDAs), so with only 5 PDAs the real split could occasionally
+/// skew - acceptable since even a 4/1 skew (4 on key 1, 1 on key 2) still
+/// fits every key's 5-connection cap alongside what else is assigned to it.
+const TICK_ARRAY_KEY_SLOTS: [usize; 5] = [1, 1, 1, 2, 2];
+
+/// Which of `ws_endpoints` a given account role's WebSocket subscription
+/// should use, as a fixed index (wrapped with `% ws_endpoints.len()` at the
+/// call site so this still works, just over that key's connection cap
+/// instead of erroring, if fewer endpoints are configured than the ideal
+/// 3-key split below assumes).
+///
+/// Split chosen to fit Helius Free's 5-concurrent-connection-per-key cap
+/// with 12 total subscriptions (4 Raydium + 3 Orca top-level + 5 Orca tick
+/// arrays) across 3 keys:
+///   key 0 (5): Raydium pool, AMM config, vault0, vault1, Orca pool state
+///   key 1 (5): Orca vaultA, vaultB, + ~3 tick arrays (see tick_array_key_slot)
+///   key 2 (~2): remaining ~2 tick arrays
+fn ws_endpoint_for<'a>(ws_endpoints: &'a [String], slot: usize) -> &'a str {
+    debug_assert!(!ws_endpoints.is_empty(), "ws_endpoints must not be empty");
+    &ws_endpoints[slot % ws_endpoints.len()]
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run_realtime_loop(
-    ws_url: &str,
+    ws_endpoints: &[String],
     rpc_url: &str,
     pair: &str,
     raydium_pool_id: &str,
@@ -193,6 +393,17 @@ pub async fn run_realtime_loop(
     exec_ctx: ExecutionContext,
 ) -> Result<()> {
     let client = RpcClient::new(rpc_url.to_string());
+
+    if ws_endpoints.len() < 3 {
+        tracing::warn!(
+            "Only {} WebSocket endpoint(s) configured (HELIUS_WS_URL + HELIUS_WS_URL_2/_3/...); \
+             Falcon opens 12 account subscriptions total, and each Helius key is capped at 5 \
+             concurrent WebSocket connections (Free tier) - fewer than 3 keys means some \
+             subscriptions will share a key past its cap and may fail to connect, as seen in \
+             earlier runs. Set HELIUS_WS_URL_2 and HELIUS_WS_URL_3 for a clean 5/5/2 split.",
+            ws_endpoints.len()
+        );
+    }
     let (tx, rx) = mpsc::channel::<RealtimeEvent>();
 
     let raydium_pool_pubkey: Pubkey = raydium_pool_id
@@ -233,7 +444,7 @@ pub async fn run_realtime_loop(
     };
 
     spawn_subscriber(
-        ws_url.to_string(),
+        ws_endpoint_for(ws_endpoints, 0).to_string(),
         raydium_pool_id.to_string(),
         AccountRole::RaydiumPoolState,
         tx.clone(),
@@ -241,21 +452,21 @@ pub async fn run_realtime_loop(
 
     if let Some(ctx) = &cpmm_ctx {
         spawn_subscriber(
-            ws_url.to_string(),
+            ws_endpoint_for(ws_endpoints, 0).to_string(),
             ctx.amm_config.to_string(),
             AccountRole::RaydiumAmmConfig,
             tx.clone(),
         );
 
         spawn_subscriber(
-            ws_url.to_string(),
+            ws_endpoint_for(ws_endpoints, 0).to_string(),
             ctx.token_0_vault.to_string(),
             AccountRole::RaydiumVault0,
             tx.clone(),
         );
 
         spawn_subscriber(
-            ws_url.to_string(),
+            ws_endpoint_for(ws_endpoints, 0).to_string(),
             ctx.token_1_vault.to_string(),
             AccountRole::RaydiumVault1,
             tx.clone(),
@@ -263,7 +474,7 @@ pub async fn run_realtime_loop(
     }
 
     spawn_subscriber(
-        ws_url.to_string(),
+        ws_endpoint_for(ws_endpoints, 0).to_string(),
         orca_pool_id.to_string(),
         AccountRole::OrcaPoolState,
         tx.clone(),
@@ -271,95 +482,57 @@ pub async fn run_realtime_loop(
 
     if let Some(ctx) = &orca_ctx {
         spawn_subscriber(
-            ws_url.to_string(),
+            ws_endpoint_for(ws_endpoints, 1).to_string(),
             ctx.token_vault_a.to_string(),
             AccountRole::OrcaVaultA,
             tx.clone(),
         );
 
         spawn_subscriber(
-            ws_url.to_string(),
+            ws_endpoint_for(ws_endpoints, 1).to_string(),
             ctx.token_vault_b.to_string(),
             AccountRole::OrcaVaultB,
             tx.clone(),
         );
     }
 
-    // Tick-array subscription window (Phase 4 stage 3): fetch the pool's
-    // CURRENT tick_current_index/tick_spacing once up front, derive the
-    // 5-array subscription window around it (orca::subscription_tick_array_pdas),
-    // and subscribe to those 5 accounts.
-    //
-    // KNOWN LIMITATION, stated plainly rather than silently: this window is
-    // fixed for the life of the process. It is NOT re-derived if price
-    // later moves far enough to leave it (a Whirlpool position boundary
-    // crossing into a 4th/5th array beyond what's subscribed). When that
-    // happens, exact_orca_clmm_quote will correctly fail closed with
-    // OrcaInsufficientTickCoverage or return quotes anchored to stale tick
-    // data - Falcon will emit warnings (see the staleness check in the main
-    // loop below) but will NOT automatically re-subscribe to a new window.
-    // Live re-subscription requires an unsubscribe/cleanup path that
-    // realtime::subscribe_to_account does not currently have (each
-    // subscription thread runs for the life of the process with no
-    // cancellation signal) - building that safely is separate follow-up
-    // work, not folded into this stage.
-    let mut orca_tick_window_bounds: Option<(i32, i32)> = None;
-    let orca_tick_array_generation: u64 = 0;
+    // Dynamic tick-array subscription window (Phase 4 Area 3):
+    // Managed dynamically by orca::DynamicTickWindow with cancellable subscriptions.
+    let mut dynamic_window: Option<orca::DynamicTickWindow> = None;
+    let mut tick_sub_handles: std::collections::HashMap<Pubkey, realtime::CancellableAccountSubscription> = std::collections::HashMap::new();
 
     if let Ok(pool_pubkey) = orca_pool_id.parse::<Pubkey>() {
         if let Ok(account) = client.get_account(&pool_pubkey) {
             if let Ok(wp) = orca::decode_whirlpool(&account.data) {
-                match orca::subscription_tick_array_pdas(
-                    &pool_pubkey,
-                    wp.tick_current_index,
-                    wp.tick_spacing,
-                ) {
-                    Ok(window) => {
+                match orca::DynamicTickWindow::new(pool_pubkey, wp.tick_spacing, wp.tick_current_index) {
+                    Ok(dw) => {
                         tracing::info!(
-                            "Orca tick-array subscription window derived at tick {} (spacing {}): {:?}",
+                            "Orca tick-array dynamic window initialized at tick {} (spacing {}): {:?}",
                             wp.tick_current_index,
                             wp.tick_spacing,
-                            window
+                            dw.window_pdas
                         );
-                        for (i, pda) in window.iter().enumerate() {
-                            spawn_subscriber(
-                                ws_url.to_string(),
+                        for pda in &dw.window_pdas {
+                            let sub = spawn_cancellable_tick_subscriber(
+                                ws_endpoint_for(ws_endpoints, tick_array_key_slot(pda)).to_string(),
                                 pda.to_string(),
-                                AccountRole::OrcaTickArray {
-                                    index: i,
-                                    generation: orca_tick_array_generation,
-                                },
+                                *pda,
+                                dw.generation,
                                 tx.clone(),
                             );
+                            tick_sub_handles.insert(*pda, sub);
                         }
-
-                        // Bounds of the ticks the 5-array window actually
-                        // covers, used by the staleness check below to warn
-                        // (not re-subscribe - see the KNOWN LIMITATION note
-                        // above) once live price drifts outside what's
-                        // subscribed.
-                        let ticks_in_array =
-                            crate::executor::orca::TICK_ARRAY_SIZE * wp.tick_spacing as i32;
-                        let window_start = crate::executor::orca::tick_array_start_index(
-                            wp.tick_current_index,
-                            wp.tick_spacing,
-                        );
-                        orca_tick_window_bounds = Some((
-                            window_start - 2 * ticks_in_array,
-                            window_start + 3 * ticks_in_array - 1,
-                        ));
+                        dynamic_window = Some(dw);
                     }
                     Err(e) => {
-                        tracing::warn!(
-                            "Failed to derive Orca tick-array subscription window: {} - exact Orca CLMM quoting will be unavailable",
-                            e
-                        );
+                        tracing::warn!("Failed to initialize Orca dynamic tick window: {e}");
                     }
                 }
             }
         }
     }
 
+    let loop_tx = tx.clone();
     drop(tx);
 
     tracing::info!(
@@ -383,7 +556,6 @@ pub async fn run_realtime_loop(
     let mut orca_liquidity: u128 = 0;
     let mut orca_fee_rate: u16 = 0;
     let mut orca_whirlpool_decoded: Option<(orca::Whirlpool, u64)> = None;
-    let mut orca_tick_arrays: [Option<(orca::DecodedTickArray, u64)>; 5] = Default::default();
     let orca_pool_pubkey: Option<Pubkey> = orca_pool_id.parse().ok();
 
     match decoder {
@@ -482,14 +654,61 @@ pub async fn run_realtime_loop(
     // the pre-simulation gate to judge how far behind the Orca snapshot is.
     let mut newest_observed_slot: u64 = 0;
 
-    for event in rx {
+    // Orca snapshot poller state. The WebSocket path alone is not enough for
+    // Orca: a quiet pool pushes nothing for long stretches (so the quote
+    // state was never published and every Orca leg failed to quote), and the
+    // 5 extra tick-array sockets can be refused by the RPC provider. Polling
+    // seeds the snapshot immediately and keeps it inside the freshness
+    // window; WebSocket pushes still apply on top, and never roll back a
+    // newer polled state (see the slot guards below).
+    let poll_interval = orca_poll_interval();
+    let mut last_orca_poll = std::time::Instant::now() - poll_interval;
+    let mut pending: std::collections::VecDeque<RealtimeEvent> =
+        std::collections::VecDeque::new();
+    let mut last_forced_sim = std::time::Instant::now() - std::time::Duration::from_secs(3600);
+    let force_sim_enabled = std::env::var("FORCE_SIM").map(|v| v == "1").unwrap_or(false);
+    if force_sim_enabled {
+        tracing::warn!("FORCE_SIM=1: dry-run simulations will be attempted even without a profitable spread (simulate-only, never broadcast)");
+    }
+
+    loop {
+        if let (Some(ctx), Some(pool_pk)) = (&orca_ctx, orca_pool_pubkey) {
+            if last_orca_poll.elapsed() >= poll_interval {
+                last_orca_poll = std::time::Instant::now();
+                if let Some(dw) = dynamic_window.as_ref() {
+                    match poll_orca_events(&client, pool_pk, ctx, dw) {
+                        Ok(events) => pending.extend(events),
+                        Err(e) => tracing::warn!("Orca RPC snapshot poll failed: {e:#}"),
+                    }
+                }
+            }
+        }
+
+        let event = match pending.pop_front() {
+            Some(e) => e,
+            None => match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                Ok(e) => e,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            },
+        };
+
         newest_observed_slot = newest_observed_slot.max(event.update.slot);
 
-        tracing::info!(
-            "WebSocket event received: {:?} ({} bytes)",
-            event.role,
-            event.update.data.len()
-        );
+        if event.via_poll {
+            tracing::debug!(
+                "RPC poll event: {:?} ({} bytes, slot {})",
+                event.role,
+                event.update.data.len(),
+                event.update.slot
+            );
+        } else {
+            tracing::info!(
+                "WebSocket event received: {:?} ({} bytes)",
+                event.role,
+                event.update.data.len()
+            );
+        }
 
         match event.role {
             AccountRole::RaydiumPoolState => {
@@ -593,29 +812,61 @@ pub async fn run_realtime_loop(
             }
 
             AccountRole::OrcaPoolState => match orca::decode_whirlpool(&event.update.data) {
+                Ok(_)
+                    if orca_whirlpool_decoded
+                        .as_ref()
+                        .map(|(_, s)| event.update.slot < *s)
+                        .unwrap_or(false) =>
+                {
+                    // Older than what we already hold (e.g. a late WebSocket
+                    // push after a newer RPC poll): never roll state back.
+                }
                 Ok(whirlpool) => {
                     orca_sqrt_price = whirlpool.sqrt_price;
                     orca_liquidity = whirlpool.liquidity;
                     orca_fee_rate = whirlpool.fee_rate;
 
-                    // Staleness check for the KNOWN LIMITATION documented
-                    // where orca_tick_window_bounds is derived: the 5-array
-                    // subscription window is fixed for the process's life
-                    // and is never re-derived. If live price has drifted
-                    // outside the bounds it covered at startup,
-                    // exact_orca_clmm_quote will start failing closed
-                    // (OrcaInsufficientTickCoverage) or quoting against
-                    // stale tick data for any array still nominally in
-                    // range but no longer adjacent to the live tick. Warn
-                    // loudly rather than let that happen silently.
-                    if let Some((lo, hi)) = orca_tick_window_bounds {
-                        if whirlpool.tick_current_index < lo || whirlpool.tick_current_index > hi {
-                            tracing::warn!(
-                                "Orca current tick {} has drifted outside the subscribed tick-array window [{}, {}] - exact CLMM quoting for this pool is now unreliable (stale or insufficient tick-array coverage). Restart the process to re-derive the subscription window at the current price.",
-                                whirlpool.tick_current_index,
-                                lo,
-                                hi
-                            );
+                    // Dynamic tick-array window management (Phase 4 Area 3)
+                    if let Some(dw) = dynamic_window.as_mut() {
+                        match dw.update_whirlpool_tick(whirlpool.tick_current_index) {
+                            Ok(orca::WindowTransition::Shift {
+                                old_generation,
+                                new_generation,
+                                obsolete_pdas,
+                                new_pdas,
+                                retained_pdas,
+                            }) => {
+                                tracing::info!(
+                                    "Orca tick window shifted from gen {} to gen {} at tick {}. Obsolete: {}, New: {}, Retained: {}",
+                                    old_generation,
+                                    new_generation,
+                                    whirlpool.tick_current_index,
+                                    obsolete_pdas.len(),
+                                    new_pdas.len(),
+                                    retained_pdas.len(),
+                                );
+                                // Cancel and unsubscribe obsolete subscriptions
+                                for obs in obsolete_pdas {
+                                    if let Some(handle) = tick_sub_handles.remove(&obs) {
+                                        handle.cancel_and_join();
+                                    }
+                                }
+                                // Start subscriptions for newly required PDAs
+                                for new_pda in new_pdas {
+                                    let sub = spawn_cancellable_tick_subscriber(
+                                        ws_endpoint_for(ws_endpoints, tick_array_key_slot(&new_pda)).to_string(),
+                                        new_pda.to_string(),
+                                        new_pda,
+                                        new_generation,
+                                        loop_tx.clone(),
+                                    );
+                                    tick_sub_handles.insert(new_pda, sub);
+                                }
+                            }
+                            Ok(orca::WindowTransition::NoOp) => {}
+                            Err(e) => {
+                                tracing::warn!("Failed to update dynamic tick window: {e}");
+                            }
                         }
                     }
 
@@ -632,11 +883,11 @@ pub async fn run_realtime_loop(
                         ));
                     }
 
-                    publish_orca_exact_snapshot(
-                        orca_pool_pubkey,
-                        &orca_whirlpool_decoded,
-                        &orca_tick_arrays,
-                    );
+                    if let Some(dw) = dynamic_window.as_ref() {
+                        orca::publish_orca_quote_state(
+                            dw.current_quote_state(whirlpool, event.update.slot),
+                        );
+                    }
                 }
 
                 Err(e) => {
@@ -690,76 +941,70 @@ pub async fn run_realtime_loop(
                 }
             }
 
-            AccountRole::OrcaTickArray { index, generation } => {
-                if generation != orca_tick_array_generation {
-                    // Push arrived for a subscription window that has
-                    // since been superseded (see the KNOWN LIMITATION note
-                    // where the window is derived: today generation never
-                    // actually advances past 0, so this branch is
-                    // unreachable in practice, but the check is kept as a
-                    // hard guard against ever silently blending two
-                    // different windows' arrays into one OrcaQuoteState if
-                    // dynamic re-subscription is added later without
-                    // updating this check).
-                    tracing::warn!(
-                        "Ignoring Orca tick-array push for stale subscription generation {} (current: {})",
-                        generation,
-                        orca_tick_array_generation
-                    );
-                } else {
-                    match orca::decode_tick_array(&event.update.data) {
-                        Ok(decoded) => {
-                            let expected_whirlpool = orca_pool_pubkey;
-                            let whirlpool_ok = expected_whirlpool
-                                .map(|p| p == decoded.whirlpool)
-                                .unwrap_or(false);
+            AccountRole::OrcaTickArray { pda, generation } => {
+                let Some(dw) = dynamic_window.as_mut() else {
+                    continue;
+                };
 
-                            if !whirlpool_ok {
+                let generation = if generation == POLLED_GENERATION {
+                    dw.generation
+                } else {
+                    generation
+                };
+
+                if generation != dw.generation {
+                    tracing::warn!(
+                        "Ignoring Orca tick-array push for stale subscription generation {} (current: {}) for PDA {}",
+                        generation,
+                        dw.generation,
+                        pda
+                    );
+                    continue;
+                }
+
+                match orca::decode_tick_array(&event.update.data) {
+                    Ok(decoded) => {
+                        let expected_whirlpool = orca_pool_pubkey;
+                        let whirlpool_ok = expected_whirlpool
+                            .map(|p| p == decoded.whirlpool)
+                            .unwrap_or(false);
+
+                        if !whirlpool_ok {
+                            tracing::warn!(
+                                "Orca tick-array push for PDA {} belongs to whirlpool {}, expected {:?} - discarding",
+                                pda,
+                                decoded.whirlpool,
+                                expected_whirlpool
+                            );
+                        } else if let Some((wp, pool_slot)) = &orca_whirlpool_decoded {
+                            if let Err(e) = orca::validate_tick_array(
+                                &decoded,
+                                &decoded.whirlpool,
+                                wp.tick_spacing,
+                            ) {
                                 tracing::warn!(
-                                    "Orca tick-array push at window slot {} belongs to whirlpool {}, expected {:?} - discarding",
-                                    index,
-                                    decoded.whirlpool,
-                                    expected_whirlpool
+                                    "Orca tick-array push for PDA {} failed validation: {}",
+                                    pda,
+                                    e
                                 );
-                            } else if let Some((wp, _pool_slot)) = &orca_whirlpool_decoded {
-                                if let Err(e) = orca::validate_tick_array(
-                                    &decoded,
-                                    &decoded.whirlpool,
-                                    wp.tick_spacing,
-                                ) {
-                                    tracing::warn!(
-                                        "Orca tick-array push at window slot {} failed validation: {}",
-                                        index,
-                                        e
-                                    );
-                                } else {
-                                    orca_tick_arrays[index] = Some((decoded, event.update.slot));
-                                    publish_orca_exact_snapshot(
-                                        orca_pool_pubkey,
-                                        &orca_whirlpool_decoded,
-                                        &orca_tick_arrays,
-                                    );
-                                }
-                            } else {
-                                // Pool state not decoded yet (e.g. a tick
-                                // array push arrived before the first
-                                // whirlpool push) - store it unvalidated-
-                                // against-tick-spacing for now; it will be
-                                // covered by publish_orca_exact_snapshot's
-                                // next call once the whirlpool push does
-                                // arrive, and by then any genuinely wrong
-                                // array would already have been caught by
-                                // the whirlpool-ownership check above.
-                                orca_tick_arrays[index] = Some((decoded, event.update.slot));
+                            } else if let Ok(true) = dw.handle_tick_array_update(
+                                &pda,
+                                generation,
+                                decoded,
+                                event.update.slot,
+                            ) {
+                                orca::publish_orca_quote_state(
+                                    dw.current_quote_state(wp.clone(), *pool_slot),
+                                );
                             }
                         }
-                        Err(e) => {
-                            tracing::warn!(
-                                "Failed to decode Orca tick-array push at window slot {}: {}",
-                                index,
-                                e
-                            );
-                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to decode Orca tick-array push for PDA {}: {}",
+                            pda,
+                            e
+                        );
                     }
                 }
             }
@@ -844,6 +1089,7 @@ pub async fn run_realtime_loop(
                         continue;
                     }
 
+                    let live_orca_state_for_exec = orca::current_orca_quote_state();
                     match executor::simulate_opportunity(
                         &exec_ctx.client,
                         &exec_ctx.payer,
@@ -854,6 +1100,8 @@ pub async fn run_realtime_loop(
                         0,
                         cached_hash,
                         &exec_ctx.ata_cache,
+                        live_orca_state_for_exec.as_ref(),
+                        false,
                     ) {
                         Ok(()) => {
                             tracing::warn!(
@@ -925,10 +1173,93 @@ pub async fn run_realtime_loop(
                         reason.as_display_pct(),
                         &format!("{:?}", reason),
                     );
+
+                    if force_sim_enabled
+                        && last_forced_sim.elapsed() >= std::time::Duration::from_secs(20)
+                    {
+                        last_forced_sim = std::time::Instant::now();
+                        run_forced_simulation(r, o, capital_source, &exec_ctx, newest_observed_slot);
+                    }
                 }
             }
         }
     }
 
     Ok(())
+}
+
+
+#[cfg(test)]
+mod key_split_tests {
+    use super::*;
+
+    #[test]
+    fn ws_endpoint_for_wraps_when_fewer_keys_than_slots() {
+        let endpoints = vec!["key0".to_string()];
+        // With only 1 key configured, every slot must resolve to it rather
+        // than panicking or silently dropping the subscription.
+        assert_eq!(ws_endpoint_for(&endpoints, 0), "key0");
+        assert_eq!(ws_endpoint_for(&endpoints, 1), "key0");
+        assert_eq!(ws_endpoint_for(&endpoints, 2), "key0");
+    }
+
+    #[test]
+    fn ws_endpoint_for_selects_correct_key_with_three_configured() {
+        let endpoints = vec!["key0".to_string(), "key1".to_string(), "key2".to_string()];
+        assert_eq!(ws_endpoint_for(&endpoints, 0), "key0");
+        assert_eq!(ws_endpoint_for(&endpoints, 1), "key1");
+        assert_eq!(ws_endpoint_for(&endpoints, 2), "key2");
+    }
+
+    #[test]
+    fn tick_array_key_slot_is_deterministic_for_the_same_pda() {
+        let pda = Pubkey::new_unique();
+        let a = tick_array_key_slot(&pda);
+        let b = tick_array_key_slot(&pda);
+        assert_eq!(a, b, "the same PDA must always land on the same key slot");
+    }
+
+    #[test]
+    fn tick_array_key_slot_only_ever_returns_key_1_or_key_2() {
+        // TICK_ARRAY_KEY_SLOTS reserves key 0 for Raydium + Orca pool
+        // state (already at its 5-connection cap); tick arrays must never
+        // be assigned there.
+        for _ in 0..64 {
+            let pda = Pubkey::new_unique();
+            let slot = tick_array_key_slot(&pda);
+            assert!(slot == 1 || slot == 2, "unexpected key slot {slot} for tick array");
+        }
+    }
+
+    #[test]
+    fn full_twelve_subscription_split_respects_five_connection_cap_per_key() {
+        // Simulates the real assignment: 5 fixed top-level subscriptions
+        // (3 on key 0, 2 on key 1) plus 5 tick-array PDAs distributed by
+        // tick_array_key_slot, and checks every key's total against
+        // Helius Free's cap of 5 concurrent connections.
+        let mut counts = std::collections::HashMap::new();
+        // Raydium: pool, amm_config, vault0, vault1 -> key 0 (slot 0)
+        for _ in 0..4 {
+            *counts.entry(0usize).or_insert(0) += 1;
+        }
+        // Orca pool state -> key 0 (slot 0)
+        *counts.entry(0usize).or_insert(0) += 1;
+        // Orca vaultA, vaultB -> key 1 (slot 1)
+        for _ in 0..2 {
+            *counts.entry(1usize).or_insert(0) += 1;
+        }
+        // 5 tick arrays, worst case all land on the same key (adversarial
+        // PDA bytes) - even then, key 0 (already at 5) must not receive
+        // any, since tick_array_key_slot never returns 0.
+        for _ in 0..5 {
+            let pda = Pubkey::new_unique();
+            *counts.entry(tick_array_key_slot(&pda)).or_insert(0) += 1;
+        }
+        assert_eq!(*counts.get(&0).unwrap(), 5, "key 0 must be exactly the 5 fixed subscriptions");
+        assert!(counts.get(&0).copied().unwrap_or(0) <= 5);
+        // Keys 1 and 2 together hold exactly: 2 fixed (Orca vaults) + 5 tick arrays = 7
+        let k1 = counts.get(&1).copied().unwrap_or(0);
+        let k2 = counts.get(&2).copied().unwrap_or(0);
+        assert_eq!(k1 + k2, 7, "Orca vaults + all 5 tick arrays must total 7 across keys 1 and 2");
+    }
 }
