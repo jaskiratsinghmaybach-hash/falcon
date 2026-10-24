@@ -44,6 +44,9 @@ pub struct ExecutionContext {
     pub other_token_mint: Pubkey,
     pub blockhash_cache: executor::BlockhashCache,
     pub ata_cache: executor::AtaCache,
+    pub mode: crate::risk::ExecutionMode,
+    pub risk: crate::risk::RiskManager,
+    pub ledger: crate::ledger::Ledger,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -327,13 +330,13 @@ fn run_forced_simulation(
         &exec_ctx.raydium_ctx,
         &exec_ctx.orca_ctx,
         &exec_ctx.other_token_mint,
-        0,
         cached_hash,
         &exec_ctx.ata_cache,
         state.as_ref(),
+        0,
         true,
     ) {
-        Ok(()) => tracing::warn!("[FORCE_SIM] SIMULATION SUCCESS on mainnet state - no funds moved"),
+        Ok(_) => tracing::warn!("[FORCE_SIM] SIMULATION SUCCESS on mainnet state - no funds moved"),
         Err(e) => {
             let class = crate::failure::classify_error_chain(&e);
             tracing::error!(failure_class = %class, "[FORCE_SIM] simulation failed: {:?}", e);
@@ -390,7 +393,7 @@ pub async fn run_realtime_loop(
     _trade_size_hint: f64,
     max_price_age_secs: u64,
     capital_source: CapitalSource,
-    exec_ctx: ExecutionContext,
+    mut exec_ctx: ExecutionContext,
 ) -> Result<()> {
     let client = RpcClient::new(rpc_url.to_string());
 
@@ -1089,24 +1092,126 @@ pub async fn run_realtime_loop(
                         continue;
                     }
 
+                    // Mode + risk gate. Observe stops here; every mode gets the
+                    // min-profit / size / duplicate checks; Live also gets the
+                    // kill-switch and circuit breakers.
+                    if exec_ctx.mode == crate::risk::ExecutionMode::Observe {
+                        continue;
+                    }
+                    match exec_ctx.risk.check(&opp, std::time::Instant::now()) {
+                        crate::risk::Decision::Allow => {}
+                        crate::risk::Decision::Skip(reason) => {
+                            tracing::info!("Risk gate skipped opportunity: {}", reason);
+                            continue;
+                        }
+                        crate::risk::Decision::Halt(reason) => {
+                            tracing::error!("TRADING HALTED: {}", reason);
+                            return Err(anyhow::anyhow!("TRADING HALTED: {reason}"));
+                        }
+                    }
+
                     let live_orca_state_for_exec = orca::current_orca_quote_state();
-                    match executor::simulate_opportunity(
+                    let min_profit = exec_ctx.risk.min_profit_lamports();
+                    let mode_str = exec_ctx.mode.to_string();
+                    let sim = executor::simulate_opportunity(
                         &exec_ctx.client,
                         &exec_ctx.payer,
                         &opp,
                         &exec_ctx.raydium_ctx,
                         &exec_ctx.orca_ctx,
                         &exec_ctx.other_token_mint,
-                        0,
                         cached_hash,
                         &exec_ctx.ata_cache,
                         live_orca_state_for_exec.as_ref(),
+                        min_profit,
                         false,
-                    ) {
-                        Ok(()) => {
+                    );
+
+                    match sim {
+                        Ok(report) => {
                             tracing::warn!(
-                                "Opportunity simulated successfully - see logs above for sim result."
+                                "Opportunity simulated successfully ({} mode, expected net {} lamports).",
+                                mode_str,
+                                opp.net_profit_lamports
                             );
+                            let mut row = crate::ledger::LedgerRow {
+                                mode: &mode_str,
+                                pair,
+                                buy_dex: &opp.buy_dex,
+                                sell_dex: &opp.sell_dex,
+                                size_lamports: opp.trade_size_lamports,
+                                expected_net_lamports: opp.net_profit_lamports,
+                                outcome: "SIM_OK",
+                                units_consumed: report.units_consumed,
+                                signature: None,
+                                realized_pnl_lamports: None,
+                            };
+
+                            if exec_ctx.mode == crate::risk::ExecutionMode::Live {
+                                let sent = executor::send_opportunity(
+                                    &exec_ctx.client,
+                                    &exec_ctx.payer,
+                                    &opp,
+                                    &exec_ctx.raydium_ctx,
+                                    &exec_ctx.orca_ctx,
+                                    &exec_ctx.other_token_mint,
+                                    &exec_ctx.ata_cache,
+                                    live_orca_state_for_exec.as_ref(),
+                                    min_profit,
+                                    exec_ctx.risk.wallet_reserve_lamports(),
+                                );
+                                match sent {
+                                    Ok(rep) => {
+                                        let outcome = if rep.landed && rep.tx_error.is_none() {
+                                            crate::risk::LiveOutcome::Confirmed {
+                                                pnl_lamports: rep.pnl_lamports,
+                                            }
+                                        } else {
+                                            crate::risk::LiveOutcome::Failed {
+                                                cost_lamports: (-rep.pnl_lamports).max(0),
+                                            }
+                                        };
+                                        let label = match (&rep.tx_error, rep.landed) {
+                                            (None, true) => "LIVE_CONFIRMED".to_string(),
+                                            (Some(e), true) => format!("LIVE_REVERTED[{e}]"),
+                                            (_, false) => "LIVE_NOT_LANDED".to_string(),
+                                        };
+                                        tracing::warn!(
+                                            "{} sig={} realized pnl {} lamports (expected {})",
+                                            label,
+                                            rep.signature,
+                                            rep.pnl_lamports,
+                                            opp.net_profit_lamports
+                                        );
+                                        exec_ctx.risk.record_live_outcome(outcome);
+                                        row.outcome = &label;
+                                        row.signature = Some(rep.signature.to_string());
+                                        row.realized_pnl_lamports = Some(rep.pnl_lamports);
+                                        let _ = exec_ctx.ledger.append(&row);
+                                        tracing::warn!(
+                                            "Session PnL {} lamports over {} live trade(s)",
+                                            exec_ctx.risk.session_pnl_lamports(),
+                                            exec_ctx.risk.live_trades()
+                                        );
+                                    }
+                                    Err(e) => {
+                                        // Failed before broadcast (funds check,
+                                        // preflight rejection): nothing landed,
+                                        // so it is NOT counted as a live trade.
+                                        let class = crate::failure::classify_error_chain(&e);
+                                        tracing::error!(
+                                            failure_class = %class,
+                                            "Live send aborted before landing: {:?}",
+                                            e
+                                        );
+                                        let label = format!("LIVE_SEND_ABORTED[{}]", class);
+                                        row.outcome = &label;
+                                        let _ = exec_ctx.ledger.append(&row);
+                                    }
+                                }
+                            } else {
+                                let _ = exec_ctx.ledger.append(&row);
+                            }
                         }
 
                         Err(e) => {
@@ -1116,6 +1221,19 @@ pub async fn run_realtime_loop(
                                 "Failed to simulate opportunity: {:?}",
                                 e
                             );
+                            let label = format!("SIM_FAILED[{}]", class);
+                            let _ = exec_ctx.ledger.append(&crate::ledger::LedgerRow {
+                                mode: &mode_str,
+                                pair,
+                                buy_dex: &opp.buy_dex,
+                                sell_dex: &opp.sell_dex,
+                                size_lamports: opp.trade_size_lamports,
+                                expected_net_lamports: opp.net_profit_lamports,
+                                outcome: &label,
+                                units_consumed: None,
+                                signature: None,
+                                realized_pnl_lamports: None,
+                            });
                             let _ = crate::logger::log_row(
                                 pair,
                                 r.price,

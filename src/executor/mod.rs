@@ -316,8 +316,14 @@ pub fn check_wallet_atas(
     Ok((wsol_ata, wsol_exists, other_ata, other_exists))
 }
 
+/// What a successful simulation reports.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SimReport {
+    pub units_consumed: Option<u64>,
+}
+
 fn simulate(client: &RpcClient, payer: &Keypair, instructions: Vec<Instruction>) -> Result<()> {
-    simulate_with_blockhash(client, payer, instructions, None)
+    simulate_with_blockhash(client, payer, instructions, None).map(|_| ())
 }
 
 /// Simulate a transaction and enforce simulation truth.
@@ -341,7 +347,7 @@ fn simulate_with_blockhash(
     payer: &Keypair,
     instructions: Vec<Instruction>,
     cached_blockhash: Option<solana_sdk::hash::Hash>,
-) -> Result<()> {
+) -> Result<SimReport> {
     let recent_blockhash = match cached_blockhash {
         Some(h) => h,
         None => client
@@ -398,7 +404,9 @@ fn simulate_with_blockhash(
 
     tracing::info!("SIMULATION SUCCESS: transaction executed successfully with no error");
 
-    Ok(())
+    Ok(SimReport {
+        units_consumed: sim.value.units_consumed,
+    })
 }
 
 /// Builds a single swap instruction for the named DEX, spending `input_mint`
@@ -526,30 +534,56 @@ fn build_leg_instruction(
     }
 }
 
-/// Builds and simulates the full atomic arbitrage transaction.
-///
-/// Never sends anything - simulation only.
-///
-/// The analyzer's expected buy output is used directly as the sell input.
+/// Slippage tolerance applied to each leg's expected output when deriving its
+/// `minimum_amount_out`. The sell leg is additionally floored at break-even
+/// plus fees plus the required profit margin (see `sell_minimum_out`).
+const SLIPPAGE_TOLERANCE_BPS: u32 = 100;
+
+/// Minimum SOL the sell leg must return. The chain enforces this, so a trade
+/// that would lose money after fees reverts (costing only the tx fee) instead
+/// of completing. `relax_profit_floor` is the FORCE_SIM plumbing test only.
+pub fn sell_minimum_out(
+    expected_sell_raw: u64,
+    amount_in_lamports: u64,
+    min_profit_lamports: i128,
+    relax_profit_floor: bool,
+) -> Result<u64> {
+    if relax_profit_floor {
+        return Ok(1);
+    }
+
+    let base = analyzer::calculate_minimum_out_raw(expected_sell_raw, SLIPPAGE_TOLERANCE_BPS)
+        .context("Failed to compute sell-leg minimum_out")?;
+
+    let fixed_cost = crate::config::fixed_tx_cost_lamports(
+        crate::config::TX_SIGNATURES,
+        crate::config::COMPUTE_UNIT_LIMIT,
+        crate::config::COMPUTE_UNIT_PRICE_MICRO_LAMPORTS,
+    )
+    .context("fixed tx cost overflow")?;
+
+    let floor =
+        crate::risk::sell_leg_floor_lamports(amount_in_lamports, fixed_cost, min_profit_lamports)
+            .context("sell-leg floor overflow")?;
+
+    Ok(base.max(floor))
+}
+
+/// Builds the full atomic arbitrage instruction list (compute budget, any
+/// missing ATAs, wrap, buy leg, sell leg). Simulation and broadcast both use
+/// exactly this list, so what is simulated is what is sent.
 #[allow(clippy::too_many_arguments)]
-pub fn simulate_opportunity(
-    client: &RpcClient,
-    payer: &Keypair,
+fn build_opportunity_instructions(
+    wallet: Pubkey,
     opportunity: &Opportunity,
     raydium_ctx: &RaydiumPoolContext,
     orca_ctx: &OrcaPoolContext,
     other_token_mint: &Pubkey,
-    other_token_decimals: u32,
-    cached_blockhash: Option<solana_sdk::hash::Hash>,
     ata_cache: &AtaCache,
     orca_state: Option<&crate::scanner::orca::OrcaQuoteState>,
-    // Dry-run plumbing test (FORCE_SIM): drop the sell-leg breakeven floor so
-    // a deliberately unprofitable trade still simulates cleanly. Simulation
-    // only - nothing is ever broadcast by this function.
+    min_profit_lamports: i128,
     relax_profit_floor: bool,
-) -> Result<()> {
-    let wallet = payer.pubkey();
-
+) -> Result<Vec<Instruction>> {
     let token_program = Pubkey::from_str(TOKEN_PROGRAM_ID)?;
 
     let wsol_mint = Pubkey::from_str(WSOL_MINT)?;
@@ -560,8 +594,6 @@ pub fn simulate_opportunity(
         other_ata,
         other_exists,
     } = *ata_cache;
-
-    let _ = other_token_decimals;
 
     let amount_in_lamports = opportunity.trade_size_lamports;
 
@@ -597,8 +629,6 @@ pub fn simulate_opportunity(
         &token_program,
         &wsol_ata,
     )?);
-
-    const SLIPPAGE_TOLERANCE_BPS: u32 = 100;
 
     let buy_minimum_out_raw = analyzer::calculate_minimum_out_raw(
         opportunity.expected_output_after_buy_raw,
@@ -676,19 +706,12 @@ pub fn simulate_opportunity(
         ),
     );
 
-    let base_sell_minimum_out = analyzer::calculate_minimum_out_raw(
+    let sell_minimum_out_lamports = sell_minimum_out(
         opportunity.expected_output_after_sell_raw,
-        SLIPPAGE_TOLERANCE_BPS,
-    )
-    .context("Failed to compute sell-leg minimum_out")?;
-
-    let breakeven_lamports = amount_in_lamports + 1_000;
-
-    let sell_minimum_out_lamports = if relax_profit_floor {
-        1
-    } else {
-        base_sell_minimum_out.max(breakeven_lamports)
-    };
+        amount_in_lamports,
+        min_profit_lamports,
+        relax_profit_floor,
+    )?;
 
     let sell_ix = build_leg_instruction(
         &opportunity.sell_dex,
@@ -706,14 +729,223 @@ pub fn simulate_opportunity(
     instructions.push(sell_ix);
 
     tracing::info!(
-        "Built atomic opportunity tx: buy on {} ({} lamports SOL in), sell on {} ({} raw units token in)",
+        "Built atomic opportunity tx: buy on {} ({} lamports SOL in), sell on {} ({} raw units token in, floor {} lamports out)",
         opportunity.buy_dex,
         amount_in_lamports,
         opportunity.sell_dex,
-        other_token_amount_raw
+        other_token_amount_raw,
+        sell_minimum_out_lamports
     );
 
+    Ok(instructions)
+}
+
+/// Builds and simulates the full atomic arbitrage transaction.
+///
+/// Never sends anything - simulation only.
+///
+/// The analyzer's expected buy output is used directly as the sell input.
+#[allow(clippy::too_many_arguments)]
+pub fn simulate_opportunity(
+    client: &RpcClient,
+    payer: &Keypair,
+    opportunity: &Opportunity,
+    raydium_ctx: &RaydiumPoolContext,
+    orca_ctx: &OrcaPoolContext,
+    other_token_mint: &Pubkey,
+    cached_blockhash: Option<solana_sdk::hash::Hash>,
+    ata_cache: &AtaCache,
+    orca_state: Option<&crate::scanner::orca::OrcaQuoteState>,
+    min_profit_lamports: i128,
+    // Dry-run plumbing test (FORCE_SIM): drop the sell-leg breakeven floor so
+    // a deliberately unprofitable trade still simulates cleanly. Simulation
+    // only - nothing is ever broadcast by this function.
+    relax_profit_floor: bool,
+) -> Result<SimReport> {
+    let instructions = build_opportunity_instructions(
+        payer.pubkey(),
+        opportunity,
+        raydium_ctx,
+        orca_ctx,
+        other_token_mint,
+        ata_cache,
+        orca_state,
+        min_profit_lamports,
+        relax_profit_floor,
+    )?;
+
     simulate_with_blockhash(client, payer, instructions, cached_blockhash)
+}
+
+/// Outcome of one broadcast attempt. `pnl_lamports` is the measured change in
+/// wallet SOL + WSOL value (negative = the fee or a loss), never an estimate.
+#[derive(Debug, Clone)]
+pub struct SendReport {
+    pub signature: solana_sdk::signature::Signature,
+    /// The transaction reached `confirmed` commitment (successfully OR with an
+    /// on-chain error - a reverted tx still lands and pays its fee).
+    pub landed: bool,
+    /// On-chain error, if the transaction landed but failed.
+    pub tx_error: Option<String>,
+    pub pnl_lamports: i128,
+}
+
+/// Wallet value in lamports: native SOL plus the WSOL ATA's token balance,
+/// both read at `confirmed` commitment (the default RpcClient commitment is
+/// `finalized`, which lags and would make a fresh trade look like zero).
+pub fn wallet_value_lamports(
+    client: &RpcClient,
+    wallet: &Pubkey,
+    wsol_ata: &Pubkey,
+) -> Result<i128> {
+    use solana_sdk::commitment_config::CommitmentConfig;
+    let confirmed = CommitmentConfig::confirmed();
+
+    let sol = client
+        .get_balance_with_commitment(wallet, confirmed)
+        .context("Failed to read wallet SOL balance")?
+        .value;
+
+    // A missing WSOL ATA is a legitimate zero balance.
+    let wsol = match client.get_token_account_balance_with_commitment(wsol_ata, confirmed) {
+        Ok(resp) => resp.value.amount.parse::<u64>().unwrap_or(0),
+        Err(_) => 0,
+    };
+
+    Ok(sol as i128 + wsol as i128)
+}
+
+/// LIVE ONLY. Builds the same atomic transaction that was just simulated,
+/// broadcasts it, and waits until it lands or its blockhash expires, then
+/// measures the real PnL from wallet balances.
+///
+/// Safety properties:
+/// - atomic: both legs are in ONE transaction, so a failed leg reverts both;
+/// - the sell leg carries an on-chain floor (see `sell_minimum_out`), so a
+///   trade that would lose money reverts and costs only the fee;
+/// - refuses to send if the wallet cannot cover size + fee + reserve;
+/// - node-side preflight simulation stays ON.
+#[allow(clippy::too_many_arguments)]
+pub fn send_opportunity(
+    client: &RpcClient,
+    payer: &Keypair,
+    opportunity: &Opportunity,
+    raydium_ctx: &RaydiumPoolContext,
+    orca_ctx: &OrcaPoolContext,
+    other_token_mint: &Pubkey,
+    ata_cache: &AtaCache,
+    orca_state: Option<&crate::scanner::orca::OrcaQuoteState>,
+    min_profit_lamports: i128,
+    wallet_reserve_lamports: u64,
+) -> Result<SendReport> {
+    use solana_client::rpc_config::RpcSendTransactionConfig;
+    use solana_sdk::commitment_config::{CommitmentConfig, CommitmentLevel};
+
+    let wallet = payer.pubkey();
+
+    let fixed_cost = crate::config::fixed_tx_cost_lamports(
+        crate::config::TX_SIGNATURES,
+        crate::config::COMPUTE_UNIT_LIMIT,
+        crate::config::COMPUTE_UNIT_PRICE_MICRO_LAMPORTS,
+    )
+    .context("fixed tx cost overflow")?;
+
+    let sol_balance = client
+        .get_balance_with_commitment(&wallet, CommitmentConfig::confirmed())
+        .context("Failed to read wallet balance before send")?
+        .value;
+    crate::risk::check_wallet_funds(
+        sol_balance,
+        opportunity.trade_size_lamports,
+        fixed_cost,
+        wallet_reserve_lamports,
+    )?;
+
+    let value_before = wallet_value_lamports(client, &wallet, &ata_cache.wsol_ata)?;
+
+    let instructions = build_opportunity_instructions(
+        wallet,
+        opportunity,
+        raydium_ctx,
+        orca_ctx,
+        other_token_mint,
+        ata_cache,
+        orca_state,
+        min_profit_lamports,
+        false,
+    )?;
+
+    // Fresh blockhash WITH its validity height: that height is how we know,
+    // later, that an unconfirmed transaction can never land.
+    let (blockhash, last_valid_block_height) = client
+        .get_latest_blockhash_with_commitment(CommitmentConfig::confirmed())
+        .context("Failed to fetch blockhash for send")?;
+
+    let message = Message::new(&instructions, Some(&wallet));
+    let mut tx = Transaction::new_unsigned(message);
+    tx.sign(&[payer], blockhash);
+
+    let signature = client
+        .send_transaction_with_config(
+            &tx,
+            RpcSendTransactionConfig {
+                skip_preflight: false,
+                preflight_commitment: Some(CommitmentLevel::Confirmed),
+                ..RpcSendTransactionConfig::default()
+            },
+        )
+        .map_err(|e| anyhow::anyhow!("Broadcast rejected before landing: {e}"))?;
+
+    tracing::warn!("LIVE: transaction broadcast, signature {signature}");
+
+    // Wait for the outcome. Only conclude "dropped" once the blockhash has
+    // expired - before that the transaction may still land, and guessing
+    // would let the next trade run on an unknown wallet state.
+    let mut landed = false;
+    let mut tx_error: Option<String> = None;
+    loop {
+        match client.get_signature_statuses(&[signature]) {
+            Ok(resp) => {
+                if let Some(Some(status)) = resp.value.first() {
+                    if status.satisfies_commitment(CommitmentConfig::confirmed()) {
+                        landed = true;
+                        tx_error = status.err.as_ref().map(|e| format!("{e:?}"));
+                        break;
+                    }
+                }
+            }
+            Err(e) => tracing::warn!("signature status poll failed: {e}"),
+        }
+
+        match client.get_block_height_with_commitment(CommitmentConfig::confirmed()) {
+            Ok(height) if height > last_valid_block_height => {
+                // One last look: the status can race the height check.
+                if let Ok(resp) = client.get_signature_statuses(&[signature]) {
+                    if let Some(Some(status)) = resp.value.first() {
+                        if status.satisfies_commitment(CommitmentConfig::confirmed()) {
+                            landed = true;
+                            tx_error = status.err.as_ref().map(|e| format!("{e:?}"));
+                        }
+                    }
+                }
+                break;
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!("block height poll failed: {e}"),
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(400));
+    }
+
+    let value_after = wallet_value_lamports(client, &wallet, &ata_cache.wsol_ata)?;
+    let pnl_lamports = value_after - value_before;
+
+    Ok(SendReport {
+        signature,
+        landed,
+        tx_error,
+        pnl_lamports,
+    })
 }
 
 use solana_sdk::hash::Hash;
@@ -806,4 +1038,38 @@ pub fn ensure_wallet_atas(
     }
 
     Ok((wsol_ata, other_ata))
+}
+
+#[cfg(test)]
+mod sell_floor_tests {
+    use super::*;
+
+    // fixed cost = 13_750 (see config cost model)
+    #[test]
+    fn floor_binds_when_profit_is_thin() {
+        // 1 SOL in, expected out only 0.3% above: 1% slippage base (0.99*) is
+        // BELOW break-even, so the fee+margin floor must win.
+        let out = sell_minimum_out(1_003_000_000, 1_000_000_000, 50_000, false).unwrap();
+        assert_eq!(out, 1_000_000_000 + 13_750 + 50_000);
+    }
+
+    #[test]
+    fn slippage_base_binds_when_profit_is_fat() {
+        let out = sell_minimum_out(1_100_000_000, 1_000_000_000, 50_000, false).unwrap();
+        assert!(out > 1_000_000_000 + 13_750 + 50_000);
+        assert!(out < 1_100_000_000);
+    }
+
+    #[test]
+    fn floor_never_allows_a_net_loss() {
+        for expected in [1_000_000_000u64, 1_000_100_000, 1_050_000_000] {
+            let out = sell_minimum_out(expected, 1_000_000_000, 0, false).unwrap();
+            assert!(out >= 1_000_000_000 + 13_750);
+        }
+    }
+
+    #[test]
+    fn relaxed_floor_is_only_for_force_sim() {
+        assert_eq!(sell_minimum_out(5, 1_000_000_000, 50_000, true).unwrap(), 1);
+    }
 }

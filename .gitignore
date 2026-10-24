@@ -5,3 +5,7 @@ opportunity_log.csv
 
 *.csv
 *.log
+paper_trades.csv
+live_trades.csv
+HALT
+falcon.zip

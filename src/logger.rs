@@ -46,6 +46,9 @@ pub fn log_row(
         .context("Failed to open log file for appending")?;
 
     let timestamp = chrono::Utc::now().to_rfc3339();
+    // Status can carry free text (error chains with commas/newlines) that
+    // would corrupt the CSV.
+    let status = crate::ledger::sanitize_field(status);
 
     writeln!(
         file,

@@ -2,7 +2,9 @@ mod analyzer;
 mod config;
 mod executor;
 mod failure;
+mod ledger;
 mod logger;
+mod risk;
 mod scanner;
 
 use solana_client::rpc_client::RpcClient;
@@ -21,6 +23,18 @@ async fn main() -> anyhow::Result<()> {
 
     let config = config::Config::load()?;
 
+    // Execution mode + risk limits. Defaults to PAPER (simulate only, never
+    // broadcast). LIVE refuses to start without every guard in place.
+    let mode = risk::mode_from_env()?;
+    let wallet_capital = matches!(config.capital_source, config::CapitalSource::Wallet { .. });
+    risk::validate_live_prerequisites(mode, wallet_capital, risk::read_live_ack()?.as_deref())?;
+    let max_trade = match config.capital_source {
+        config::CapitalSource::Wallet { max_lamports } => max_lamports,
+        config::CapitalSource::Pool => u64::MAX,
+    };
+    let limits = risk::RiskLimits::from_env(max_trade)?;
+    tracing::warn!("EXECUTION MODE: {} | risk limits: {:?}", mode, limits);
+
     let blockhash_cache = executor::spawn_blockhash_poller(config.helius_rpc_url.clone(), 1500)?;
     tracing::info!("Background blockhash cache started (1500ms interval)");
 
@@ -38,8 +52,18 @@ async fn main() -> anyhow::Result<()> {
         orca_exec_ctx.info.token_mint_a
     };
 
-    executor::ensure_wallet_atas(&exec_client, &config.keypair, &other_token_mint)
-        .expect("Failed to ensure wallet ATAs exist");
+    // Creating ATAs sends a real transaction and spends rent, so it is LIVE
+    // only. In OBSERVE/PAPER missing ATAs are just included in the simulated
+    // transaction instead.
+    if mode == risk::ExecutionMode::Live {
+        tracing::warn!(
+            "LIVE MODE: real funds from wallet {}. Starting in 10s - Ctrl+C now to abort.",
+            config.keypair.pubkey()
+        );
+        std::thread::sleep(std::time::Duration::from_secs(10));
+        executor::ensure_wallet_atas(&exec_client, &config.keypair, &other_token_mint)
+            .expect("Failed to ensure wallet ATAs exist");
+    }
 
     let ata_cache =
         executor::AtaCache::load(&exec_client, &config.keypair.pubkey(), &other_token_mint)
@@ -72,6 +96,12 @@ async fn main() -> anyhow::Result<()> {
             other_token_mint,
             blockhash_cache,
             ata_cache,
+            mode,
+            risk: risk::RiskManager::new(mode, limits),
+            ledger: ledger::Ledger::open(match mode {
+                risk::ExecutionMode::Live => "live_trades.csv",
+                _ => "paper_trades.csv",
+            })?,
         },
     )
     .await?;
