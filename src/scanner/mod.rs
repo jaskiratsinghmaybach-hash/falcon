@@ -46,6 +46,8 @@ pub struct ExecutionContext {
     pub ata_cache: executor::AtaCache,
     pub live_trading: bool,
     pub exec_cooldown_ms: u64,
+    pub extras: executor::ExecExtras,
+    pub jito: Option<executor::jito::JitoSender>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -346,6 +348,7 @@ fn run_forced_simulation(
         cached_hash,
         &exec_ctx.ata_cache,
         state.as_ref(),
+        &exec_ctx.extras,
         true,
     ) {
         Ok(()) => {
@@ -1138,6 +1141,8 @@ pub async fn run_realtime_loop(
                         cached_hash,
                         &exec_ctx.ata_cache,
                         live_orca_state_for_exec.as_ref(),
+                        &exec_ctx.extras,
+                        exec_ctx.jito.as_ref(),
                         exec_ctx.live_trading,
                     ) {
                         Ok(outcome) => {

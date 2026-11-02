@@ -7,25 +7,13 @@ pub enum DecoderType {
     Amm,
 }
 
-/// Where trade size limits come from - this is the foundation for the
-/// flash-loan integration. Two modes today, a third to come:
+/// Where trade capital comes from (`MTS` in .env):
 ///
-/// - `Wallet`: trade size is capped to what the wallet can actually afford
-///   (a real lamport ceiling), regardless of how deep the pool is. This is
-///   the mode to run in BEFORE flash loans are wired up - the wallet is
-///   real capital, so sizing must respect its real balance.
-/// - `Pool`: trade size is NOT capped by wallet balance at all - sizing
-///   stays purely a function of pool depth, exactly as `find_best_opportunity`
-///   already computes it. This is the flash-loan placeholder: once a flash
-///   loan instruction is wired into the executor, this variant is where that
-///   capital is assumed to come from instead of the wallet, so pool-depth
-///   sizing becomes correct rather than dangerous.
-///
-/// Selected via `MTS` in .env (`WALLET` or `POOL`). Nothing about
-/// `find_best_opportunity`'s sizing logic changes based on this - it always
-/// proposes the same pool-depth-based candidate sizes; this only decides
-/// whether those candidates get clamped against a real balance before being
-/// evaluated.
+/// - `Wallet`: the wallet funds the trade; size is capped at
+///   `MAX_TRADE_SIZE_LAMPORTS`.
+/// - `Pool`: the trade is funded by a Kamino flash loan borrowed and repaid
+///   inside the same atomic transaction (`executor::kamino`), so size is a
+///   function of pool depth only. The wallet only pays fees, rent and tip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CapitalSource {
     Wallet { max_lamports: u64 },
@@ -42,14 +30,13 @@ pub enum CapitalSource {
 // charged ~15x the real cost and rejected profitable trades).
 //
 // Falcon submits ONE atomic transaction (buy leg + sell leg), signed by ONE
-// key, with a compute-unit limit and compute-unit price. There is no Jito
-// bundle and no tip. Real cost of that transaction:
+// key, with a compute-unit limit and compute-unit price. Fixed cost:
 //
 //   base fee     = LAMPORTS_PER_SIGNATURE * signatures
 //   priority fee = ceil(compute_unit_limit * compute_unit_price_micro / 1_000_000)
 //
-// Jito tips and flash loans are deferred future optimizations; nothing here
-// models them.
+// On top of that, per-trade variable costs (`variable_cost_lamports`): the
+// Kamino flash-loan fee in POOL mode and the Jito tip when Jito is enabled.
 // ===========================================================================
 
 /// Solana's fixed base fee per transaction signature.
@@ -83,6 +70,32 @@ static MIN_PROFIT_LAMPORTS: std::sync::OnceLock<u64> = std::sync::OnceLock::new(
 /// `MIN_PROFIT_LAMPORTS` in `Config::load`; 0 until then.
 pub fn min_profit_lamports() -> u64 {
     MIN_PROFIT_LAMPORTS.get().copied().unwrap_or(0)
+}
+
+static FLASH_LOAN_FEE_SF: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+static JITO_TIP_LAMPORTS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+/// Set once at startup from the on-chain Kamino reserve (POOL mode).
+pub fn set_flash_loan_fee_sf(fee_sf: u64) {
+    let _ = FLASH_LOAN_FEE_SF.set(fee_sf);
+}
+
+/// Jito tip per trade (`JITO_TIP_LAMPORTS`); 0 = Jito disabled.
+pub fn jito_tip_lamports() -> u64 {
+    JITO_TIP_LAMPORTS.get().copied().unwrap_or(0)
+}
+
+/// Flash-loan fee for borrowing `trade_size_lamports` (0 outside POOL mode).
+pub fn flash_loan_fee_lamports(trade_size_lamports: u64) -> Option<u64> {
+    match FLASH_LOAN_FEE_SF.get() {
+        Some(fee_sf) => crate::executor::kamino::flash_fee_lamports(*fee_sf, trade_size_lamports),
+        None => Some(0),
+    }
+}
+
+/// Per-trade costs on top of the fixed tx cost: flash-loan fee + Jito tip.
+pub fn variable_cost_lamports(trade_size_lamports: u64) -> Option<u64> {
+    flash_loan_fee_lamports(trade_size_lamports)?.checked_add(jito_tip_lamports())
 }
 
 /// Priority fee in lamports, rounded UP (the runtime rounds up, so rounding
@@ -135,6 +148,13 @@ pub struct Config {
     /// Minimum milliseconds between two live sends (`EXEC_COOLDOWN_MS`),
     /// so the same stale opportunity is not re-sent on every push.
     pub exec_cooldown_ms: u64,
+    /// Kamino reserve to flash-borrow from (`KAMINO_RESERVE`); set in POOL mode.
+    pub kamino_reserve: Option<solana_sdk::pubkey::Pubkey>,
+    /// Jito block engine base URL; `Some` when `JITO_TIP_LAMPORTS` > 0.
+    pub jito_block_engine_url: Option<String>,
+    /// Address lookup tables for v0 transactions (`LOOKUP_TABLES`, comma
+    /// separated). POOL mode defaults to Kamino's main-market table.
+    pub lookup_tables: Vec<solana_sdk::pubkey::Pubkey>,
 }
 
 impl Config {
@@ -261,14 +281,54 @@ impl Config {
             "1" | "true" | "yes"
         );
 
-        // POOL mode sizes trades by pool depth, assuming flash-loan capital
-        // that does not exist yet. Broadcasting that would just fail (or
-        // drain the wallet), so refuse the combination outright.
-        if live_trading && capital_source == CapitalSource::Pool {
+        let kamino_reserve: Option<solana_sdk::pubkey::Pubkey> =
+            if capital_source == CapitalSource::Pool {
+                let reserve = std::env::var("KAMINO_RESERVE")
+                    .unwrap_or_else(|_| crate::executor::kamino::DEFAULT_SOL_RESERVE.to_string());
+                Some(
+                    reserve
+                        .trim()
+                        .parse()
+                        .context("KAMINO_RESERVE must be a valid pubkey")?,
+                )
+            } else {
+                None
+            };
+
+        let lookup_tables: Vec<solana_sdk::pubkey::Pubkey> = match std::env::var("LOOKUP_TABLES") {
+            Ok(v) => v
+                .split(',')
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(|t| {
+                    t.parse()
+                        .context("LOOKUP_TABLES entries must be valid pubkeys")
+                })
+                .collect::<Result<_>>()?,
+            Err(_) if capital_source == CapitalSource::Pool => {
+                vec![crate::executor::kamino::MAIN_MARKET_LOOKUP_TABLE
+                    .parse()
+                    .expect("valid pubkey")]
+            }
+            Err(_) => Vec::new(),
+        };
+
+        let jito_tip: u64 = std::env::var("JITO_TIP_LAMPORTS")
+            .unwrap_or_else(|_| "0".to_string())
+            .trim()
+            .parse()
+            .context("JITO_TIP_LAMPORTS must be a valid u64")?;
+        if jito_tip > 0 && jito_tip < crate::executor::jito::MIN_TIP_LAMPORTS {
             anyhow::bail!(
-                "LIVE_TRADING=1 requires MTS=WALLET: POOL sizing assumes flash-loan capital that is not wired in"
+                "JITO_TIP_LAMPORTS must be 0 (disabled) or >= {}",
+                crate::executor::jito::MIN_TIP_LAMPORTS
             );
         }
+        let _ = JITO_TIP_LAMPORTS.set(jito_tip);
+        let jito_block_engine_url = (jito_tip > 0).then(|| {
+            std::env::var("JITO_BLOCK_ENGINE_URL")
+                .unwrap_or_else(|_| crate::executor::jito::DEFAULT_BLOCK_ENGINE_URL.to_string())
+        });
 
         let exec_cooldown_ms: u64 = std::env::var("EXEC_COOLDOWN_MS")
             .unwrap_or_else(|_| "2000".to_string())
@@ -301,12 +361,15 @@ impl Config {
                 );
             }
             CapitalSource::Pool => {
-                tracing::warn!(
-                    "Capital source: POOL (trade size NOT capped to wallet balance - \
-                     this mode assumes flash-loan-funded capital; do not run this against \
-                     a real wallet's own funds)"
+                tracing::info!(
+                    "Capital source: POOL (Kamino flash loan from reserve {})",
+                    kamino_reserve.map(|r| r.to_string()).unwrap_or_default()
                 );
             }
+        }
+        match &jito_block_engine_url {
+            Some(url) => tracing::info!("Jito: ON, tip {} lamports via {}", jito_tip, url),
+            None => tracing::info!("Jito: off (JITO_TIP_LAMPORTS=0), sending via RPC"),
         }
 
         Ok(Self {
@@ -322,6 +385,9 @@ impl Config {
             capital_source,
             live_trading,
             exec_cooldown_ms,
+            kamino_reserve,
+            jito_block_engine_url,
+            lookup_tables,
         })
     }
 }

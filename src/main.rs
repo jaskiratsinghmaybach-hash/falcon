@@ -68,6 +68,59 @@ async fn main() -> anyhow::Result<()> {
         ata_cache.other_exists
     );
 
+    let flash = match config.kamino_reserve {
+        Some(reserve_id) => {
+            let reserve = executor::kamino::KaminoReserve::load(&exec_client, &reserve_id)
+                .context("Failed to load Kamino flash-loan reserve")?;
+            if reserve.liquidity_mint.to_string() != executor::WSOL_MINT
+                || reserve.token_program.to_string() != executor::TOKEN_PROGRAM_ID
+            {
+                anyhow::bail!(
+                    "Kamino reserve {} lends {} (token program {}); POOL mode needs a WSOL / SPL Token reserve",
+                    reserve_id,
+                    reserve.liquidity_mint,
+                    reserve.token_program
+                );
+            }
+            config::set_flash_loan_fee_sf(reserve.flash_loan_fee_sf);
+            tracing::info!(
+                "Kamino flash loans: reserve {}, fee {} lamports per SOL, {} lamports available",
+                reserve_id,
+                reserve.flash_fee(1_000_000_000).unwrap_or(0),
+                reserve.available_amount
+            );
+            Some(reserve)
+        }
+        None => None,
+    };
+    let mut lookup_tables = Vec::new();
+    for key in &config.lookup_tables {
+        let account = exec_client
+            .get_account(key)
+            .with_context(|| format!("Failed to fetch lookup table {key}"))?;
+        let table =
+            solana_sdk::address_lookup_table::state::AddressLookupTable::deserialize(&account.data)
+                .map_err(|e| {
+                    anyhow::anyhow!("Account {key} is not an address lookup table: {e}")
+                })?;
+        tracing::info!(
+            "Lookup table {} loaded ({} addresses)",
+            key,
+            table.addresses.len()
+        );
+        lookup_tables.push(
+            solana_sdk::address_lookup_table::AddressLookupTableAccount {
+                key: *key,
+                addresses: table.addresses.to_vec(),
+            },
+        );
+    }
+
+    let jito = config
+        .jito_block_engine_url
+        .as_deref()
+        .map(executor::jito::JitoSender::new);
+
     tracing::info!("Falcon initialized and ready - starting real-time engine");
 
     scanner::run_realtime_loop(
@@ -90,6 +143,12 @@ async fn main() -> anyhow::Result<()> {
             ata_cache,
             live_trading: config.live_trading,
             exec_cooldown_ms: config.exec_cooldown_ms,
+            extras: executor::ExecExtras {
+                flash,
+                jito_tip_lamports: config::jito_tip_lamports(),
+                lookup_tables,
+            },
+            jito,
         },
     )
     .await?;
