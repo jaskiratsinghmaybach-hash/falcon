@@ -58,12 +58,32 @@ pub const LAMPORTS_PER_SIGNATURE: u64 = 5_000;
 /// Signatures on Falcon's atomic transaction (fee payer only).
 pub const TX_SIGNATURES: u64 = 1;
 
-/// Compute-unit limit requested by the executor's atomic transaction.
-pub const COMPUTE_UNIT_LIMIT: u32 = 350_000;
+/// Compute-unit limit requested by the executor's atomic transaction. The
+/// full round trip (ATA create, wrap, CPMM + Orca swaps, unwrap) measured
+/// ~70k CU on mainnet; 200k leaves headroom for multi-tick Orca swaps.
+pub const COMPUTE_UNIT_LIMIT: u32 = 200_000;
 
 /// Compute-unit price (micro-lamports per CU) requested by the executor.
 /// Must equal what the executor passes to `set_compute_unit_price`.
 pub const COMPUTE_UNIT_PRICE_MICRO_LAMPORTS: u64 = 25_000;
+
+/// Slippage tolerance (bps) on the buy leg's `minimum_amount_out`. The sell
+/// leg spends exactly this guaranteed minimum (never more than the buy leg
+/// can have produced), and the analyzer prices the sell leg on the same
+/// amount, so analyzer and executor stay in lockstep. 0 = the buy leg must
+/// deliver at least the exact quoted output or the whole transaction reverts.
+pub const BUY_LEG_SLIPPAGE_BPS: u32 = 0;
+
+static MIN_PROFIT_LAMPORTS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+/// Minimum net profit (lamports, after tx fees) an opportunity must clear.
+/// Enforced twice: by the analyzer when approving, and ON-CHAIN by the sell
+/// leg's `minimum_amount_out`, so a transaction that would land below this
+/// reverts atomically instead of losing money. Set once from
+/// `MIN_PROFIT_LAMPORTS` in `Config::load`; 0 until then.
+pub fn min_profit_lamports() -> u64 {
+    MIN_PROFIT_LAMPORTS.get().copied().unwrap_or(0)
+}
 
 /// Priority fee in lamports, rounded UP (the runtime rounds up, so rounding
 /// down here would under-price the transaction). `None` on overflow.
@@ -109,6 +129,12 @@ pub struct Config {
     pub decoder: DecoderType,
     pub max_price_age_secs: u64,
     pub capital_source: CapitalSource,
+    /// `LIVE_TRADING=1`: broadcast transactions that pass simulation.
+    /// Default off (simulate-only).
+    pub live_trading: bool,
+    /// Minimum milliseconds between two live sends (`EXEC_COOLDOWN_MS`),
+    /// so the same stale opportunity is not re-sent on every push.
+    pub exec_cooldown_ms: u64,
 }
 
 impl Config {
@@ -219,7 +245,47 @@ impl Config {
             other => anyhow::bail!("Invalid MTS '{other}' in .env: must be WALLET or POOL"),
         };
 
+        let min_profit: u64 = std::env::var("MIN_PROFIT_LAMPORTS")
+            .unwrap_or_else(|_| "0".to_string())
+            .trim()
+            .parse()
+            .context("MIN_PROFIT_LAMPORTS must be a valid u64")?;
+        let _ = MIN_PROFIT_LAMPORTS.set(min_profit);
+
+        let live_trading = matches!(
+            std::env::var("LIVE_TRADING")
+                .unwrap_or_default()
+                .trim()
+                .to_lowercase()
+                .as_str(),
+            "1" | "true" | "yes"
+        );
+
+        // POOL mode sizes trades by pool depth, assuming flash-loan capital
+        // that does not exist yet. Broadcasting that would just fail (or
+        // drain the wallet), so refuse the combination outright.
+        if live_trading && capital_source == CapitalSource::Pool {
+            anyhow::bail!(
+                "LIVE_TRADING=1 requires MTS=WALLET: POOL sizing assumes flash-loan capital that is not wired in"
+            );
+        }
+
+        let exec_cooldown_ms: u64 = std::env::var("EXEC_COOLDOWN_MS")
+            .unwrap_or_else(|_| "2000".to_string())
+            .trim()
+            .parse()
+            .context("EXEC_COOLDOWN_MS must be a valid u64")?;
+
         tracing::info!("Config loaded. Wallet pubkey: {}", keypair.pubkey());
+        tracing::info!("Minimum net profit per trade: {} lamports", min_profit);
+        if live_trading {
+            tracing::warn!(
+                "LIVE_TRADING=1: transactions that pass simulation WILL be broadcast (cooldown {} ms)",
+                exec_cooldown_ms
+            );
+        } else {
+            tracing::info!("LIVE_TRADING off: simulate-only, nothing is broadcast");
+        }
         tracing::info!(
             "Pair: {}, Raydium pool: {}, Orca pool: {}, Decoder: {:?}",
             pair,
@@ -254,6 +320,8 @@ impl Config {
             decoder,
             max_price_age_secs,
             capital_source,
+            live_trading,
+            exec_cooldown_ms,
         })
     }
 }
@@ -293,7 +361,7 @@ mod cost_model_tests {
                 COMPUTE_UNIT_LIMIT,
                 COMPUTE_UNIT_PRICE_MICRO_LAMPORTS
             ),
-            Some(13_750)
+            Some(10_000)
         );
     }
 
