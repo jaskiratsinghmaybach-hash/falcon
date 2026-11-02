@@ -1,3 +1,5 @@
+pub mod jito;
+pub mod kamino;
 pub mod orca;
 pub mod raydium;
 pub mod raydium_cpmm;
@@ -5,13 +7,15 @@ pub mod raydium_cpmm;
 use anyhow::{bail, Context, Result};
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::{
+    address_lookup_table::AddressLookupTableAccount,
     hash::Hash,
     instruction::Instruction,
     message::Message,
+    message::{v0, VersionedMessage},
     pubkey::Pubkey,
     signature::{Keypair, Signer},
     system_instruction,
-    transaction::Transaction,
+    transaction::{Transaction, VersionedTransaction},
 };
 use spl_associated_token_account::{
     get_associated_token_address,
@@ -358,19 +362,23 @@ fn simulate_with_blockhash(
 
     tx.sign(&[payer], recent_blockhash);
 
-    simulate_signed(client, &tx, &instruction_programs)
+    simulate_signed(
+        client,
+        &VersionedTransaction::from(tx),
+        &instruction_programs,
+    )
 }
 
 /// Simulates an already-signed transaction and applies the simulation
 /// truth gate (see `simulate_with_blockhash`).
 fn simulate_signed(
     client: &RpcClient,
-    tx: &Transaction,
+    tx: &VersionedTransaction,
     instruction_programs: &[Pubkey],
 ) -> Result<()> {
     tracing::info!(
         "Simulating transaction with {} instructions...",
-        tx.message.instructions.len()
+        tx.message.instructions().len()
     );
 
     // Transport failure is a failed simulation (typed as `rpc_error`).
@@ -562,10 +570,31 @@ pub fn sell_minimum_out_lamports(
     Ok(slippage_floor.max(profit_floor))
 }
 
+/// Optional execution features layered onto the atomic transaction.
+#[derive(Debug, Clone, Default)]
+pub struct ExecExtras {
+    /// POOL mode: fund the buy leg with a Kamino flash loan instead of the
+    /// wallet. Borrow and repay sit in the same transaction as both legs.
+    pub flash: Option<kamino::KaminoReserve>,
+    /// Jito tip (lamports) appended as the last instruction; 0 = no tip.
+    pub jito_tip_lamports: u64,
+    /// Address lookup tables; when non-empty the arb is sent as a v0
+    /// transaction (needed to fit the flash-loan accounts in 1232 bytes).
+    pub lookup_tables: Vec<AddressLookupTableAccount>,
+}
+
+/// Max serialized transaction size accepted by the cluster.
+pub const MAX_TX_BYTES: usize = 1232;
+
+/// Wire size of a transaction (signature count fits a 1-byte short_vec).
+pub fn serialized_tx_size(tx: &VersionedTransaction) -> usize {
+    1 + 64 * tx.signatures.len() + tx.message.serialize().len()
+}
+
 /// A fully built, signed atomic arbitrage transaction plus the program of
 /// each instruction (in order) for failure classification.
 pub struct BuiltArbTx {
-    pub tx: Transaction,
+    pub tx: VersionedTransaction,
     pub instruction_programs: Vec<Pubkey>,
 }
 
@@ -587,6 +616,7 @@ pub fn build_opportunity_instructions(
     other_token_mint: &Pubkey,
     ata_cache: &AtaCache,
     orca_state: Option<&crate::scanner::orca::OrcaQuoteState>,
+    extras: &ExecExtras,
     // Dry-run plumbing test (FORCE_SIM): drop the sell-leg profit floor so a
     // deliberately unprofitable trade still simulates cleanly. Never set for
     // a transaction that may be broadcast.
@@ -628,15 +658,27 @@ pub fn build_opportunity_instructions(
         ));
     }
 
-    instructions.push(system_instruction::transfer(
-        &wallet,
-        &wsol_ata,
-        amount_in_lamports,
-    ));
-    instructions.push(spl_token::instruction::sync_native(
-        &token_program,
-        &wsol_ata,
-    )?);
+    // Fund the buy leg: flash-borrow WSOL straight into the WSOL ATA (POOL
+    // mode), or wrap the wallet's own SOL.
+    let flash_borrow = match &extras.flash {
+        Some(flash) => {
+            let index = u8::try_from(instructions.len()).context("Too many instructions")?;
+            instructions.push(flash.borrow_ix(wallet, wsol_ata, amount_in_lamports));
+            Some((flash, index))
+        }
+        None => {
+            instructions.push(system_instruction::transfer(
+                &wallet,
+                &wsol_ata,
+                amount_in_lamports,
+            ));
+            instructions.push(spl_token::instruction::sync_native(
+                &token_program,
+                &wsol_ata,
+            )?);
+            None
+        }
+    };
 
     // Buy leg minimum == amount the sell leg spends, so the sell leg can
     // never try to spend more base token than the buy leg delivered.
@@ -713,10 +755,20 @@ pub fn build_opportunity_instructions(
             crate::config::COMPUTE_UNIT_PRICE_MICRO_LAMPORTS,
         )
         .context("Fixed tx cost overflow")?;
+        let flash_fee = match &flash_borrow {
+            Some((flash, _)) => flash
+                .flash_fee(amount_in_lamports)
+                .context("Flash-loan fee overflow")?,
+            None => 0,
+        };
+        let all_costs = fixed_cost
+            .checked_add(flash_fee)
+            .and_then(|v| v.checked_add(extras.jito_tip_lamports))
+            .context("Cost overflow")?;
         sell_minimum_out_lamports(
             amount_in_lamports,
             opportunity.expected_output_after_sell_raw,
-            fixed_cost,
+            all_costs,
             crate::config::min_profit_lamports(),
         )?
     };
@@ -734,8 +786,15 @@ pub fn build_opportunity_instructions(
         orca_current_tick,
     )?);
 
-    // Unwrap: closing the WSOL ATA returns every lamport in it (principal +
-    // profit + rent) to the wallet as native SOL.
+    // Repay principal + fee from the WSOL ATA. klend checks this pairs with
+    // the borrow at `index`; if the sell leg came up short, this fails and
+    // the whole transaction reverts.
+    if let Some((flash, index)) = flash_borrow {
+        instructions.push(flash.repay_ix(wallet, wsol_ata, amount_in_lamports, index));
+    }
+
+    // Unwrap: closing the WSOL ATA returns every lamport in it (principal or
+    // remaining profit + rent) to the wallet as native SOL.
     instructions.push(spl_token::instruction::close_account(
         &token_program,
         &wsol_ata,
@@ -743,6 +802,15 @@ pub fn build_opportunity_instructions(
         &wallet,
         &[],
     )?);
+
+    // Jito tip last: only paid if every instruction above succeeded.
+    if extras.jito_tip_lamports > 0 {
+        instructions.push(jito::tip_ix(
+            &wallet,
+            &jito::pick_tip_account(),
+            extras.jito_tip_lamports,
+        ));
+    }
 
     tracing::info!(
         "Built atomic arb tx: buy on {} ({} lamports in, min {} raw out), sell on {} ({} raw in, min {} lamports out)",
@@ -768,6 +836,7 @@ pub fn build_opportunity_transaction(
     recent_blockhash: Hash,
     ata_cache: &AtaCache,
     orca_state: Option<&crate::scanner::orca::OrcaQuoteState>,
+    extras: &ExecExtras,
     relax_profit_floor: bool,
 ) -> Result<BuiltArbTx> {
     let wallet = payer.pubkey();
@@ -779,14 +848,35 @@ pub fn build_opportunity_transaction(
         other_token_mint,
         ata_cache,
         orca_state,
+        extras,
         relax_profit_floor,
     )?;
 
     let instruction_programs: Vec<Pubkey> = instructions.iter().map(|ix| ix.program_id).collect();
-    let message = Message::new(&instructions, Some(&wallet));
-    let mut tx = Transaction::new_unsigned(message);
-    tx.try_sign(&[payer], recent_blockhash)
-        .context("Failed to sign arb transaction")?;
+    let tx = if extras.lookup_tables.is_empty() {
+        let message = Message::new(&instructions, Some(&wallet));
+        let mut tx = Transaction::new_unsigned(message);
+        tx.try_sign(&[payer], recent_blockhash)
+            .context("Failed to sign arb transaction")?;
+        VersionedTransaction::from(tx)
+    } else {
+        let message = v0::Message::try_compile(
+            &wallet,
+            &instructions,
+            &extras.lookup_tables,
+            recent_blockhash,
+        )
+        .context("Failed to compile v0 arb message")?;
+        VersionedTransaction::try_new(VersionedMessage::V0(message), &[payer])
+            .context("Failed to sign arb transaction")?
+    };
+
+    let size = serialized_tx_size(&tx);
+    if size > MAX_TX_BYTES {
+        bail!(
+            "Executor fail closed: arb transaction is {size} bytes (max {MAX_TX_BYTES}); add an address lookup table (LOOKUP_TABLES)"
+        );
+    }
 
     Ok(BuiltArbTx {
         tx,
@@ -816,6 +906,7 @@ pub fn simulate_opportunity(
     cached_blockhash: Option<Hash>,
     ata_cache: &AtaCache,
     orca_state: Option<&crate::scanner::orca::OrcaQuoteState>,
+    extras: &ExecExtras,
     relax_profit_floor: bool,
 ) -> Result<()> {
     let built = build_opportunity_transaction(
@@ -827,6 +918,7 @@ pub fn simulate_opportunity(
         resolve_blockhash(client, cached_blockhash)?,
         ata_cache,
         orca_state,
+        extras,
         relax_profit_floor,
     )?;
     simulate_signed(client, &built.tx, &built.instruction_programs)
@@ -855,6 +947,8 @@ pub fn execute_opportunity(
     cached_blockhash: Option<Hash>,
     ata_cache: &AtaCache,
     orca_state: Option<&crate::scanner::orca::OrcaQuoteState>,
+    extras: &ExecExtras,
+    jito_sender: Option<&jito::JitoSender>,
     live: bool,
 ) -> Result<ExecutionOutcome> {
     let built = build_opportunity_transaction(
@@ -866,6 +960,7 @@ pub fn execute_opportunity(
         resolve_blockhash(client, cached_blockhash)?,
         ata_cache,
         orca_state,
+        extras,
         false,
     )?;
 
@@ -875,21 +970,25 @@ pub fn execute_opportunity(
         return Ok(ExecutionOutcome::Simulated);
     }
 
-    let signature = client
-        .send_transaction_with_config(
-            &built.tx,
-            solana_client::rpc_config::RpcSendTransactionConfig {
-                // The identical transaction was just simulated; a second
-                // preflight only adds latency.
-                skip_preflight: true,
-                max_retries: Some(2),
-                ..Default::default()
-            },
-        )
-        .context("Failed to send arb transaction")?;
+    let signature = match jito_sender {
+        Some(jito) => jito.send(&built.tx)?,
+        None => client
+            .send_transaction_with_config(
+                &built.tx,
+                solana_client::rpc_config::RpcSendTransactionConfig {
+                    // The identical transaction was just simulated; a second
+                    // preflight only adds latency.
+                    skip_preflight: true,
+                    max_retries: Some(2),
+                    ..Default::default()
+                },
+            )
+            .context("Failed to send arb transaction")?,
+    };
 
     tracing::warn!(
-        "ARB SENT: {} (expected net profit {} lamports)",
+        "ARB SENT via {}: {} (expected net profit {} lamports)",
+        if jito_sender.is_some() { "Jito" } else { "RPC" },
         signature,
         opportunity.net_profit_lamports
     );
@@ -1086,6 +1185,42 @@ mod mainnet_sim_tests {
             .value
     }
 
+    fn v0_tx(
+        ixs: &[Instruction],
+        payer: &Pubkey,
+        luts: &[AddressLookupTableAccount],
+    ) -> VersionedTransaction {
+        let msg = v0::Message::try_compile(payer, ixs, luts, Hash::default()).unwrap();
+        VersionedTransaction {
+            signatures: vec![solana_sdk::signature::Signature::default()],
+            message: VersionedMessage::V0(msg),
+        }
+    }
+
+    fn v0_size(ixs: &[Instruction], payer: &Pubkey, luts: &[AddressLookupTableAccount]) -> usize {
+        serialized_tx_size(&v0_tx(ixs, payer, luts))
+    }
+
+    fn simulate_unsigned_v0(
+        client: &RpcClient,
+        payer: &Pubkey,
+        ixs: &[Instruction],
+        luts: &[AddressLookupTableAccount],
+    ) -> solana_client::rpc_response::RpcSimulateTransactionResult {
+        client
+            .simulate_transaction_with_config(
+                &v0_tx(ixs, payer, luts),
+                RpcSimulateTransactionConfig {
+                    sig_verify: false,
+                    replace_recent_blockhash: true,
+                    commitment: Some(CommitmentConfig::confirmed()),
+                    ..Default::default()
+                },
+            )
+            .expect("simulate RPC failed")
+            .value
+    }
+
     #[test]
     #[ignore]
     fn mainnet_sim_atomic_arb_round_trip() {
@@ -1200,6 +1335,7 @@ mod mainnet_sim_tests {
             &other_mint,
             &ata_cache,
             Some(&orca_state),
+            &ExecExtras::default(),
             true,
         )
         .unwrap();
@@ -1226,12 +1362,103 @@ mod mainnet_sim_tests {
                 &other_mint,
                 &ata_cache,
                 Some(&orca_state),
+                &ExecExtras::default(),
                 false,
             )
             .unwrap();
             let sim = simulate_unsigned(&client, &payer, &ixs);
             println!("profit-floor sim err (expected): {:?}", sim.err);
             assert!(sim.err.is_some(), "unprofitable trade must revert");
+        }
+
+        // 3. Flash loan + Jito tip: borrow the trade size from Kamino, run
+        //    both legs, repay, unwrap, tip.
+        let reserve_id: Pubkey = env_or("SIM_KAMINO_RESERVE", kamino::DEFAULT_SOL_RESERVE)
+            .parse()
+            .unwrap();
+        let flash = kamino::KaminoReserve::load(&client, &reserve_id).unwrap();
+        let lut_key: Pubkey = kamino::MAIN_MARKET_LOOKUP_TABLE.parse().unwrap();
+        let lut_data = client.get_account(&lut_key).unwrap().data;
+        let luts = vec![AddressLookupTableAccount {
+            key: lut_key,
+            addresses: solana_sdk::address_lookup_table::state::AddressLookupTable::deserialize(
+                &lut_data,
+            )
+            .unwrap()
+            .addresses
+            .to_vec(),
+        }];
+        let extras = ExecExtras {
+            flash: Some(flash.clone()),
+            jito_tip_lamports: 10_000,
+            lookup_tables: luts.clone(),
+        };
+        let mut ixs = build_opportunity_instructions(
+            payer,
+            &opp,
+            &raydium_ctx,
+            &orca_ctx,
+            &other_mint,
+            &ata_cache,
+            Some(&orca_state),
+            &extras,
+            true,
+        )
+        .unwrap();
+        let repay_pos = ixs
+            .iter()
+            .rposition(|ix| ix.program_id == kamino::KLEND_PROGRAM_ID)
+            .unwrap();
+        // The live spread is usually negative; top up the WSOL ATA just
+        // before the repay so the plumbing (borrow/repay pairing) is tested
+        // independently of market conditions.
+        let shortfall = 1_000_000u64;
+        let wsol_ata = ata_cache.wsol_ata;
+        ixs.insert(
+            repay_pos,
+            spl_token::instruction::sync_native(&spl_token::id(), &wsol_ata).unwrap(),
+        );
+        ixs.insert(
+            repay_pos,
+            system_instruction::transfer(&payer, &wsol_ata, shortfall),
+        );
+        let sim = simulate_unsigned_v0(&client, &payer, &ixs, &luts);
+        for l in sim.logs.iter().flatten() {
+            println!("  {l}");
+        }
+        assert!(
+            sim.err.is_none(),
+            "flash-loan round trip failed: {:?}",
+            sim.err
+        );
+        println!(
+            "flash-loan + Jito tip round trip OK, CU used {:?}",
+            sim.units_consumed
+        );
+        let size = v0_size(&ixs, &payer, &luts);
+        println!("serialized tx size: {size} bytes (limit 1232)");
+        assert!(size <= 1232);
+
+        // 4. Without the top-up an unprofitable flash-loan arb must revert.
+        if opp.net_profit_lamports <= 0 {
+            let ixs = build_opportunity_instructions(
+                payer,
+                &opp,
+                &raydium_ctx,
+                &orca_ctx,
+                &other_mint,
+                &ata_cache,
+                Some(&orca_state),
+                &extras,
+                false,
+            )
+            .unwrap();
+            let sim = simulate_unsigned_v0(&client, &payer, &ixs, &luts);
+            println!("flash profit-floor sim err (expected): {:?}", sim.err);
+            assert!(
+                sim.err.is_some(),
+                "unprofitable flash-loan trade must revert"
+            );
         }
     }
 }

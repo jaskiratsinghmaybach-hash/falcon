@@ -1063,8 +1063,13 @@ pub fn find_opportunity(
         Err(_) => return Err(RejectReason::ArithmeticFailure),
     };
 
-    let net_profit_lamports =
-        (expected_output_after_sell_raw as i128) - (trade_size_lamports as i128) - fixed_cost;
+    let variable_cost = crate::config::variable_cost_lamports(trade_size_lamports)
+        .ok_or(RejectReason::ArithmeticFailure)? as i128;
+
+    let net_profit_lamports = (expected_output_after_sell_raw as i128)
+        - (trade_size_lamports as i128)
+        - fixed_cost
+        - variable_cost;
 
     if net_profit_lamports <= 0
         || net_profit_lamports < crate::config::min_profit_lamports() as i128
@@ -1134,7 +1139,9 @@ pub fn build_forced_opportunity(
 
     let net_profit_lamports = (sell_quote.amount_out_raw as i128)
         - (trade_size_lamports as i128)
-        - fixed_cost_lamports().map_err(|_| RejectReason::ArithmeticFailure)?;
+        - fixed_cost_lamports().map_err(|_| RejectReason::ArithmeticFailure)?
+        - crate::config::variable_cost_lamports(trade_size_lamports)
+            .ok_or(RejectReason::ArithmeticFailure)? as i128;
 
     Ok(Opportunity {
         buy_dex: buy.dex.clone(),
