@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use solana_sdk::signature::{Keypair, Signer};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecoderType {
@@ -72,12 +73,52 @@ pub fn min_profit_lamports() -> u64 {
     MIN_PROFIT_LAMPORTS.get().copied().unwrap_or(0)
 }
 
-static FLASH_LOAN_FEE_SF: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 static JITO_TIP_LAMPORTS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 
-/// Set once at startup from the on-chain Kamino reserve (POOL mode).
-pub fn set_flash_loan_fee_sf(fee_sf: u64) {
-    let _ = FLASH_LOAN_FEE_SF.set(fee_sf);
+// Live Kamino reserve state (POOL mode), refreshed by a background poller.
+static FLASH_ENABLED: AtomicBool = AtomicBool::new(false);
+static FLASH_LOAN_FEE_SF: AtomicU64 = AtomicU64::new(0);
+static FLASH_AVAILABLE_LAMPORTS: AtomicU64 = AtomicU64::new(0);
+static FLASH_REFRESHED_AT_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Reserve state older than this makes POOL execution fail closed.
+pub const FLASH_STATE_MAX_AGE_MS: u64 = 10_000;
+/// Fees are priced at this multiple of the last observed rate, so a fee
+/// increase between refresh and landing (up to this factor) cannot turn a
+/// passing trade into a loss.
+pub const FLASH_FEE_SAFETY_MULTIPLIER: u64 = 2;
+/// Borrow at most this share (bps) of the reserve's available liquidity.
+pub const FLASH_MAX_UTILIZATION_BPS: u64 = 9_000;
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Record the latest on-chain Kamino reserve state (POOL mode).
+pub fn update_flash_reserve(flash_loan_fee_sf: u64, available_lamports: u64) {
+    FLASH_LOAN_FEE_SF.store(flash_loan_fee_sf, Ordering::Release);
+    FLASH_AVAILABLE_LAMPORTS.store(available_lamports, Ordering::Release);
+    FLASH_REFRESHED_AT_MS.store(now_ms(), Ordering::Release);
+    FLASH_ENABLED.store(true, Ordering::Release);
+}
+
+/// True when POOL state was refreshed within `FLASH_STATE_MAX_AGE_MS`.
+pub fn flash_state_fresh() -> bool {
+    now_ms().saturating_sub(FLASH_REFRESHED_AT_MS.load(Ordering::Acquire)) <= FLASH_STATE_MAX_AGE_MS
+}
+
+/// Largest loan POOL sizing may request; `None` outside POOL mode.
+pub fn flash_loan_cap_lamports() -> Option<u64> {
+    FLASH_ENABLED
+        .load(Ordering::Acquire)
+        .then(|| flash_cap(FLASH_AVAILABLE_LAMPORTS.load(Ordering::Acquire)))
+}
+
+fn flash_cap(available_lamports: u64) -> u64 {
+    ((available_lamports as u128) * FLASH_MAX_UTILIZATION_BPS as u128 / 10_000) as u64
 }
 
 /// Jito tip per trade (`JITO_TIP_LAMPORTS`); 0 = Jito disabled.
@@ -85,12 +126,21 @@ pub fn jito_tip_lamports() -> u64 {
     JITO_TIP_LAMPORTS.get().copied().unwrap_or(0)
 }
 
-/// Flash-loan fee for borrowing `trade_size_lamports` (0 outside POOL mode).
+/// Conservative fee bound for a flash loan of `amount` at `flash_loan_fee_sf`.
+pub fn bounded_flash_fee(flash_loan_fee_sf: u64, amount: u64) -> Option<u64> {
+    crate::executor::kamino::flash_fee_lamports(flash_loan_fee_sf, amount)?
+        .checked_mul(FLASH_FEE_SAFETY_MULTIPLIER)
+}
+
+/// Flash-loan fee bound for borrowing `trade_size_lamports` (0 outside POOL).
 pub fn flash_loan_fee_lamports(trade_size_lamports: u64) -> Option<u64> {
-    match FLASH_LOAN_FEE_SF.get() {
-        Some(fee_sf) => crate::executor::kamino::flash_fee_lamports(*fee_sf, trade_size_lamports),
-        None => Some(0),
+    if !FLASH_ENABLED.load(Ordering::Acquire) {
+        return Some(0);
     }
+    bounded_flash_fee(
+        FLASH_LOAN_FEE_SF.load(Ordering::Acquire),
+        trade_size_lamports,
+    )
 }
 
 /// Per-trade costs on top of the fixed tx cost: flash-loan fee + Jito tip.
@@ -389,6 +439,26 @@ impl Config {
             jito_block_engine_url,
             lookup_tables,
         })
+    }
+}
+
+#[cfg(test)]
+mod flash_bound_tests {
+    use super::*;
+
+    #[test]
+    fn fee_bound_covers_rate_increase_up_to_multiplier() {
+        let sf = 11_529_215_046_068; // ~0.001%, mainnet SOL reserve
+        let amount = 10_000_000_000;
+        let bound = bounded_flash_fee(sf, amount).unwrap();
+        let doubled = crate::executor::kamino::flash_fee_lamports(sf * 2, amount).unwrap();
+        assert!(bound >= doubled);
+    }
+
+    #[test]
+    fn cap_keeps_headroom_below_available() {
+        assert_eq!(flash_cap(1_000_000_000), 900_000_000);
+        assert_eq!(flash_cap(0), 0);
     }
 }
 

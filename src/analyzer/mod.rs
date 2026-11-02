@@ -1209,7 +1209,12 @@ pub fn find_best_opportunity(
             crate::config::CapitalSource::Wallet { max_lamports } => {
                 pool_derived_size.min(max_lamports as u128)
             }
-            crate::config::CapitalSource::Pool => pool_derived_size,
+            // Never ask Kamino for more than it can lend; when every pool
+            // fraction exceeds that, the cap itself becomes the candidate.
+            crate::config::CapitalSource::Pool => match crate::config::flash_loan_cap_lamports() {
+                Some(cap) => pool_derived_size.min(cap as u128),
+                None => pool_derived_size,
+            },
         };
 
         let trade_size_lamports = trade_size.min(u64::MAX as u128) as u64;

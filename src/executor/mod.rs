@@ -662,6 +662,17 @@ pub fn build_opportunity_instructions(
     // mode), or wrap the wallet's own SOL.
     let flash_borrow = match &extras.flash {
         Some(flash) => {
+            if !crate::config::flash_state_fresh() {
+                bail!(
+                    "Executor fail closed: Kamino reserve state is stale (refresh poller behind)"
+                );
+            }
+            let cap = crate::config::flash_loan_cap_lamports().unwrap_or(0);
+            if amount_in_lamports > cap {
+                bail!(
+                    "Executor fail closed: flash loan {amount_in_lamports} exceeds Kamino cap {cap} lamports"
+                );
+            }
             let index = u8::try_from(instructions.len()).context("Too many instructions")?;
             instructions.push(flash.borrow_ix(wallet, wsol_ata, amount_in_lamports));
             Some((flash, index))
@@ -756,8 +767,7 @@ pub fn build_opportunity_instructions(
         )
         .context("Fixed tx cost overflow")?;
         let flash_fee = match &flash_borrow {
-            Some((flash, _)) => flash
-                .flash_fee(amount_in_lamports)
+            Some(_) => crate::config::flash_loan_fee_lamports(amount_in_lamports)
                 .context("Flash-loan fee overflow")?,
             None => 0,
         };
@@ -790,6 +800,25 @@ pub fn build_opportunity_instructions(
     // the borrow at `index`; if the sell leg came up short, this fails and
     // the whole transaction reverts.
     if let Some((flash, index)) = flash_borrow {
+        // FORCE_SIM dry runs trade at a loss on purpose; top the WSOL ATA up
+        // from the wallet so the repay path is still exercised. Relaxed
+        // transactions are never broadcast.
+        if relax_profit_floor {
+            let owed = amount_in_lamports
+                .checked_add(
+                    crate::config::flash_loan_fee_lamports(amount_in_lamports)
+                        .context("Flash-loan fee overflow")?,
+                )
+                .context("Repay amount overflow")?;
+            let shortfall = owed.saturating_sub(opportunity.expected_output_after_sell_raw)
+                + amount_in_lamports / 100
+                + 1;
+            instructions.push(system_instruction::transfer(&wallet, &wsol_ata, shortfall));
+            instructions.push(spl_token::instruction::sync_native(
+                &token_program,
+                &wsol_ata,
+            )?);
+        }
         instructions.push(flash.repay_ix(wallet, wsol_ata, amount_in_lamports, index));
     }
 
@@ -1393,7 +1422,10 @@ mod mainnet_sim_tests {
             jito_tip_lamports: 10_000,
             lookup_tables: luts.clone(),
         };
-        let mut ixs = build_opportunity_instructions(
+        crate::config::update_flash_reserve(flash.flash_loan_fee_sf, flash.available_amount);
+        // Relaxed build tops up the WSOL ATA before the repay, so this checks
+        // the borrow/repay plumbing independently of the live spread.
+        let ixs = build_opportunity_instructions(
             payer,
             &opp,
             &raydium_ctx,
@@ -1405,23 +1437,6 @@ mod mainnet_sim_tests {
             true,
         )
         .unwrap();
-        let repay_pos = ixs
-            .iter()
-            .rposition(|ix| ix.program_id == kamino::KLEND_PROGRAM_ID)
-            .unwrap();
-        // The live spread is usually negative; top up the WSOL ATA just
-        // before the repay so the plumbing (borrow/repay pairing) is tested
-        // independently of market conditions.
-        let shortfall = 1_000_000u64;
-        let wsol_ata = ata_cache.wsol_ata;
-        ixs.insert(
-            repay_pos,
-            spl_token::instruction::sync_native(&spl_token::id(), &wsol_ata).unwrap(),
-        );
-        ixs.insert(
-            repay_pos,
-            system_instruction::transfer(&payer, &wsol_ata, shortfall),
-        );
         let sim = simulate_unsigned_v0(&client, &payer, &ixs, &luts);
         for l in sim.logs.iter().flatten() {
             println!("  {l}");
