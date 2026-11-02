@@ -82,7 +82,12 @@ async fn main() -> anyhow::Result<()> {
                     reserve.token_program
                 );
             }
-            config::set_flash_loan_fee_sf(reserve.flash_loan_fee_sf);
+            config::update_flash_reserve(reserve.flash_loan_fee_sf, reserve.available_amount);
+            executor::kamino::spawn_reserve_poller(
+                config.helius_rpc_url.clone(),
+                reserve_id,
+                2_000,
+            );
             tracing::info!(
                 "Kamino flash loans: reserve {}, fee {} lamports per SOL, {} lamports available",
                 reserve_id,

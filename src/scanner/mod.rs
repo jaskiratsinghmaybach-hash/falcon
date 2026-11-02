@@ -303,7 +303,9 @@ fn run_forced_simulation(
         .unwrap_or(1_000_000);
     let size = match capital_source {
         CapitalSource::Wallet { max_lamports } => requested.min(max_lamports),
-        CapitalSource::Pool => requested,
+        CapitalSource::Pool => {
+            requested.min(crate::config::flash_loan_cap_lamports().unwrap_or(u64::MAX))
+        }
     };
 
     let opp = match analyzer::build_forced_opportunity(r, o, size) {

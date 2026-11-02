@@ -140,6 +140,32 @@ impl KaminoReserve {
     }
 }
 
+/// Refreshes the reserve's fee and available liquidity into `config` every
+/// `interval_ms`, so POOL sizing and the profit floor track the chain.
+pub fn spawn_reserve_poller(rpc_url: String, reserve: Pubkey, interval_ms: u64) {
+    std::thread::spawn(move || {
+        let client = RpcClient::new(rpc_url);
+        let mut last_fee_sf = None;
+        loop {
+            match KaminoReserve::load(&client, &reserve) {
+                Ok(r) => {
+                    if last_fee_sf.is_some_and(|f| f != r.flash_loan_fee_sf) {
+                        tracing::warn!(
+                            "Kamino flash-loan fee changed: {:?} -> {}",
+                            last_fee_sf,
+                            r.flash_loan_fee_sf
+                        );
+                    }
+                    last_fee_sf = Some(r.flash_loan_fee_sf);
+                    crate::config::update_flash_reserve(r.flash_loan_fee_sf, r.available_amount);
+                }
+                Err(e) => tracing::warn!("Kamino reserve refresh failed: {e:#}"),
+            }
+            std::thread::sleep(std::time::Duration::from_millis(interval_ms));
+        }
+    });
+}
+
 pub fn lending_market_authority(lending_market: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(&[b"lma", lending_market.as_ref()], &KLEND_PROGRAM_ID).0
 }
