@@ -39,6 +39,21 @@ pub fn tick_array_start_index(tick_index: i32, tick_spacing: u16) -> i32 {
     tick_index.div_euclid(ticks_in_array) * ticks_in_array
 }
 
+/// Start index of `tick_array_0` for a swap in direction `a_to_b`. For
+/// b->a swaps the Whirlpool program searches a range shifted down by one
+/// `tick_spacing`, so a current tick in the last spacing of an array needs
+/// the NEXT array as `tick_array_0` (same rule as Orca's SDK
+/// `getTickArrayPublicKeys`: shift = a_to_b ? 0 : tick_spacing). Without it
+/// those swaps fail on-chain with an invalid tick array sequence.
+pub fn first_tick_array_start_index(
+    tick_current_index: i32,
+    tick_spacing: u16,
+    a_to_b: bool,
+) -> i32 {
+    let shift = if a_to_b { 0 } else { tick_spacing as i32 };
+    tick_array_start_index(tick_current_index + shift, tick_spacing)
+}
+
 /// Derives a tick array PDA for a given start tick index. Public for the
 /// same reason as `tick_array_start_index` - the scanner must derive the
 /// exact same PDAs the executor will submit on-chain, or a quote/execution
@@ -73,7 +88,7 @@ pub fn derive_tick_arrays(
     a_to_b: bool,
 ) -> Result<[Pubkey; 3]> {
     let ticks_in_array = TICK_ARRAY_SIZE * tick_spacing as i32;
-    let start = tick_array_start_index(tick_current_index, tick_spacing);
+    let start = first_tick_array_start_index(tick_current_index, tick_spacing, a_to_b);
     let offsets: [i32; 3] = if a_to_b { [0, -1, -2] } else { [0, 1, 2] };
 
     Ok([
@@ -135,4 +150,26 @@ pub fn build_swap_instruction(
         accounts: account_metas,
         data,
     })
+}
+
+#[cfg(test)]
+mod tick_array_shift_tests {
+    use super::*;
+
+    #[test]
+    fn a_to_b_uses_array_containing_current_tick() {
+        // spacing 64 -> 5632 ticks per array.
+        assert_eq!(first_tick_array_start_index(5631, 64, true), 0);
+        assert_eq!(first_tick_array_start_index(-1, 64, true), -5632);
+    }
+
+    #[test]
+    fn b_to_a_shifts_by_one_spacing() {
+        assert_eq!(first_tick_array_start_index(5000, 64, false), 0);
+        // Last spacing of array 0: b->a must start at the next array.
+        assert_eq!(first_tick_array_start_index(5568, 64, false), 5632);
+        assert_eq!(first_tick_array_start_index(5631, 64, false), 5632);
+        assert_eq!(first_tick_array_start_index(-65, 64, false), -5632);
+        assert_eq!(first_tick_array_start_index(-64, 64, false), 0);
+    }
 }

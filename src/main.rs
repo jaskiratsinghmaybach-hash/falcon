@@ -5,6 +5,7 @@ mod failure;
 mod logger;
 mod scanner;
 
+use anyhow::Context;
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::signer::Signer;
 use tracing_subscriber::EnvFilter;
@@ -37,6 +38,21 @@ async fn main() -> anyhow::Result<()> {
     } else {
         orca_exec_ctx.info.token_mint_a
     };
+
+    // The Orca legacy `swap` and Raydium AMM v4 instructions only support the
+    // classic SPL Token program, and the executor creates ATAs with it. A
+    // Token-2022 mint would fail every trade on-chain, so refuse to start.
+    let other_mint_owner = exec_client
+        .get_account(&other_token_mint)
+        .context("Failed to fetch the non-SOL token mint account")?
+        .owner;
+    if other_mint_owner.to_string() != executor::TOKEN_PROGRAM_ID {
+        anyhow::bail!(
+            "Token mint {} is owned by {} (not the SPL Token program); Token-2022 pairs are not supported by the Orca legacy swap path",
+            other_token_mint,
+            other_mint_owner
+        );
+    }
 
     executor::ensure_wallet_atas(&exec_client, &config.keypair, &other_token_mint)
         .expect("Failed to ensure wallet ATAs exist");
@@ -72,6 +88,8 @@ async fn main() -> anyhow::Result<()> {
             other_token_mint,
             blockhash_cache,
             ata_cache,
+            live_trading: config.live_trading,
+            exec_cooldown_ms: config.exec_cooldown_ms,
         },
     )
     .await?;

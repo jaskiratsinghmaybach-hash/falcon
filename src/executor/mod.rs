@@ -5,6 +5,7 @@ pub mod raydium_cpmm;
 use anyhow::{bail, Context, Result};
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::{
+    hash::Hash,
     instruction::Instruction,
     message::Message,
     pubkey::Pubkey,
@@ -13,7 +14,8 @@ use solana_sdk::{
     transaction::Transaction,
 };
 use spl_associated_token_account::{
-    get_associated_token_address, instruction::create_associated_token_account,
+    get_associated_token_address,
+    instruction::{create_associated_token_account, create_associated_token_account_idempotent},
 };
 use std::str::FromStr;
 
@@ -340,14 +342,9 @@ fn simulate_with_blockhash(
     client: &RpcClient,
     payer: &Keypair,
     instructions: Vec<Instruction>,
-    cached_blockhash: Option<solana_sdk::hash::Hash>,
+    cached_blockhash: Option<Hash>,
 ) -> Result<()> {
-    let recent_blockhash = match cached_blockhash {
-        Some(h) => h,
-        None => client
-            .get_latest_blockhash()
-            .context("Failed to fetch recent blockhash")?,
-    };
+    let recent_blockhash = resolve_blockhash(client, cached_blockhash)?;
 
     // Program of each instruction, in submission order. Message compilation
     // preserves instruction order, so the index inside a chain-reported
@@ -361,13 +358,23 @@ fn simulate_with_blockhash(
 
     tx.sign(&[payer], recent_blockhash);
 
+    simulate_signed(client, &tx, &instruction_programs)
+}
+
+/// Simulates an already-signed transaction and applies the simulation
+/// truth gate (see `simulate_with_blockhash`).
+fn simulate_signed(
+    client: &RpcClient,
+    tx: &Transaction,
+    instruction_programs: &[Pubkey],
+) -> Result<()> {
     tracing::info!(
         "Simulating transaction with {} instructions...",
         tx.message.instructions.len()
     );
 
     // Transport failure is a failed simulation (typed as `rpc_error`).
-    let sim = client.simulate_transaction(&tx).map_err(|e| {
+    let sim = client.simulate_transaction(tx).map_err(|e| {
         anyhow::Error::new(crate::failure::SimulationFailure::Rpc(format!(
             "Failed to simulate transaction: {e}"
         )))
@@ -385,7 +392,7 @@ fn simulate_with_blockhash(
     // (we are past it) AND `value.err == None`. Any chain-reported error is a
     // failed simulation, returned as a typed, classifiable failure.
     if let Err(failure) =
-        crate::failure::simulation_outcome(sim.value.err.clone(), &instruction_programs)
+        crate::failure::simulation_outcome(sim.value.err.clone(), instruction_programs)
     {
         tracing::error!(
             failure_class = %failure.class(),
@@ -526,60 +533,94 @@ fn build_leg_instruction(
     }
 }
 
-/// Builds and simulates the full atomic arbitrage transaction.
+/// Slippage tolerance applied to the sell leg's quoted output. The on-chain
+/// profit floor (see `sell_minimum_out_lamports`) is usually the binding
+/// constraint; this only matters when it is stricter.
+const SELL_LEG_SLIPPAGE_BPS: u32 = 100;
+
+/// The sell leg's `minimum_amount_out`: the larger of the slippage-adjusted
+/// quote and the PROFIT FLOOR (SOL in + every lamport of tx fees + the
+/// configured minimum profit). Because both legs live in one transaction,
+/// the floor makes the whole arbitrage revert on-chain unless it actually
+/// nets at least `min_profit_lamports` after fees.
+pub fn sell_minimum_out_lamports(
+    amount_in_lamports: u64,
+    expected_sell_out_lamports: u64,
+    fixed_cost_lamports: u64,
+    min_profit_lamports: u64,
+) -> Result<u64> {
+    let slippage_floor =
+        analyzer::calculate_minimum_out_raw(expected_sell_out_lamports, SELL_LEG_SLIPPAGE_BPS)
+            .context("Failed to compute sell-leg minimum_out")?;
+
+    let profit_floor = amount_in_lamports
+        .checked_add(fixed_cost_lamports)
+        .and_then(|v| v.checked_add(min_profit_lamports))
+        .and_then(|v| v.checked_add(1))
+        .context("Profit floor overflow")?;
+
+    Ok(slippage_floor.max(profit_floor))
+}
+
+/// A fully built, signed atomic arbitrage transaction plus the program of
+/// each instruction (in order) for failure classification.
+pub struct BuiltArbTx {
+    pub tx: Transaction,
+    pub instruction_programs: Vec<Pubkey>,
+}
+
+/// Builds and signs the full atomic arbitrage transaction:
 ///
-/// Never sends anything - simulation only.
+/// compute budget -> create WSOL ATA (idempotent) -> wrap SOL -> buy leg ->
+/// sell leg (with on-chain profit floor) -> close WSOL ATA (unwrap back to
+/// native SOL).
 ///
-/// The analyzer's expected buy output is used directly as the sell input.
+/// Every step is in ONE transaction, so either the whole round trip lands
+/// with at least the minimum profit or nothing happens (only the fee is
+/// spent on a revert).
 #[allow(clippy::too_many_arguments)]
-pub fn simulate_opportunity(
-    client: &RpcClient,
-    payer: &Keypair,
+pub fn build_opportunity_instructions(
+    wallet: Pubkey,
     opportunity: &Opportunity,
     raydium_ctx: &RaydiumPoolContext,
     orca_ctx: &OrcaPoolContext,
     other_token_mint: &Pubkey,
-    other_token_decimals: u32,
-    cached_blockhash: Option<solana_sdk::hash::Hash>,
     ata_cache: &AtaCache,
     orca_state: Option<&crate::scanner::orca::OrcaQuoteState>,
-    // Dry-run plumbing test (FORCE_SIM): drop the sell-leg breakeven floor so
-    // a deliberately unprofitable trade still simulates cleanly. Simulation
-    // only - nothing is ever broadcast by this function.
+    // Dry-run plumbing test (FORCE_SIM): drop the sell-leg profit floor so a
+    // deliberately unprofitable trade still simulates cleanly. Never set for
+    // a transaction that may be broadcast.
     relax_profit_floor: bool,
-) -> Result<()> {
-    let wallet = payer.pubkey();
-
+) -> Result<Vec<Instruction>> {
     let token_program = Pubkey::from_str(TOKEN_PROGRAM_ID)?;
-
     let wsol_mint = Pubkey::from_str(WSOL_MINT)?;
 
     let AtaCache {
         wsol_ata,
-        wsol_exists,
         other_ata,
         other_exists,
+        ..
     } = *ata_cache;
 
-    let _ = other_token_decimals;
-
     let amount_in_lamports = opportunity.trade_size_lamports;
-
-    let other_token_amount_raw = opportunity.expected_output_after_buy_raw;
-
-    let mut instructions = vec![];
-
-    if !wsol_exists {
-        instructions.push(create_associated_token_account(
-            &wallet,
-            &wallet,
-            &wsol_mint,
-            &token_program,
-        ));
+    if amount_in_lamports == 0 {
+        bail!("Executor fail closed: zero trade size");
     }
 
+    let mut instructions = vec![
+        solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(
+            crate::config::COMPUTE_UNIT_LIMIT,
+        ),
+        solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_price(
+            crate::config::COMPUTE_UNIT_PRICE_MICRO_LAMPORTS,
+        ),
+        // The WSOL ATA is closed at the end of every arb, so it is
+        // (re)created here every time. Idempotent: a no-op if it exists.
+        create_associated_token_account_idempotent(&wallet, &wallet, &wsol_mint, &token_program),
+    ];
+
     if !other_exists {
-        instructions.push(create_associated_token_account(
+        instructions.push(create_associated_token_account_idempotent(
             &wallet,
             &wallet,
             other_token_mint,
@@ -592,19 +633,22 @@ pub fn simulate_opportunity(
         &wsol_ata,
         amount_in_lamports,
     ));
-
     instructions.push(spl_token::instruction::sync_native(
         &token_program,
         &wsol_ata,
     )?);
 
-    const SLIPPAGE_TOLERANCE_BPS: u32 = 100;
-
+    // Buy leg minimum == amount the sell leg spends, so the sell leg can
+    // never try to spend more base token than the buy leg delivered.
     let buy_minimum_out_raw = analyzer::calculate_minimum_out_raw(
         opportunity.expected_output_after_buy_raw,
-        SLIPPAGE_TOLERANCE_BPS,
+        crate::config::BUY_LEG_SLIPPAGE_BPS,
     )
     .context("Failed to compute buy-leg minimum_out")?;
+    let sell_amount_in_raw = buy_minimum_out_raw;
+    if sell_amount_in_raw == 0 {
+        bail!("Executor fail closed: buy leg guarantees zero output");
+    }
 
     let orca_is_involved = opportunity.buy_dex == "Orca" || opportunity.sell_dex == "Orca";
     let orca_current_tick = if orca_is_involved {
@@ -615,7 +659,7 @@ pub fn simulate_opportunity(
         })?;
 
         if state.whirlpool_pubkey != orca_ctx.pool_id {
-            anyhow::bail!(
+            bail!(
                 "Executor fail closed: Orca state pool {} does not match context pool {}",
                 state.whirlpool_pubkey,
                 orca_ctx.pool_id
@@ -625,7 +669,7 @@ pub fn simulate_opportunity(
         if let crate::scanner::orca::CoherenceStatus::Incoherent { worst_drift } =
             state.coherence_status()
         {
-            anyhow::bail!(
+            bail!(
                 "Executor fail closed: Orca state incoherent with worst slot drift {}",
                 worst_drift
             );
@@ -647,7 +691,7 @@ pub fn simulate_opportunity(
         None
     };
 
-    let buy_ix = build_leg_instruction(
+    instructions.push(build_leg_instruction(
         &opportunity.buy_dex,
         raydium_ctx,
         orca_ctx,
@@ -658,39 +702,26 @@ pub fn simulate_opportunity(
         amount_in_lamports,
         buy_minimum_out_raw,
         orca_current_tick,
-    )?;
+    )?);
 
-    instructions.push(buy_ix);
-
-    instructions.insert(
-        0,
-        solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(
-            crate::config::COMPUTE_UNIT_LIMIT,
-        ),
-    );
-
-    instructions.insert(
-        1,
-        solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_price(
-            crate::config::COMPUTE_UNIT_PRICE_MICRO_LAMPORTS,
-        ),
-    );
-
-    let base_sell_minimum_out = analyzer::calculate_minimum_out_raw(
-        opportunity.expected_output_after_sell_raw,
-        SLIPPAGE_TOLERANCE_BPS,
-    )
-    .context("Failed to compute sell-leg minimum_out")?;
-
-    let breakeven_lamports = amount_in_lamports + 1_000;
-
-    let sell_minimum_out_lamports = if relax_profit_floor {
+    let sell_minimum_out = if relax_profit_floor {
         1
     } else {
-        base_sell_minimum_out.max(breakeven_lamports)
+        let fixed_cost = crate::config::fixed_tx_cost_lamports(
+            crate::config::TX_SIGNATURES,
+            crate::config::COMPUTE_UNIT_LIMIT,
+            crate::config::COMPUTE_UNIT_PRICE_MICRO_LAMPORTS,
+        )
+        .context("Fixed tx cost overflow")?;
+        sell_minimum_out_lamports(
+            amount_in_lamports,
+            opportunity.expected_output_after_sell_raw,
+            fixed_cost,
+            crate::config::min_profit_lamports(),
+        )?
     };
 
-    let sell_ix = build_leg_instruction(
+    instructions.push(build_leg_instruction(
         &opportunity.sell_dex,
         raydium_ctx,
         orca_ctx,
@@ -698,25 +729,213 @@ pub fn simulate_opportunity(
         wsol_ata,
         other_ata,
         other_token_mint,
-        other_token_amount_raw,
-        sell_minimum_out_lamports,
+        sell_amount_in_raw,
+        sell_minimum_out,
         orca_current_tick,
-    )?;
+    )?);
 
-    instructions.push(sell_ix);
+    // Unwrap: closing the WSOL ATA returns every lamport in it (principal +
+    // profit + rent) to the wallet as native SOL.
+    instructions.push(spl_token::instruction::close_account(
+        &token_program,
+        &wsol_ata,
+        &wallet,
+        &wallet,
+        &[],
+    )?);
 
     tracing::info!(
-        "Built atomic opportunity tx: buy on {} ({} lamports SOL in), sell on {} ({} raw units token in)",
+        "Built atomic arb tx: buy on {} ({} lamports in, min {} raw out), sell on {} ({} raw in, min {} lamports out)",
         opportunity.buy_dex,
         amount_in_lamports,
+        buy_minimum_out_raw,
         opportunity.sell_dex,
-        other_token_amount_raw
+        sell_amount_in_raw,
+        sell_minimum_out
     );
 
-    simulate_with_blockhash(client, payer, instructions, cached_blockhash)
+    Ok(instructions)
 }
 
-use solana_sdk::hash::Hash;
+/// `build_opportunity_instructions` + sign with `payer` as fee payer.
+#[allow(clippy::too_many_arguments)]
+pub fn build_opportunity_transaction(
+    payer: &Keypair,
+    opportunity: &Opportunity,
+    raydium_ctx: &RaydiumPoolContext,
+    orca_ctx: &OrcaPoolContext,
+    other_token_mint: &Pubkey,
+    recent_blockhash: Hash,
+    ata_cache: &AtaCache,
+    orca_state: Option<&crate::scanner::orca::OrcaQuoteState>,
+    relax_profit_floor: bool,
+) -> Result<BuiltArbTx> {
+    let wallet = payer.pubkey();
+    let instructions = build_opportunity_instructions(
+        wallet,
+        opportunity,
+        raydium_ctx,
+        orca_ctx,
+        other_token_mint,
+        ata_cache,
+        orca_state,
+        relax_profit_floor,
+    )?;
+
+    let instruction_programs: Vec<Pubkey> = instructions.iter().map(|ix| ix.program_id).collect();
+    let message = Message::new(&instructions, Some(&wallet));
+    let mut tx = Transaction::new_unsigned(message);
+    tx.try_sign(&[payer], recent_blockhash)
+        .context("Failed to sign arb transaction")?;
+
+    Ok(BuiltArbTx {
+        tx,
+        instruction_programs,
+    })
+}
+
+fn resolve_blockhash(client: &RpcClient, cached_blockhash: Option<Hash>) -> Result<Hash> {
+    match cached_blockhash {
+        Some(h) => Ok(h),
+        None => client
+            .get_latest_blockhash()
+            .context("Failed to fetch recent blockhash"),
+    }
+}
+
+/// Builds and simulates the full atomic arbitrage transaction.
+/// Never sends anything - simulation only.
+#[allow(clippy::too_many_arguments)]
+pub fn simulate_opportunity(
+    client: &RpcClient,
+    payer: &Keypair,
+    opportunity: &Opportunity,
+    raydium_ctx: &RaydiumPoolContext,
+    orca_ctx: &OrcaPoolContext,
+    other_token_mint: &Pubkey,
+    cached_blockhash: Option<Hash>,
+    ata_cache: &AtaCache,
+    orca_state: Option<&crate::scanner::orca::OrcaQuoteState>,
+    relax_profit_floor: bool,
+) -> Result<()> {
+    let built = build_opportunity_transaction(
+        payer,
+        opportunity,
+        raydium_ctx,
+        orca_ctx,
+        other_token_mint,
+        resolve_blockhash(client, cached_blockhash)?,
+        ata_cache,
+        orca_state,
+        relax_profit_floor,
+    )?;
+    simulate_signed(client, &built.tx, &built.instruction_programs)
+}
+
+/// Result of `execute_opportunity`.
+#[derive(Debug)]
+pub enum ExecutionOutcome {
+    /// Simulation passed; live trading is off so nothing was sent.
+    Simulated,
+    /// Simulation passed and the exact simulated transaction was broadcast.
+    Sent(solana_sdk::signature::Signature),
+}
+
+/// Builds the atomic arb transaction, simulates it (simulation truth gate),
+/// and - only if `live` and the simulation succeeded - broadcasts the EXACT
+/// transaction that was simulated. Landing is confirmed in the background.
+#[allow(clippy::too_many_arguments)]
+pub fn execute_opportunity(
+    client: &RpcClient,
+    payer: &Keypair,
+    opportunity: &Opportunity,
+    raydium_ctx: &RaydiumPoolContext,
+    orca_ctx: &OrcaPoolContext,
+    other_token_mint: &Pubkey,
+    cached_blockhash: Option<Hash>,
+    ata_cache: &AtaCache,
+    orca_state: Option<&crate::scanner::orca::OrcaQuoteState>,
+    live: bool,
+) -> Result<ExecutionOutcome> {
+    let built = build_opportunity_transaction(
+        payer,
+        opportunity,
+        raydium_ctx,
+        orca_ctx,
+        other_token_mint,
+        resolve_blockhash(client, cached_blockhash)?,
+        ata_cache,
+        orca_state,
+        false,
+    )?;
+
+    simulate_signed(client, &built.tx, &built.instruction_programs)?;
+
+    if !live {
+        return Ok(ExecutionOutcome::Simulated);
+    }
+
+    let signature = client
+        .send_transaction_with_config(
+            &built.tx,
+            solana_client::rpc_config::RpcSendTransactionConfig {
+                // The identical transaction was just simulated; a second
+                // preflight only adds latency.
+                skip_preflight: true,
+                max_retries: Some(2),
+                ..Default::default()
+            },
+        )
+        .context("Failed to send arb transaction")?;
+
+    tracing::warn!(
+        "ARB SENT: {} (expected net profit {} lamports)",
+        signature,
+        opportunity.net_profit_lamports
+    );
+
+    spawn_confirmation_watcher(client.url(), signature);
+
+    Ok(ExecutionOutcome::Sent(signature))
+}
+
+/// Polls the signature status in the background and logs whether the arb
+/// landed, reverted, or expired. Never blocks the hot path.
+fn spawn_confirmation_watcher(rpc_url: String, signature: solana_sdk::signature::Signature) {
+    std::thread::spawn(move || {
+        let client = RpcClient::new(rpc_url);
+        for _ in 0..40 {
+            std::thread::sleep(std::time::Duration::from_millis(750));
+            match client.get_signature_statuses(&[signature]) {
+                Ok(resp) => {
+                    if let Some(Some(status)) = resp.value.first() {
+                        match &status.err {
+                            None => {
+                                tracing::warn!("ARB LANDED: {} (slot {})", signature, status.slot);
+                                return;
+                            }
+                            Some(err) => {
+                                tracing::error!(
+                                    "ARB REVERTED ON-CHAIN: {} (slot {}): {:?} - only the fee was spent",
+                                    signature,
+                                    status.slot,
+                                    err
+                                );
+                                return;
+                            }
+                        }
+                    }
+                }
+                Err(e) => tracing::debug!("Signature status poll failed for {}: {}", signature, e),
+            }
+        }
+        tracing::warn!(
+            "ARB NOT CONFIRMED within ~30s (likely dropped/expired): {}",
+            signature
+        );
+    });
+}
+
 use std::sync::{Arc, RwLock};
 
 pub type BlockhashCache = Arc<RwLock<Hash>>;
@@ -806,4 +1025,213 @@ pub fn ensure_wallet_atas(
     }
 
     Ok((wsol_ata, other_ata))
+}
+
+#[cfg(test)]
+mod profit_floor_tests {
+    use super::*;
+
+    #[test]
+    fn profit_floor_covers_principal_fees_and_min_profit() {
+        // expected out barely above principal: the profit floor binds.
+        let min_out = sell_minimum_out_lamports(1_000_000, 1_010_000, 13_750, 5_000).unwrap();
+        assert_eq!(min_out, 1_000_000 + 13_750 + 5_000 + 1);
+    }
+
+    #[test]
+    fn slippage_floor_binds_when_stricter() {
+        // 1% below 2_000_000 = 1_980_000 > profit floor.
+        let min_out = sell_minimum_out_lamports(1_000_000, 2_000_000, 13_750, 0).unwrap();
+        assert_eq!(min_out, 1_980_000);
+    }
+
+    #[test]
+    fn profit_floor_overflow_is_error() {
+        assert!(sell_minimum_out_lamports(u64::MAX, 0, 1, 0).is_err());
+    }
+}
+
+/// Live mainnet check of the full atomic transaction (no keys, nothing sent):
+/// `cargo test mainnet_sim -- --ignored --nocapture`. Uses a SOL-rich system
+/// account as fee payer with signature verification disabled.
+/// Env overrides: MAINNET_RPC_URL, SIM_PAYER, SIM_RAYDIUM_CPMM_POOL, SIM_ORCA_POOL.
+#[cfg(test)]
+mod mainnet_sim_tests {
+    use super::*;
+    use crate::scanner::{orca as sorca, raydium_cpmm as scpmm};
+    use solana_client::rpc_config::RpcSimulateTransactionConfig;
+    use solana_sdk::commitment_config::CommitmentConfig;
+
+    fn env_or(key: &str, default: &str) -> String {
+        std::env::var(key).unwrap_or_else(|_| default.to_string())
+    }
+
+    fn simulate_unsigned(
+        client: &RpcClient,
+        payer: &Pubkey,
+        ixs: &[Instruction],
+    ) -> solana_client::rpc_response::RpcSimulateTransactionResult {
+        let tx = Transaction::new_unsigned(Message::new(ixs, Some(payer)));
+        client
+            .simulate_transaction_with_config(
+                &tx,
+                RpcSimulateTransactionConfig {
+                    sig_verify: false,
+                    replace_recent_blockhash: true,
+                    commitment: Some(CommitmentConfig::confirmed()),
+                    ..Default::default()
+                },
+            )
+            .expect("simulate RPC failed")
+            .value
+    }
+
+    #[test]
+    #[ignore]
+    fn mainnet_sim_atomic_arb_round_trip() {
+        let client = RpcClient::new_with_commitment(
+            env_or("MAINNET_RPC_URL", "https://api.mainnet-beta.solana.com"),
+            CommitmentConfig::confirmed(),
+        );
+        let payer: Pubkey = env_or("SIM_PAYER", "5tzFkiKscXHK5ZXCGbXZxdw7gTjjD1mBwuoFbhUvuAi9")
+            .parse()
+            .unwrap();
+        let ray_id = env_or(
+            "SIM_RAYDIUM_CPMM_POOL",
+            "Q2sPHPdUWFMg7M7wwrQKLrn619cAucfRsmhVJffodSp",
+        );
+        let orca_id = env_or(
+            "SIM_ORCA_POOL",
+            "HsQGWEh3ib6w59rBh5n1jXmi8VXFBqKEjxozL6PGfcgb",
+        );
+
+        let raydium_ctx = RaydiumPoolContext::load_cpmm(&client, &ray_id).unwrap();
+        let orca_ctx = OrcaPoolContext::load(&client, &orca_id).unwrap();
+
+        // Raydium CPMM exact quote state.
+        let ray_pk: Pubkey = ray_id.parse().unwrap();
+        let pool_state =
+            scpmm::decode_pool_state(&client.get_account(&ray_pk).unwrap().data).unwrap();
+        let amm_config =
+            scpmm::decode_amm_config(&client.get_account(&pool_state.amm_config).unwrap().data)
+                .unwrap();
+        let bal = |v: &Pubkey| -> u64 {
+            client
+                .get_token_account_balance(v)
+                .unwrap()
+                .amount
+                .parse()
+                .unwrap()
+        };
+        let (v0, v1) = (
+            bal(&pool_state.token_0_vault),
+            bal(&pool_state.token_1_vault),
+        );
+        scpmm::publish_quote_state(scpmm::quote_state_from_accounts(
+            ray_pk,
+            &pool_state,
+            &amm_config,
+            v0,
+            v1,
+        ));
+        let ray_price = scpmm::CpmmStaticContext::from_loaded(ray_pk, &pool_state, &amm_config)
+            .price_from_raw_reserves(v0, v1, "SIM");
+
+        // Orca exact quote state: pool + 5-array window, one slot.
+        let slot = client.get_slot().unwrap();
+        let whirlpool =
+            sorca::decode_whirlpool(&client.get_account(&orca_ctx.pool_id).unwrap().data).unwrap();
+        let mut tick_arrays: Vec<sorca::SlottedTickArray> = sorca::subscription_tick_array_pdas(
+            &orca_ctx.pool_id,
+            whirlpool.tick_current_index,
+            whirlpool.tick_spacing,
+        )
+        .unwrap()
+        .iter()
+        .filter_map(|pda| {
+            sorca::load_tick_array(&client, pda, &orca_ctx.pool_id, whirlpool.tick_spacing).ok()
+        })
+        .map(|array| sorca::SlottedTickArray { array, slot })
+        .collect();
+        tick_arrays.sort_by_key(|s| s.array.start_tick_index);
+        let orca_state = sorca::OrcaQuoteState {
+            whirlpool_pubkey: orca_ctx.pool_id,
+            whirlpool: whirlpool.clone(),
+            tick_arrays,
+            pool_slot: slot,
+        };
+        sorca::publish_orca_quote_state(orca_state.clone());
+        let orca_price = sorca::OrcaStaticContext::load(&client, &orca_id)
+            .unwrap()
+            .price_from_whirlpool(&client, &whirlpool, "SIM")
+            .unwrap();
+
+        let opp = analyzer::build_forced_opportunity(&ray_price, &orca_price, 10_000_000)
+            .expect("forced opportunity");
+        println!(
+            "buy {} -> sell {}: in {} lamports, buy out {} raw, sell out {} lamports, net {}",
+            opp.buy_dex,
+            opp.sell_dex,
+            opp.trade_size_lamports,
+            opp.expected_output_after_buy_raw,
+            opp.expected_output_after_sell_raw,
+            opp.net_profit_lamports
+        );
+
+        let wsol_mint: Pubkey = WSOL_MINT.parse().unwrap();
+        let other_mint = if orca_ctx.info.token_mint_a == wsol_mint {
+            orca_ctx.info.token_mint_b
+        } else {
+            orca_ctx.info.token_mint_a
+        };
+        let ata_cache = AtaCache {
+            wsol_ata: get_associated_token_address(&payer, &wsol_mint),
+            wsol_exists: false,
+            other_ata: get_associated_token_address(&payer, &other_mint),
+            other_exists: false,
+        };
+
+        // 1. Plumbing: full round trip with the profit floor relaxed must succeed.
+        let ixs = build_opportunity_instructions(
+            payer,
+            &opp,
+            &raydium_ctx,
+            &orca_ctx,
+            &other_mint,
+            &ata_cache,
+            Some(&orca_state),
+            true,
+        )
+        .unwrap();
+        let sim = simulate_unsigned(&client, &payer, &ixs);
+        for l in sim.logs.iter().flatten() {
+            println!("  {l}");
+        }
+        assert!(
+            sim.err.is_none(),
+            "relaxed round trip failed: {:?}",
+            sim.err
+        );
+        println!("relaxed round trip OK, CU used {:?}", sim.units_consumed);
+        assert!(sim.units_consumed.unwrap_or(0) <= crate::config::COMPUTE_UNIT_LIMIT as u64);
+
+        // 2. Atomic guard: with the profit floor on, an unprofitable trade
+        //    must revert in the sell leg instead of landing at a loss.
+        if opp.net_profit_lamports <= 0 {
+            let ixs = build_opportunity_instructions(
+                payer,
+                &opp,
+                &raydium_ctx,
+                &orca_ctx,
+                &other_mint,
+                &ata_cache,
+                Some(&orca_state),
+                false,
+            )
+            .unwrap();
+            let sim = simulate_unsigned(&client, &payer, &ixs);
+            println!("profit-floor sim err (expected): {:?}", sim.err);
+            assert!(sim.err.is_some(), "unprofitable trade must revert");
+        }
+    }
 }

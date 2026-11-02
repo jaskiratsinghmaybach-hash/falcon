@@ -625,10 +625,10 @@ pub fn select_tick_arrays_for_direction(
     tick_spacing: u16,
     a_to_b: bool,
 ) -> Result<Vec<crate::scanner::orca::DecodedTickArray>, MathError> {
-    use crate::executor::orca::{tick_array_start_index, TICK_ARRAY_SIZE};
+    use crate::executor::orca::{first_tick_array_start_index, TICK_ARRAY_SIZE};
 
     let ticks_in_array = TICK_ARRAY_SIZE * tick_spacing as i32;
-    let current_start = tick_array_start_index(tick_current_index, tick_spacing);
+    let current_start = first_tick_array_start_index(tick_current_index, tick_spacing, a_to_b);
     let offsets: [i32; 3] = if a_to_b { [0, -1, -2] } else { [0, 1, 2] };
 
     offsets
@@ -826,9 +826,14 @@ pub fn revalidate_orca_snapshot(
     // 4. Every array the executor will submit for this direction must be in
     //    the snapshot the quote used - same rule, same source of truth
     //    (executor::orca::derive_tick_arrays uses offsets [0,-1,-2] / [0,1,2]).
+    let first_start = crate::executor::orca::first_tick_array_start_index(
+        state.whirlpool.tick_current_index,
+        spacing,
+        a_to_b,
+    );
     let offsets: [i32; 3] = if a_to_b { [0, -1, -2] } else { [0, 1, 2] };
     for off in offsets {
-        let start = current_start + off * ticks_in_array;
+        let start = first_start + off * ticks_in_array;
         if !have(start) {
             return Err(RevalidationError::ExecutionArrayMissing { start });
         }
@@ -1017,7 +1022,15 @@ pub fn find_opportunity(
 
     let expected_output_after_buy_raw = buy_quote.amount_out_raw;
 
-    let sell_quote = match estimate_leg_quote(sell, expected_output_after_buy_raw, false) {
+    // The sell leg spends the buy leg's GUARANTEED minimum (exactly what the
+    // executor submits), not the optimistic expected output.
+    let sell_amount_in_raw = calculate_minimum_out_raw(
+        expected_output_after_buy_raw,
+        crate::config::BUY_LEG_SLIPPAGE_BPS,
+    )
+    .map_err(|_| RejectReason::ArithmeticFailure)?;
+
+    let sell_quote = match estimate_leg_quote(sell, sell_amount_in_raw, false) {
         Ok(v) => v,
         Err(e) => {
             return Err(RejectReason::QuoteUnavailable(format!(
@@ -1053,7 +1066,9 @@ pub fn find_opportunity(
     let net_profit_lamports =
         (expected_output_after_sell_raw as i128) - (trade_size_lamports as i128) - fixed_cost;
 
-    if net_profit_lamports <= 0 {
+    if net_profit_lamports <= 0
+        || net_profit_lamports < crate::config::min_profit_lamports() as i128
+    {
         return Err(RejectReason::NetProfitNotPositive {
             net_profit_lamports,
         });
@@ -1109,7 +1124,12 @@ pub fn build_forced_opportunity(
 
     let buy_quote = estimate_leg_quote(buy, trade_size_lamports, true)
         .map_err(|e| RejectReason::QuoteUnavailable(format!("buy leg on {}: {}", buy.dex, e)))?;
-    let sell_quote = estimate_leg_quote(sell, buy_quote.amount_out_raw, false)
+    let sell_amount_in_raw = calculate_minimum_out_raw(
+        buy_quote.amount_out_raw,
+        crate::config::BUY_LEG_SLIPPAGE_BPS,
+    )
+    .map_err(|_| RejectReason::ArithmeticFailure)?;
+    let sell_quote = estimate_leg_quote(sell, sell_amount_in_raw, false)
         .map_err(|e| RejectReason::QuoteUnavailable(format!("sell leg on {}: {}", sell.dex, e)))?;
 
     let net_profit_lamports = (sell_quote.amount_out_raw as i128)
@@ -1446,9 +1466,9 @@ mod tests {
 
     #[test]
     fn fixed_cost_is_the_real_atomic_tx_cost_not_the_old_jito_placeholder() {
-        // 1 signature (5_000) + 350_000 CU * 25_000 micro-lamports (8_750) = 13_750.
+        // 1 signature (5_000) + 200_000 CU * 25_000 micro-lamports (5_000) = 10_000.
         // The removed placeholder charged (5_000 + 100_000) * 2 = 210_000.
-        assert_eq!(fixed_cost_lamports().unwrap(), 13_750);
+        assert_eq!(fixed_cost_lamports().unwrap(), 10_000);
         assert_ne!(fixed_cost_lamports().unwrap(), 210_000);
     }
 
@@ -1484,7 +1504,7 @@ mod tests {
     #[test]
     fn trade_profitable_only_after_removing_the_fake_tip_is_now_approved() {
         // Find a tiny trade whose gross gain sits between the real cost
-        // (13_750) and the old placeholder cost (210_000): the old code
+        // (10_000) and the old placeholder cost (210_000): the old code
         // rejected it, the real cost model must approve it.
         let a = pu("A", 1_000_000_000_000, 1_000_000_000_000, 1, 1_000_000);
         let b = pu("B", 1_000_000_000_000, 1_100_000_000_000, 1, 1_000_000);
@@ -1496,7 +1516,7 @@ mod tests {
             if let Ok(opp) = find_opportunity(&a, &b, size) {
                 let gross =
                     opp.expected_output_after_sell_raw as i128 - opp.trade_size_lamports as i128;
-                if gross > 13_750 && gross <= 210_000 {
+                if gross > 10_000 && gross <= 210_000 {
                     assert!(opp.net_profit_lamports > 0);
                     found = true;
                     break;
@@ -2450,7 +2470,7 @@ mod tests {
                             a_to_b,
                         )
                         .unwrap();
-                        let executor_starts: Vec<i32> = executor_pdas
+                        let executor_starts: Option<Vec<i32>> = executor_pdas
                             .iter()
                             .map(|pda| {
                                 // Recover the start each PDA was derived from by
@@ -2468,9 +2488,25 @@ mod tests {
                                             == *pda
                                     })
                                     .map(|w| w.start_tick_index)
-                                    .expect("executor PDA must correspond to one of the 5 window arrays")
                             })
                             .collect();
+
+                        // b->a with the current tick in the last spacing of
+                        // its array shifts tick_array_0 to the next array, so
+                        // the executor needs +1..+3 - one beyond the 5-array
+                        // window. Selection must then fail closed, never
+                        // substitute different arrays.
+                        let Some(executor_starts) = executor_starts else {
+                            assert!(!a_to_b);
+                            assert!(select_tick_arrays_for_direction(
+                                &slotted,
+                                tick_current_index,
+                                tick_spacing,
+                                a_to_b,
+                            )
+                            .is_err());
+                            continue;
+                        };
 
                         // What the analyzer will quote against.
                         let selected = select_tick_arrays_for_direction(

@@ -44,6 +44,8 @@ pub struct ExecutionContext {
     pub other_token_mint: Pubkey,
     pub blockhash_cache: executor::BlockhashCache,
     pub ata_cache: executor::AtaCache,
+    pub live_trading: bool,
+    pub exec_cooldown_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,7 +155,14 @@ fn spawn_cancellable_tick_subscriber(
     std::thread::spawn(move || {
         let role = AccountRole::OrcaTickArray { pda, generation };
         for update in inner_rx {
-            if tx.send(RealtimeEvent { role, update, via_poll: false }).is_err() {
+            if tx
+                .send(RealtimeEvent {
+                    role,
+                    update,
+                    via_poll: false,
+                })
+                .is_err()
+            {
                 break;
             }
         }
@@ -181,7 +190,14 @@ fn spawn_subscriber(
         });
 
         for update in inner_rx {
-            if tx.send(RealtimeEvent { role, update, via_poll: false }).is_err() {
+            if tx
+                .send(RealtimeEvent {
+                    role,
+                    update,
+                    via_poll: false,
+                })
+                .is_err()
+            {
                 break;
             }
         }
@@ -327,13 +343,14 @@ fn run_forced_simulation(
         &exec_ctx.raydium_ctx,
         &exec_ctx.orca_ctx,
         &exec_ctx.other_token_mint,
-        0,
         cached_hash,
         &exec_ctx.ata_cache,
         state.as_ref(),
         true,
     ) {
-        Ok(()) => tracing::warn!("[FORCE_SIM] SIMULATION SUCCESS on mainnet state - no funds moved"),
+        Ok(()) => {
+            tracing::warn!("[FORCE_SIM] SIMULATION SUCCESS on mainnet state - no funds moved")
+        }
         Err(e) => {
             let class = crate::failure::classify_error_chain(&e);
             tracing::error!(failure_class = %class, "[FORCE_SIM] simulation failed: {:?}", e);
@@ -499,12 +516,19 @@ pub async fn run_realtime_loop(
     // Dynamic tick-array subscription window (Phase 4 Area 3):
     // Managed dynamically by orca::DynamicTickWindow with cancellable subscriptions.
     let mut dynamic_window: Option<orca::DynamicTickWindow> = None;
-    let mut tick_sub_handles: std::collections::HashMap<Pubkey, realtime::CancellableAccountSubscription> = std::collections::HashMap::new();
+    let mut tick_sub_handles: std::collections::HashMap<
+        Pubkey,
+        realtime::CancellableAccountSubscription,
+    > = std::collections::HashMap::new();
 
     if let Ok(pool_pubkey) = orca_pool_id.parse::<Pubkey>() {
         if let Ok(account) = client.get_account(&pool_pubkey) {
             if let Ok(wp) = orca::decode_whirlpool(&account.data) {
-                match orca::DynamicTickWindow::new(pool_pubkey, wp.tick_spacing, wp.tick_current_index) {
+                match orca::DynamicTickWindow::new(
+                    pool_pubkey,
+                    wp.tick_spacing,
+                    wp.tick_current_index,
+                ) {
                     Ok(dw) => {
                         tracing::info!(
                             "Orca tick-array dynamic window initialized at tick {} (spacing {}): {:?}",
@@ -663,10 +687,12 @@ pub async fn run_realtime_loop(
     // newer polled state (see the slot guards below).
     let poll_interval = orca_poll_interval();
     let mut last_orca_poll = std::time::Instant::now() - poll_interval;
-    let mut pending: std::collections::VecDeque<RealtimeEvent> =
-        std::collections::VecDeque::new();
+    let mut pending: std::collections::VecDeque<RealtimeEvent> = std::collections::VecDeque::new();
     let mut last_forced_sim = std::time::Instant::now() - std::time::Duration::from_secs(3600);
-    let force_sim_enabled = std::env::var("FORCE_SIM").map(|v| v == "1").unwrap_or(false);
+    let mut last_live_send = std::time::Instant::now() - std::time::Duration::from_secs(3600);
+    let force_sim_enabled = std::env::var("FORCE_SIM")
+        .map(|v| v == "1")
+        .unwrap_or(false);
     if force_sim_enabled {
         tracing::warn!("FORCE_SIM=1: dry-run simulations will be attempted even without a profitable spread (simulate-only, never broadcast)");
     }
@@ -854,7 +880,11 @@ pub async fn run_realtime_loop(
                                 // Start subscriptions for newly required PDAs
                                 for new_pda in new_pdas {
                                     let sub = spawn_cancellable_tick_subscriber(
-                                        ws_endpoint_for(ws_endpoints, tick_array_key_slot(&new_pda)).to_string(),
+                                        ws_endpoint_for(
+                                            ws_endpoints,
+                                            tick_array_key_slot(&new_pda),
+                                        )
+                                        .to_string(),
                                         new_pda.to_string(),
                                         new_pda,
                                         new_generation,
@@ -1089,23 +1119,55 @@ pub async fn run_realtime_loop(
                         continue;
                     }
 
+                    if exec_ctx.live_trading
+                        && last_live_send.elapsed()
+                            < std::time::Duration::from_millis(exec_ctx.exec_cooldown_ms)
+                    {
+                        tracing::info!("Skipping opportunity: live-send cooldown active");
+                        continue;
+                    }
+
                     let live_orca_state_for_exec = orca::current_orca_quote_state();
-                    match executor::simulate_opportunity(
+                    match executor::execute_opportunity(
                         &exec_ctx.client,
                         &exec_ctx.payer,
                         &opp,
                         &exec_ctx.raydium_ctx,
                         &exec_ctx.orca_ctx,
                         &exec_ctx.other_token_mint,
-                        0,
                         cached_hash,
                         &exec_ctx.ata_cache,
                         live_orca_state_for_exec.as_ref(),
-                        false,
+                        exec_ctx.live_trading,
                     ) {
-                        Ok(()) => {
-                            tracing::warn!(
-                                "Opportunity simulated successfully - see logs above for sim result."
+                        Ok(outcome) => {
+                            let status = match &outcome {
+                                executor::ExecutionOutcome::Simulated => {
+                                    tracing::warn!(
+                                        "Opportunity simulated successfully (LIVE_TRADING off - not sent)."
+                                    );
+                                    "SIMULATED_OK".to_string()
+                                }
+                                executor::ExecutionOutcome::Sent(sig) => {
+                                    last_live_send = std::time::Instant::now();
+                                    format!("SENT: {}", sig)
+                                }
+                            };
+                            let _ = crate::logger::log_row(
+                                pair,
+                                r.price,
+                                o.price,
+                                r.base_liquidity,
+                                r.quote_liquidity,
+                                o.base_liquidity,
+                                o.quote_liquidity,
+                                &opp.buy_dex,
+                                &opp.sell_dex,
+                                opp.raw_spread_pct,
+                                opp.fee_adjusted_spread_pct,
+                                opp.net_spread_after_slippage_pct,
+                                opp.net_profit_pct,
+                                &status,
                             );
                         }
 
@@ -1178,7 +1240,13 @@ pub async fn run_realtime_loop(
                         && last_forced_sim.elapsed() >= std::time::Duration::from_secs(20)
                     {
                         last_forced_sim = std::time::Instant::now();
-                        run_forced_simulation(r, o, capital_source, &exec_ctx, newest_observed_slot);
+                        run_forced_simulation(
+                            r,
+                            o,
+                            capital_source,
+                            &exec_ctx,
+                            newest_observed_slot,
+                        );
                     }
                 }
             }
@@ -1187,7 +1255,6 @@ pub async fn run_realtime_loop(
 
     Ok(())
 }
-
 
 #[cfg(test)]
 mod key_split_tests {
@@ -1227,7 +1294,10 @@ mod key_split_tests {
         for _ in 0..64 {
             let pda = Pubkey::new_unique();
             let slot = tick_array_key_slot(&pda);
-            assert!(slot == 1 || slot == 2, "unexpected key slot {slot} for tick array");
+            assert!(
+                slot == 1 || slot == 2,
+                "unexpected key slot {slot} for tick array"
+            );
         }
     }
 
@@ -1255,11 +1325,19 @@ mod key_split_tests {
             let pda = Pubkey::new_unique();
             *counts.entry(tick_array_key_slot(&pda)).or_insert(0) += 1;
         }
-        assert_eq!(*counts.get(&0).unwrap(), 5, "key 0 must be exactly the 5 fixed subscriptions");
+        assert_eq!(
+            *counts.get(&0).unwrap(),
+            5,
+            "key 0 must be exactly the 5 fixed subscriptions"
+        );
         assert!(counts.get(&0).copied().unwrap_or(0) <= 5);
         // Keys 1 and 2 together hold exactly: 2 fixed (Orca vaults) + 5 tick arrays = 7
         let k1 = counts.get(&1).copied().unwrap_or(0);
         let k2 = counts.get(&2).copied().unwrap_or(0);
-        assert_eq!(k1 + k2, 7, "Orca vaults + all 5 tick arrays must total 7 across keys 1 and 2");
+        assert_eq!(
+            k1 + k2,
+            7,
+            "Orca vaults + all 5 tick arrays must total 7 across keys 1 and 2"
+        );
     }
 }
